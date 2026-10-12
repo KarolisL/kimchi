@@ -124,6 +124,7 @@ import promptSummaryExtension from "./extensions/prompt-summary.js"
 import pullRequestStatusExtension from "./extensions/pull-request-status/index.js"
 import questionnaireExtension from "./extensions/questionnaire/index.js"
 import rateLimitNoticeExtension from "./extensions/rate-limit-notice.js"
+import refusedTurnPruningExtension from "./extensions/refused-turn-pruning.js"
 import remoteRunExtension from "./extensions/remote-run/index.js"
 import reportBugExtension from "./extensions/report-bug.js"
 import requestTimingExtension from "./extensions/request-timing.js"
@@ -822,6 +823,7 @@ try {
 			modelGuardExtension,
 			orphanToolResultRepairExtension,
 			orphanToolResultSanitizerExtension,
+			refusedTurnPruningExtension,
 			piiRedactionExtension,
 			stripImagesExtension,
 			traceIdExtension,
