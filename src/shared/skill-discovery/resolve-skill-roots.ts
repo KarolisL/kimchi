@@ -288,6 +288,56 @@ function bundledSkillDisabledByResource(bundledDir: string, name: string): boole
 	}
 }
 
+/**
+ * Skills hidden on behalf of a visible bundled skill: a bundled skill may
+ * declare `disables-skills: <name, ...>` in its SKILL.md frontmatter to
+ * shadow same-named skills from external sources (the Claude Code skills
+ * path — ~/.claude/skills and trusted project .claude/skills). The list is
+ * inert while the declaring skill's own `requires-resource` toggle is off,
+ * so a disabled experimental toggle stays byte-identical to a build without
+ * the feature. The documents skill uses this to suppress the Anthropic
+ * office skills (xlsx/pdf/docx/pptx) whose pip/LibreOffice workflows
+ * contradict its native read_document guidance.
+ *
+ * Returns skill name → declaring skill name (for Skill-tool refusal text).
+ */
+export function collectBundledDisabledSkillNames(bundledDir?: string): Map<string, string> {
+	const disabled = new Map<string, string>()
+	const dir = bundledDir ?? resolveBundledSkillsDir()
+	if (!dir) return disabled
+	for (const name of listSkillNames(dir)) {
+		if (bundledSkillDisabledByResource(dir, name)) continue
+		for (const target of readDisablesSkillsNames(join(dir, name, "SKILL.md"))) {
+			if (!disabled.has(target)) disabled.set(target, name)
+		}
+	}
+	return disabled
+}
+
+function readDisablesSkillsNames(skillFilePath: string): string[] {
+	try {
+		const frontmatter = readFileSync(skillFilePath, "utf-8").split("\n").slice(0, 30).join("\n")
+		const match = /^disables-skills:[ \t]*(.+?)[ \t]*$/m.exec(frontmatter)
+		if (!match) return []
+		return match[1]
+			.split(",")
+			.map(normalizeDisablesSkillName)
+			.filter((name) => name !== "")
+	} catch {
+		return []
+	}
+}
+
+/** Mirror of the claude-code-skills name normalization so declared names
+ * match the names discovered from materialized skill dirs. */
+function normalizeDisablesSkillName(name: string): string {
+	return name
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+}
+
 function copySkillsToTempDir(bundledDir: string, names: string[]): string {
 	const tempDir = mkdtempSync(join(tmpdir(), "kimchi-bundled-skills-"))
 	process.once("exit", () => {

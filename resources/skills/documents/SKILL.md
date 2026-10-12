@@ -2,6 +2,7 @@
 name: documents
 description: Read PDF, DOCX, PPTX, and XLSX (plus XLS/ODS/CSV) files as Markdown with stable locators, via the read_document tool, plain read, and @file arguments.
 requires-resource: extensions.documents
+disables-skills: xlsx, pdf, docx, pptx
 ---
 
 # Documents
