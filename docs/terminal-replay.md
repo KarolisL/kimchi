@@ -2,7 +2,7 @@
 
 Kimchi automatically records interactive terminal output so an unexpected display problem can be watched later. Run `/export report.html`, choose **Transcript + replay (raw terminal output)**, then open the HTML and select **Replay** beside **JSONL** in the header. **Transcript** returns to the conversation at the same scroll position. Playback fills the viewing area and works locally, with play, pause, seeking, speed and recorded terminal resizes. It makes no model calls or recording-service requests.
 
-Changing speed preserves both position and play/pause state. Returning to the transcript pauses replay; reopening keeps the same position, speed and part. The browser retains only the selected part decoded while the HTML stays open. Switching parts replaces that cache. The previous screen stays visible while a speed change prepares its replacement; recorded output and pauses are unchanged. **Download part**, next to the part selector, saves the selected part and its player as a standalone HTML file that opens offline.
+Changing speed preserves both position and play/pause state without rebuilding the terminal. Returning to the transcript pauses replay; reopening keeps the same position, speed and part. The browser retains only the selected part decoded while the HTML stays open. Switching parts replaces that cache; recorded output and pauses are unchanged. **Download part**, next to the part selector, saves the selected part and its player as a standalone HTML file that opens offline.
 
 ## Linked harness steps
 
@@ -26,7 +26,7 @@ This supports inspection of a past run. It does not pause a live agent, inspect 
 
 The useful pattern in [Playwright Trace Viewer](https://playwright.dev/docs/trace-viewer) is selecting an action to see the corresponding visual state and details. [rrweb custom events](https://github.com/rrweb-io/rrweb/blob/main/docs/recipes/custom-event.md) provide a similar link between semantic events and a recording timeline. Neither is a terminal recorder, so this implementation adds semantic markers to the existing terminal stream.
 
-The existing [player marker API](https://docs.asciinema.org/manual/player/markers/) already supports playback callbacks and seeking. Kimchi keeps those markers in captured order, gives them readable labels and adds its trace panel without another player or recording dependency. The [pinned player driver](https://github.com/asciinema/asciinema-player/blob/v3.17.0/src/driver/recording.js) and browser checks establish the behavior used here.
+Kimchi keeps semantic markers in captured order alongside output and resize events. Its playback controller stops processing at an error marker before drawing subsequent output; the trace panel seeks through the same ordered stream. [xterm.js](https://github.com/xtermjs/xterm.js) renders terminal bytes while Kimchi owns timing, controls, navigation and the page design.
 
 Pinned Pi 0.85.1 supplies public session events but no terminal-to-trace mapping. Its extension hooks precede the interactive UI subscriber and can replace finalized messages; a subscriber after the UI sees the final event. The terminal redraw is scheduled later, so an event timestamp alone can stop before an error appears. Completed synchronized-output bursts supply the frame boundary. The [Pi package catalog](https://pi.dev/packages) and bounded upstream issue/PR searches did not reveal a ready-made adapter for this flow. No upstream patch is needed.
 
@@ -50,7 +50,9 @@ When a part fills, capture continues in the next numbered part. The recorder rec
 
 The HTML identifies continued parts, buffer limits, storage errors and interrupted capture. If a single frame plus its starting checkpoint cannot fit in a part, capture stops with a size-limit notice. Excessive output or slow storage can still fill the bounded queue and stop recording. An abruptly killed process can lose its final unflushed fraction; committed chunks remain readable. Recording writes never wait for disk I/O, and lifecycle operations give a stalled recorder at most one second before proceeding. The explicit raw replay export may take longer while retained parts are read and compressed; transcript-only exports skip this work. Base64 and the embedded player make an HTML export larger than the stored compressed data.
 
-Set `"terminalRecording": false` in `~/.config/kimchi/harness/settings.json` before launching Kimchi to disable recording. `--no-session`, print, RPC and ACP sessions do not record a terminal. Turning capture off does not erase existing recordings; remove `terminal-recordings/` while Kimchi is closed to clear them.
+Open `/resources`, select **Extensions**, and toggle **Terminal recording** to control automatic capture. It defaults to on and takes effect immediately. Turning it off closes the current part; turning it on starts a new visit with a complete screen. The choice persists through the existing `terminalRecording` setting in `~/.config/kimchi/harness/settings.json`, including older explicit false values. Existing recordings remain available.
+
+`--no-session`, print, RPC and ACP sessions do not record a terminal. ACP exposes the same resource setting for configuration, with no terminal capture. To clear stored recordings, remove `terminal-recordings/` while Kimchi is closed.
 
 ## What replay proves
 
@@ -58,30 +60,48 @@ The player receives captured output bytes, timing and dimensions. It can show in
 
 This is terminal playback, not pixel video. Fonts, Unicode widths, terminal-specific sequences and inline image protocols may render differently. Use a screen recording for terminal-host or GPU defects. Playing an old recording also cannot prove a fix: use a controlled TUI regression to execute the changed renderer.
 
+Two fidelity limits reproduced in both the previous player and this implementation: joined emoji can occupy more columns than Kimchi expects, and part checkpoints can lose background colours on blank alternate-screen cells. Keep the original terminal-host capture when either detail is central to the issue.
+
 ## Implementation and validation
 
 `src/terminal-replay/` owns capture, bounded storage and export integration. A small adapter starts capture before Pi's first interactive frame; session hooks own export consent and cleanup. Writes to both attached stdout and stderr are observed, including terminal methods that bypass `Terminal.write`. Raw input is not recorded. Output is encoded as asciicast v3; independently compressed, length-framed chunks make incomplete final writes ignorable.
 
 UTF-8 string writes are captured without allocating an intermediate Buffer. The tap normalizes lone UTF-16 surrogates as Node's UTF-8 encoding does, and retains the streaming decoder for Buffer writes and other encodings. This reduces work on each normal redraw without changing capture timing or storage limits.
 
-The offline player uses pinned assets fetched and verified during setup/build, outside the tracked source tree. It runs in a sandboxed iframe with network access disabled by Content Security Policy. The transcript and subagent viewers keep their existing rendering. Generated upstream export templates are not edited.
+The offline player uses a pinned normal package dependency. Setup/build copies its installed browser assets and Kimchi's controller into ignored generated files; no separate download script is needed. It runs in a sandboxed iframe with network access disabled by Content Security Policy, terminal input and recorded-link activation disabled, and no clipboard addon. The transcript and subagent viewers keep their existing rendering. Generated upstream export templates are not edited.
 
 ### Owning the replay UI
 
-`scripts/stage-terminal-replay.js` downloads and checks the player assets during setup/build. It does not record sessions or run during playback. Removing only that script would leave the exporter without its assets. A company-designed replay page can use either the current engine behind custom controls or a different terminal renderer.
+`resources/terminal-replay/playback.js` owns playback, seeking, resize and speed. `player.html` owns the interface and trace inspection. `scripts/copy-resources.js` stages the normal `@xterm/xterm` dependency and its Unicode11 addon during setup/build. The browser and part checkpoints use the same Unicode width rules. The former `scripts/stage-terminal-replay.js` downloader is removed. Neither browser renderer nor playback controller runs on live output writes.
 
-The following alternatives were checked against their upstream documentation on 2026-10-13. Only the current player has been tested with Kimchi's recordings; the integration assessments are engineering judgments, not measured comparisons.
+The following alternatives were researched and tried in Chromium 147 on 2026-10-13, using the same ordered fixture and original 73.315-second GLM-5.3 recording. The fixture covers clearing, colour, CJK/combining text, split control sequences, recorded resize, backward seek and a one-microsecond failure/recovery boundary. Tests ran offline in a sandbox with network access denied.
 
-| Option | What it supplies | Work for Kimchi |
+| Option | Verified result | Decision |
 | --- | --- | --- |
-| Current player with Kimchi controls | Timed playback, seeking, markers and terminal rendering. Its [controls option](https://docs.asciinema.org/manual/player/options/#controls) hides the stock bar. | Implemented: Kimchi owns the play/seek controls and page design for every part. This keeps the player dependency. |
-| [xterm.js](https://github.com/xtermjs/xterm.js) | A terminal renderer with public [write, reset and resize APIs](https://xtermjs.org/docs/api/terminal/classes/terminal/). Kimchi already uses its headless package for part checkpoints. | Preferred candidate if removing the current player is required. Add the browser package, own playback timing and seeking, and reuse the trace panel, parts and downloads. Package assets through the normal build instead of downloading release files. |
-| [ghostty-web](https://github.com/coder/ghostty-web) | Ghostty's WASM terminal engine with an API intended to resemble xterm.js. | Another renderer candidate; needs the same playback controller plus verification of WASM loading in the offline, sandboxed export. No Kimchi compatibility or performance result yet. |
-| [tty-player](https://github.com/chris-morgan/tty-player) | A video-like web component for ttyrec recordings. | Poorer fit: a different recording format, and its README still lists migration from term.js to xterm.js as unfinished. |
+| [asciinema-player 3.17.0](https://github.com/asciinema/asciinema-player/releases/tag/v3.17.0) | Previous implementation passed all eight fixture checkpoints and ten real marker screens. | Working baseline; replaced to own playback and use normal package assets. |
+| [xterm.js 6.0.0](https://github.com/xtermjs/xterm.js/releases/tag/6.0.0) | Passed all eight checkpoints, ten real screens, pause/speed/error stopping, hostile OSC input and 20 combining-text reset cycles. Non-graphic screen text matched the baseline; screenshots were inspected separately because the baseline draws block glyphs with CSS. | Selected. Public [write/reset/resize APIs](https://xtermjs.org/docs/api/terminal/classes/terminal/) supply rendering; Kimchi owns the recording controller. |
+| [ghostty-web 0.4.0](https://github.com/coder/ghostty-web) | Offline WASM loading worked. A write after reset crashed with combining text and multi-codepoint emoji: ten failures and six passing ASCII/CJK/simple-emoji controls, each using a fresh WASM instance. | Rejected for backward-seek lifecycle failure, consistent with [upstream issue 141](https://github.com/coder/ghostty-web/issues/141). Large-part test skipped after the crash. |
+| [tty-player](https://github.com/chris-morgan/tty-player/tree/083734213d1c1ed23b5530915aaa0c85ab61d764) | Passed 26 of 27 checks, including ten real screens. Recorded resize from 80×24 to 40×12 stayed at 80×24 and wrapped incorrectly. Ttyrec conversion also needs a separate marker channel. | Rejected for resize failure. No npm package; source last changed in 2020 and depends on an old term.js fork. Large-part test skipped. |
 
-The current player's [pinned license](https://github.com/asciinema/asciinema-player/blob/v3.17.0/LICENSE) is Apache-2.0; [xterm.js](https://github.com/xtermjs/xterm.js/blob/master/LICENSE), [ghostty-web](https://github.com/coder/ghostty-web/blob/main/LICENSE) and tty-player use MIT. These allow a company-designed interface while retaining the required notices with distributed code. A visible third-party badge and a distributed license notice are separate concerns; changing engines does not make third-party code notice-free. Generated notices need not be committed as vendored files in this PR.
+The xterm.js package integrity matched the registry. It has no runtime dependencies; its upstream repository was active on the research date. GitHub listed no published advisories and OSV returned no match for 6.0.0. Those bounded checks do not prove absence of vulnerabilities. Package code and required notices remain in installed/generated assets, outside tracked source.
 
-A renderer replacement can preserve the recording format and capture path, so it adds no live harness work. Its browser CPU, memory and fidelity still need measurement. Acceptance must cover backwards seeks, equal-time failure frames, resizes, Unicode and cursor state, speed changes, dense traces, part checkpoints, and offline downloads before replacing the tested engine. Building a terminal emulator from scratch would add much more maintenance than owning the small playback UI.
+In one shared 32 MiB JSONL trial (220,455 events; 21.27 MiB terminal output), the xterm prototype applied the already-parsed stream in 660 ms. The previous player opened in 401 ms and then sought to the end in 174 ms. The controller paths differ, so these are responsiveness observations, not a controlled engine speed comparison. Replacing the browser renderer does not reduce or increase live capture work. Production checks cover recorded dimensions, backward seeks, exact failure frames, Unicode, speed changes, dense traces, retained parts and offline downloads.
+
+### Ten concurrent real-model sessions
+
+Two rounds ran ten native TUI sessions per arm: official [v1.9.2](https://github.com/getkimchi/kimchi/releases/tag/v1.9.2), preview recording OFF, and the same preview recording ON. All **60 sessions passed**, with no provider errors or paid retries. Every session used GLM-5.3, medium thinking, a 120×40 terminal, the same four reads (one deliberate missing file), then 40 numbered lines. Twenty recordings contained all 80 expected framed tool results.
+
+| Metric | v1.9.2 | Preview OFF | Preview ON |
+| --- | ---: | ---: | ---: |
+| Mean primary CPU per session | 8.85 s | 8.52 s | 10.04 s |
+| Median command peak RAM per session | 316.84 MiB | 329.34 MiB | 336.71 MiB |
+| Reported output tokens across 20 sessions | 132,665 | 132,562 | 139,322 |
+
+The same-build observed difference was **+1.52 CPU seconds per session (+17.8%)** and **+7.37 MiB median peak RAM**. Per-round CPU differences were +2.2% and +36.0%. ON produced 5.1% more output tokens and spent 13.0% longer in active work; real reasoning/timing and host load varied. These samples do not establish an exact recorder penalty or universally negligible overhead. The earlier deterministic three-session batches measured about +2% CPU; the different workloads should be assessed separately.
+
+Recording data across 20 ON sessions was 65.51 MiB raw and 9.34 MiB compressed. Allocated space was 9.78 MiB at close and 9.46 MiB on later inspection; logical bytes were unchanged and the difference's cause was not established. This is measured short-session storage, not a five-day extrapolation.
+
+The baseline commit was `c635f5384`; preview `281b1a1a9` also contains two unrelated release differences, so use ON/OFF for the switch comparison. CPU uses the maximum sampled cumulative counter for each owned PID, preserving zero-valued exit samples. Concurrent RAM uses simultaneous snapshots; observed sampling medians were 166–177 ms. Driver/tmux CPU, input latency, slow disks and five-day soak behavior were not measured. Builds, browser tests and encoding were paused during sampling; unrelated host activity remained. The subsequent browser replacement does not change ordinary capture writes. Its Unicode alignment affects part-boundary reconstruction; that and resource-toggle transitions have separate functional checks and were not measured in these runs.
 
 Run focused contracts with `pnpm exec vitest run src/terminal-replay src/utils/export-post-process.test.ts src/utils/export-post-process.redaction.test.ts`. After `pnpm run build:binary`, run `node scripts/run-tui-e2e.js 'session-replay[.]test[.]ts$' --trace`. Anchor the filename: test filters match the complete path, including worktree names.
 

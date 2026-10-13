@@ -12,9 +12,16 @@ export default function (pi) {
 				const entries = await Promise.all(
 					(await readdir(root))
 						.filter((name) => name.startsWith("slot-"))
-						.map(async (name) => JSON.parse(await readFile(join(root, name, "metadata.json"), "utf8"))),
+						.map(async (name) => {
+							try {
+								return JSON.parse(await readFile(join(root, name, "metadata.json"), "utf8"))
+							} catch {
+								// A newly reserved slot may not have published its complete metadata yet.
+								return undefined
+							}
+						}),
 				)
-				return entries.find((entry) => entry.pid === process.pid && entry.status === "recording")
+				return entries.find((entry) => entry?.pid === process.pid && entry.status === "recording")
 			}
 			const deadline = Date.now() + 30000
 			while (Date.now() < deadline) {
@@ -23,7 +30,11 @@ export default function (pi) {
 					ctx.ui.notify("REPLAY_PART_TWO_READY", "info")
 					return
 				}
-				if (!before) throw new Error("Recording stopped during the boundary check")
+				if (!before) {
+					// Rotation completes the old slot before publishing the next recording slot.
+					await delay(5)
+					continue
+				}
 				process.stdout.write("\x1b[0m".repeat(8000))
 				// Pace the synthetic producer to committed chunks rather than overflowing the queue.
 				while (Date.now() < deadline) {

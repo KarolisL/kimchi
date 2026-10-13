@@ -1,9 +1,9 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { expect, test } from "@microsoft/tui-test"
-import { waitForText, waitForTurnToSettle } from "./support/assertions.js"
-import { runKimchiSession, TUI_TEST_CONFIG } from "./support/kimchi-fixture.js"
+import { viewText, waitForText, waitForTurnToSettle } from "./support/assertions.js"
+import { PROMPT_READY, runKimchiSession, TUI_TEST_CONFIG } from "./support/kimchi-fixture.js"
 import { toolResultText } from "./support/mcp-model-script.js"
 
 interface ExportedRecording {
@@ -259,6 +259,92 @@ test("keeps recording after a full part and exports the continued screen", async
 				Math.max(...firstSteps.map((step) => step.step)),
 			)
 			trace.step("later part retains the preceding screen and carries only its own linked trace steps")
+		},
+	)
+})
+
+test("toggles terminal recording live from resources and retains earlier visits", async ({ terminal }) => {
+	await runKimchiSession(
+		terminal,
+		{
+			artifactName: "session-replay-resource-toggle",
+			responses: [
+				{ stream: ["REPLAY_BEFORE_DISABLE."] },
+				{ stream: ["REPLAY_WHILE_DISABLED."] },
+				{ stream: ["REPLAY_AFTER_ENABLE."] },
+			],
+		},
+		async (fixture, trace) => {
+			const settingsPath = join(fixture.agentDir, "settings.json")
+			const recordingRoot = join(fixture.agentDir, "terminal-recordings")
+			const openRecordingToggle = async () => {
+				terminal.submit("/resources")
+				await waitForText(terminal, "Kimchi resources", { full: false })
+				terminal.keyRight(3)
+				await waitForText(terminal, "Built-in Kimchi feature modules.", { full: false })
+				for (let index = 0; index < 30 && !viewText(terminal).includes("extensions.terminal-recording —"); index++) {
+					terminal.keyDown()
+					await new Promise((resolve) => setTimeout(resolve, 100))
+				}
+				await waitForText(terminal, "extensions.terminal-recording — Applies immediately.", { full: false })
+			}
+			terminal.submit("Record the first visible response")
+			await waitForText(terminal, "REPLAY_BEFORE_DISABLE.")
+			await waitForTurnToSettle(fixture.fake.requests)
+			await openRecordingToggle()
+			await waitForText(terminal, /Terminal recording\s+enabled/, { full: false })
+			terminal.submit("")
+			await waitForText(terminal, /Terminal recording\s+disabled/, { full: false })
+			expect(JSON.parse(readFileSync(settingsPath, "utf8")).terminalRecording).toBe(false)
+			terminal.keyEscape()
+			await waitForTurnToSettle(fixture.fake.requests)
+			const oldSlots = readdirSync(recordingRoot).filter((name) => name.startsWith("slot-"))
+			expect(oldSlots).toHaveLength(1)
+			const oldSlot = join(recordingRoot, oldSlots[0])
+			expect(JSON.parse(readFileSync(join(oldSlot, "metadata.json"), "utf8")).status).toBe("complete")
+			const oldOutput = readFileSync(join(oldSlot, "output.bin"))
+			terminal.submit("This prompt must not create a recorded trace step")
+			await waitForText(terminal, "REPLAY_WHILE_DISABLED.")
+			await waitForTurnToSettle(fixture.fake.requests)
+			expect(readFileSync(join(oldSlot, "output.bin")).equals(oldOutput)).toBe(true)
+			expect(readdirSync(recordingRoot).filter((name) => name.startsWith("slot-"))).toHaveLength(1)
+			trace.step("resources disabled capture immediately; the existing recording stopped growing")
+			await openRecordingToggle()
+			await waitForText(terminal, /Terminal recording\s+disabled/, { full: false })
+			terminal.submit("")
+			await waitForText(terminal, /Terminal recording\s+enabled/, { full: false })
+			expect(JSON.parse(readFileSync(settingsPath, "utf8")).terminalRecording).toBe(true)
+			terminal.keyEscape()
+			await waitForText(terminal, PROMPT_READY, { full: false })
+			terminal.submit("Record again after enabling")
+			await waitForText(terminal, "REPLAY_AFTER_ENABLE.")
+			await waitForTurnToSettle(fixture.fake.requests)
+			const path = join(fixture.workDir, "toggled-replay.html")
+			terminal.submit(`/export ${path}`)
+			await waitForText(terminal, "Include terminal replay?", { full: false })
+			terminal.keyDown()
+			terminal.submit("")
+			await waitForText(terminal, /Session exported to:\s+\S*toggled-replay\.html/)
+			const visits = recordingPayload(path)
+			expect(visits).toHaveLength(2)
+			expect(visits[0].metadata.sessionId).toBe(visits[1].metadata.sessionId)
+			expect(decodedCast(visits[0])).toContain("REPLAY_BEFORE_DISABLE")
+			expect(decodedCast(visits[0])).not.toContain("REPLAY_WHILE_DISABLED")
+			const resumedEvents = decodedCast(visits[1])
+				.trim()
+				.split("\n")
+				.slice(1)
+				.map((line) => JSON.parse(line))
+			const firstOutput = resumedEvents.find((event) => event[1] === "o")?.[2]
+			expect(firstOutput).toContain("\u001b[2J")
+			expect(
+				visits.flatMap(recordedSteps).some((step) => step.detail.includes("must not create a recorded trace step")),
+			).toBe(false)
+			expect(recordedSteps(visits[1]).some((step) => step.detail.includes("REPLAY_AFTER_ENABLE."))).toBe(true)
+			expect(readFileSync(join(oldSlot, "output.bin")).equals(oldOutput)).toBe(true)
+			trace.step(
+				"resources re-enabled capture with a full frame; export retains both visits and omits disabled trace steps",
+			)
 		},
 	)
 })

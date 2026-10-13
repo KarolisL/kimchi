@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; font-src data:; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <title>Kimchi terminal replay</title>
 <style>/* PLAYER_CSS */</style>
 <style>
@@ -74,8 +74,8 @@
   #coverage[data-status$="limit"], #coverage[data-status="storage-error"] { color: #d6ba79; }
   .page-footer { display: flex; flex-shrink: 0; justify-content: space-between; gap: 12px; padding: 7px 18px; color: var(--muted); font-size: 10px; background: var(--card); }
   #recording-summary { font-variant-numeric: tabular-nums; }
-  div.ap-wrapper div.ap-player { border-radius: 3px; }
-  #player .ap-overlay-start { display: none; }
+  .kimchi-terminal { display: flex; align-items: center; justify-content: center; overflow: hidden; width: 100%; height: 100%; border-radius: 3px; background: #101010; }
+  .kimchi-terminal > div { flex-shrink: 0; transform-origin: center; }
   @media (max-width: 900px) {
     .workspace { display: flex; flex-direction: column; overflow: auto; }
     .terminal-pane { flex-shrink: 0; min-height: 300px; }
@@ -144,8 +144,6 @@
   <p id="coverage" role="status"></p>
 </main>
 <footer class="page-footer"><span id="recording-summary"></span><span>Original pauses preserved</span></footer>
-<!-- Third-party licenses are included in the standalone document source. -->
-<script id="licenses" type="application/json">/* LICENSES */</script>
 <script id="recordings" type="application/json">/* RECORDINGS */</script>
 <script>/* PLAYER_JS */</script>
 <script>
@@ -191,17 +189,27 @@
   let lastFollowTime = -1;
   const clock = time => Math.floor(time / 60) + ':' + String(Math.floor(time % 60)).padStart(2, '0');
   function readTrace(cast) {
-    if (!cast.includes('kimchi.trace')) return { cast, steps: [], markers: [] };
     const lines = cast.trimEnd().split('\n');
     const header = JSON.parse(lines[0]);
+    if (![2, 3].includes(header.version)) throw new Error('Unsupported recording format');
+    const cols = header.term?.cols ?? header.width;
+    const rows = header.term?.rows ?? header.height;
+    if (!Number.isSafeInteger(cols) || !Number.isSafeInteger(rows) || cols < 1 || rows < 1) throw new Error('Invalid terminal size');
     const trace = [];
     const markers = [];
+    const events = [];
     let time = 0;
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i].trim()) continue;
       const event = JSON.parse(lines[i]);
+      if (!Array.isArray(event) || !Number.isFinite(event[0]) || event[0] < 0 || typeof event[2] !== 'string') throw new Error('Invalid recording event');
+      const previousTime = time;
       time = header.version === 3 ? time + event[0] * 1000 : event[0] * 1000;
-      if (event[1] !== 'm') continue;
+      if (!Number.isFinite(time) || time < previousTime) throw new Error('Invalid recording time');
+      if (event[1] !== 'm') {
+        if (event[1] === 'o' || event[1] === 'r') events.push([time / 1000, event[1], event[2]]);
+        continue;
+      }
       let step;
       try { step = JSON.parse(event[2]); } catch {}
       if (step?.type === 'kimchi.trace' && step.version === 1 && Number.isSafeInteger(step.step)
@@ -209,15 +217,16 @@
         && ['prompt', 'response', 'tool_call', 'tool_result', 'error'].includes(step.kind)) {
         const entry = { ...step, time: time / 1000, title: step.title.slice(0, 120), detail: step.detail.slice(0, 8192) };
         trace.push(entry);
-        if (step.frame) markers.push(entry);
-        // Preserve output/marker order: overriding markers would reorder equal-time events.
-        lines[i] = JSON.stringify([event[0], step.frame ? 'm' : 'o', step.frame ? entry.title : '']);
+        if (step.frame) {
+          events.push([time / 1000, 'm', markers.length]);
+          markers.push(entry);
+        }
       } else {
+        events.push([time / 1000, 'm', markers.length]);
         markers.push(undefined);
-        lines[i] = JSON.stringify([event[0], 'm', String(event[2]).slice(0, 120)]);
       }
     }
-    return { cast: lines.join('\n') + '\n', steps: trace, markers };
+    return { cols, rows, events, steps: trace, markers };
   }
   function errorAfter(index) {
     return steps.findIndex((step, i) => i > index && step.frame && step.error === true);
@@ -394,14 +403,12 @@
     visit.appendChild(option);
   }
   visit.value = String(recordings.length - 1);
-  async function mount(keepPosition = false) {
+  async function mount() {
     const current = ++generation;
-    const position = keepPosition && player ? player.getCurrentTime() : 0;
-    const selectedStep = keepPosition ? selected : -1;
     const previous = player;
-    if (!keepPosition) playing = false;
+    playing = false;
     playbackToggle.textContent = playing ? 'Pause' : 'Play';
-    if (!keepPosition) delete container.dataset.inspecting;
+    delete container.dataset.inspecting;
     visit.disabled = speed.disabled = true;
     container.setAttribute('aria-busy', 'true');
     const host = document.createElement('div');
@@ -421,7 +428,7 @@
     document.getElementById('recording-summary').textContent = metadata.duration.toFixed(1) + ' seconds · ' + metadata.cols + '×' + metadata.rows + ' initially';
     try {
       await previous?.pause();
-      // Keep only the selected visit decoded; speed changes reuse its data.
+      // Keep only the selected part decoded.
       if (cachedVisit !== visit.value) {
         cachedVisit = visit.value;
         const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
@@ -432,13 +439,9 @@
       if (current !== generation) return;
       steps = recording.steps;
       playbackSeek.max = metadata.duration;
-      renderTrace(selectedStep);
+      renderTrace(-1);
       container.appendChild(host);
-      next = AsciinemaPlayer.create({ data: recording.cast }, host, {
-        fit: 'both', controls: false,
-        preload: true, speed: Number(speed.value), terminalFontSize: 14,
-        terminalFontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
-      });
+      next = createTerminalReplay(recording, host, { duration: metadata.duration, speed: Number(speed.value) });
       next.addEventListener('playing', () => { if (current === generation) { playing = true; playbackToggle.textContent = 'Pause'; } });
       for (const event of ['pause', 'ended']) {
         next.addEventListener(event, () => { if (current === generation) { playing = false; playbackToggle.textContent = 'Play'; } });
@@ -452,15 +455,14 @@
       next.addEventListener('error', () => {
         if (current === generation) coverage.textContent = 'This recording could not be played. The conversation transcript is still available.';
       });
-      await next.seek(position);
+      await next.seek(0);
       if (current !== generation) { next.dispose(); host.remove(); return; }
-      // Keep the previous screen visible until the replacement is positioned.
+      // Keep the previous part visible until the replacement is positioned.
       previous?.dispose();
       container.replaceChildren(host);
       host.style.visibility = '';
       player = next;
-      lastFollowTime = selectedStep >= 0 ? position : -1;
-      if (playing) await player.play();
+      lastFollowTime = -1;
     } catch {
       next?.dispose();
       host.remove();
@@ -480,7 +482,7 @@
     player?.pause();
   });
   visit.addEventListener('change', () => mount());
-  speed.addEventListener('change', () => mount(true));
+  speed.addEventListener('change', () => player?.setSpeed(Number(speed.value)));
   mount();
 })();
 </script>

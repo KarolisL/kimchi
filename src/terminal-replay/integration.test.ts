@@ -8,6 +8,9 @@ import type { TraceStep } from "./trace.js"
 
 const state = vi.hoisted(() => ({
 	enabled: true,
+	change: undefined as ((path: string) => void) | undefined,
+	createWait: undefined as Promise<void> | undefined,
+	untaps: [] as Array<ReturnType<typeof vi.fn>>,
 	order: [] as string[],
 	recorders: [] as Array<{
 		metadata: { sessionId: string }
@@ -36,6 +39,7 @@ function session(id: string) {
 
 interface TestMode {
 	session: ReturnType<typeof session>
+	ui: { requestRender: ReturnType<typeof vi.fn> }
 	init(): Promise<void>
 	rebindCurrentSession(): Promise<void>
 }
@@ -61,8 +65,21 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	},
 }))
 vi.mock("../cli-args.js", () => ({ getParsedCliArgs: () => ({ options: {} }) }))
-vi.mock("../config/settings.js", () => ({ readConfigSetting: () => state.enabled }))
-vi.mock("./output-tap.js", () => ({ tapTerminalOutput: () => vi.fn() }))
+vi.mock("../resources/store.js", () => ({
+	getResourceSettingsPath: () => "/tmp/replay-integration-test/settings.json",
+	isResourceEnabled: () => state.enabled,
+	onTerminalRecordingChange: (listener: (path: string) => void) => {
+		state.change = listener
+		return vi.fn()
+	},
+}))
+vi.mock("./output-tap.js", () => ({
+	tapTerminalOutput: () => {
+		const untap = vi.fn()
+		state.untaps.push(untap)
+		return untap
+	},
+}))
 vi.mock("./recorder.js", () => ({
 	TerminalRecorder: {
 		create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
@@ -82,6 +99,7 @@ vi.mock("./recorder.js", () => ({
 				close: vi.fn(async () => {}),
 			}
 			state.recorders.push(recorder)
+			await state.createWait
 			return recorder
 		}),
 	},
@@ -104,6 +122,9 @@ describe("terminal trace integration", () => {
 	it("observes after the UI, replaces subscriptions on rebind, and finalizes raw exports", async () => {
 		installTerminalRecording()
 		installTerminalRecording()
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		await Promise.resolve()
+		expect(state.recorders).toHaveLength(0)
 		const mode = new (InteractiveMode as unknown as new () => TestMode)()
 		await mode.init()
 		const prompt: AgentSessionEvent = {
@@ -156,5 +177,62 @@ describe("terminal trace integration", () => {
 		mode.session.emit({ type: "message_start", message: { role: "user", content: "Not recorded", timestamp: 1 } })
 		expect(state.order).toEqual(["ui"])
 		expect(state.recorders).toHaveLength(count)
+	})
+
+	it("applies the resource toggle live and starts a complete frame without replacing the session", async () => {
+		state.enabled = true
+		const mode = new (InteractiveMode as unknown as new () => TestMode)()
+		await mode.init()
+		const first = state.recorders.at(-1)
+		const untap = state.untaps.at(-1)
+		const count = state.recorders.length
+		state.enabled = false
+		state.change?.("/tmp/another-session/settings.json")
+		expect(untap).not.toHaveBeenCalled()
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		expect(untap).toHaveBeenCalledOnce()
+		expect(first?.close).toHaveBeenCalledOnce()
+		mode.session.emit({ type: "message_start", message: { role: "user", content: "While disabled", timestamp: 2 } })
+		expect(first?.trace).not.toHaveBeenCalled()
+		state.enabled = true
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		await vi.waitFor(() => expect(state.recorders).toHaveLength(count + 1))
+		await vi.waitFor(() => expect(mode.ui.requestRender).toHaveBeenCalledWith(true))
+		const resumed = state.recorders.at(-1)
+		expect(resumed?.metadata.sessionId).toBe(first?.metadata.sessionId)
+		mode.session.emit({ type: "message_start", message: { role: "user", content: "After enabling", timestamp: 3 } })
+		expect(resumed?.trace).toHaveBeenCalledOnce()
+		expect(first?.trace).not.toHaveBeenCalled()
+		state.enabled = false
+		state.change?.("/tmp/replay-integration-test/settings.json")
+	})
+
+	it("does not reattach a pending recorder after disabling, and can enable again", async () => {
+		state.enabled = false
+		const mode = new (InteractiveMode as unknown as new () => TestMode)()
+		await mode.init()
+		let ready!: () => void
+		state.createWait = new Promise<void>((resolve) => {
+			ready = resolve
+		})
+		const count = state.recorders.length
+		const tapCount = state.untaps.length
+		state.enabled = true
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		await vi.waitFor(() => expect(state.recorders).toHaveLength(count + 1))
+		const cancelled = state.recorders.at(-1)
+		state.enabled = false
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		state.createWait = undefined
+		ready()
+		await vi.waitFor(() => expect(cancelled?.close).toHaveBeenCalledOnce())
+		expect(state.untaps).toHaveLength(tapCount)
+		expect(mode.ui.requestRender).not.toHaveBeenCalled()
+		state.enabled = true
+		state.change?.("/tmp/replay-integration-test/settings.json")
+		await vi.waitFor(() => expect(mode.ui.requestRender).toHaveBeenCalledWith(true))
+		expect(state.untaps).toHaveLength(tapCount + 1)
+		state.enabled = false
+		state.change?.("/tmp/replay-integration-test/settings.json")
 	})
 })

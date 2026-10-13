@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs"
 import { gunzipSync, gzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
 import { addTerminalReplay } from "./export.js"
@@ -45,9 +44,9 @@ describe("HTML terminal replay", () => {
 		if (!payload) throw new Error("Replay payload missing")
 		const data = JSON.parse(payload)
 		expect(gunzipSync(Buffer.from(data[0].gzip, "base64")).toString("utf8")).toBe(cast)
-		expect(player).toContain("Apache License")
-		expect(player).toContain("Copyright (c) 2018 Marcin Kulik")
-		expect(player).toContain('<script id="licenses" type="application/json">')
+		expect(player).toContain("Permission is hereby granted, free of charge")
+		expect(player).not.toContain("AsciinemaPlayer")
+		expect(player).not.toContain("wasm-unsafe-eval")
 		expect(player).not.toContain("Standalone distribution used without modification.")
 	})
 
@@ -94,15 +93,5 @@ describe("HTML terminal replay", () => {
 		expect(embedded.gzip).toBe(original.gzip)
 		expect(player).not.toContain(savedText)
 		expect(original).not.toHaveProperty("traceDetails")
-	})
-
-	it("keeps the pinned standalone player assets unchanged", async () => {
-		const { createHash } = await import("node:crypto")
-		const js = readFileSync(
-			new URL("../../resources/terminal-replay/generated/asciinema-player.min.js", import.meta.url),
-		)
-		expect(createHash("sha256").update(js).digest("hex")).toBe(
-			"a13c37632e1b5c49fe9128417b9319a9b5bc64cb457dd5ae52cbba8a3aceb880",
-		)
 	})
 })

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { gzipSync } from "node:zlib"
-import { chromium } from "playwright"
+import { chromium, type Locator } from "playwright"
 import { postProcessHtmlExport } from "../utils/export-post-process.js"
 import { addTerminalReplay } from "./export.js"
 import { readRecordings, TerminalRecorder } from "./recorder.js"
@@ -25,7 +25,7 @@ try {
 		now: () => now,
 	})
 	now = 100
-	recorder.write("\x1b[2J\x1b[H\x1b[2;1HDUPLICATE BUG\x1b[3;1HDUPLICATE BUG\x1b[4;7H界")
+	recorder.write("\x1b[2J\x1b[H\x1b[2;1HDUPLICATE BUG\x1b[3;1HDUPLICATE BUG\x1b[4;7H界 e\u0301\x1b[5;77H🧑ABZ")
 	now = 2000
 	recorder.write("\x1b[3;1H\x1b[2Kcleared later")
 	now = 3000
@@ -62,9 +62,9 @@ try {
 	assert.equal(await page.locator("#app").isVisible(), false)
 	assert.equal(await page.locator("#terminal-replay-open").getAttribute("aria-pressed"), "true")
 	const frame = page.frameLocator("#terminal-replay-frame")
-	await frame.locator(".ap-term").waitFor()
-	assert.doesNotMatch(await frame.locator("body").innerText(), /Player credits|asciinema-player|Marcin Kulik/)
-	assert.match((await frame.locator("#licenses").textContent()) ?? "", /Apache License/)
+	await frame.locator(".xterm-screen").waitFor()
+	assert.doesNotMatch(await frame.locator("body").innerText(), /Player credits/)
+	assert.match(await frame.locator("html").innerHTML(), /Permission is hereby granted, free of charge/)
 	const details = frame.locator("details").filter({ has: frame.getByText("Recording details", { exact: true }) })
 	assert.equal(await details.locator(".details-body").isVisible(), false)
 	await details.locator("summary").click()
@@ -74,7 +74,7 @@ try {
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(await frame.locator("#playback-controls").isVisible(), true)
 	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).count(), 1)
-	assert.equal(await frame.locator(".ap-control-bar").isVisible(), false, "Only the shared replay controls are visible")
+	assert.equal(await frame.getByRole("slider", { name: "Seek recording" }).count(), 1)
 	async function seek(fraction: number) {
 		const slider = frame.getByRole("slider", { name: "Seek recording" })
 		const box = await slider.boundingBox()
@@ -82,26 +82,57 @@ try {
 		await slider.click({ position: { x: box.width * fraction, y: box.height / 2 } })
 		await page.waitForTimeout(150)
 	}
-	const lines = () => frame.locator(".ap-line").allTextContents()
+	const terminalLines = async (rows: Locator) =>
+		(await rows.allTextContents()).map((line) => line.replaceAll("\u00a0", " "))
+	const lines = () => terminalLines(frame.locator(".xterm-rows > div"))
 	await seek(0.2)
 	let rows = await lines()
 	assert.equal(rows.length, 24)
 	assert.equal(rows[1].trimEnd(), "DUPLICATE BUG")
 	assert.equal(rows[2].trimEnd(), "DUPLICATE BUG")
 	assert.equal(rows[3].indexOf("界"), 6)
+	assert.equal(rows[3].trimEnd(), "      界 e\u0301")
+	assert.equal(rows[4].trimEnd(), `${" ".repeat(76)}🧑AB`)
+	assert.equal(rows[5].trimEnd(), "Z", "The emoji must occupy two columns before wrapping")
 	await seek(0.5)
 	assert.equal((await lines())[2].trimEnd(), "cleared later")
 	await seek(0.7)
 	rows = await lines()
 	assert.equal(rows.length, 12, "The recorded resize must change the emulator's rows")
-	assert.equal(
-		await frame.locator(".ap-term").evaluate((element) => element.style.getPropertyValue("--term-cols")),
-		"40",
-	)
 	assert.equal(rows[3].slice(38), "XY")
 	assert.equal(rows[4].trimEnd(), "ZZ", "Output must wrap at the recorded width")
+	for (let reset = 0; reset < 3; reset++) {
+		await seek(0.2)
+		rows = await lines()
+		assert.equal(rows.length, 24, "Backward seek must restore the initial terminal dimensions")
+		assert.equal(rows[3].trimEnd(), "      界 e\u0301")
+		assert.equal(rows[4].trimEnd(), `${" ".repeat(76)}🧑AB`)
+		assert.equal(rows[5].trimEnd(), "Z", "Repeated resets must retain Unicode character widths")
+		await seek(0.7)
+		assert.equal((await lines())[4].trimEnd(), "ZZ")
+	}
+	await frame.getByLabel("Seek recording").evaluate((element) => {
+		const slider = element as HTMLInputElement
+		for (const fraction of [0.2, 0.7, 0.2]) {
+			slider.value = String(Number(slider.max) * fraction)
+			slider.dispatchEvent(new Event("input", { bubbles: true }))
+		}
+	})
+	await frame.locator(".xterm-rows > div").filter({ hasText: "🧑AB" }).waitFor()
+	await page.waitForTimeout(150)
+	rows = await lines()
+	assert.equal(rows.length, 24, "The last request in a rapid seek sequence must win")
+	assert.equal(rows[5].trimEnd(), "Z")
+	await seek(0.7)
+	const screenBeforeSpeed = await frame.locator(".xterm-screen").elementHandle()
+	assert(screenBeforeSpeed)
 	await frame.getByLabel("Playback speed").selectOption("4")
 	await page.waitForTimeout(200)
+	assert.equal(
+		await screenBeforeSpeed.evaluate((element) => element.isConnected),
+		true,
+		"Changing speed must keep the visible terminal mounted",
+	)
 	assert.equal((await lines())[4].trimEnd(), "ZZ", "Speed change must preserve position")
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
 	await page.waitForTimeout(100)
@@ -110,6 +141,8 @@ try {
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
 	await frame.getByLabel("Playback speed").selectOption("0.5")
 	await page.waitForTimeout(200)
+	assert.equal(await screenBeforeSpeed.evaluate((element) => element.isConnected), true)
+	await screenBeforeSpeed.dispose()
 	assert.equal(
 		await frame.getByRole("button", { name: "Pause", exact: true }).isVisible(),
 		true,
@@ -123,7 +156,7 @@ try {
 	assert.equal(await page.locator("#app").isVisible(), true)
 	assert.equal(await page.evaluate(() => window.scrollY), 900, "Returning must preserve transcript scroll")
 	await page.locator("#terminal-replay-open").click()
-	await frame.locator(".ap-term").waitFor()
+	await frame.locator(".xterm-screen").waitFor()
 	assert.deepEqual(await lines(), beforeClose, "Reopening replay must preserve the recorded screen and position")
 	assert.equal(await frame.getByLabel("Playback speed").inputValue(), "0.5")
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
@@ -145,7 +178,7 @@ try {
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	await seek(0.7)
 	assert.equal((await lines())[4].trimEnd(), "ZZ")
-	assert.equal(await frame.locator(".ap-wrapper").count(), 1, "Only the selected player remains mounted")
+	assert.equal(await frame.locator("#player .xterm").count(), 1, "Only the selected player remains mounted")
 	const downloaded = page.waitForEvent("download")
 	await frame.getByRole("button", { name: "Download part", exact: true }).click()
 	const download = await downloaded
@@ -162,10 +195,10 @@ try {
 	await offline.goto(pathToFileURL(downloadPath).href)
 	await offline.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(await offline.getByLabel("Recording part").locator("option").count(), 1)
-	assert.match((await offline.locator("#licenses").textContent()) ?? "", /Apache License/)
+	assert.match(await offline.content(), /Permission is hereby granted, free of charge/)
 	await offline.getByRole("button", { name: "Play", exact: true }).click()
 	await offline.waitForTimeout(300)
-	assert.equal((await offline.locator(".ap-line").allTextContents())[1].trimEnd(), "DUPLICATE BUG")
+	assert.equal((await terminalLines(offline.locator(".xterm-rows > div")))[1].trimEnd(), "DUPLICATE BUG")
 	await offline.close()
 	await page.setViewportSize({ width: 390, height: 844 })
 	await page.waitForTimeout(150)
@@ -267,7 +300,7 @@ try {
 	await subagent.contentFrame().locator("#app").waitFor()
 	assert.equal(await subagent.contentFrame().locator('[id^="terminal-replay-"]').count(), 0)
 	await page.locator("#terminal-replay-open").click()
-	await frame.locator(".ap-term").waitFor()
+	await frame.locator(".xterm-screen").waitFor()
 	assert.equal(await subagent.isVisible(), false)
 	assert.equal(await page.locator("#subagent-tabs").isVisible(), false)
 	await page.locator("#terminal-replay-close").click()
@@ -478,7 +511,7 @@ try {
 	await selected(3)
 	assert.deepEqual(await lines(), failedScreen, "Changing speed at a breakpoint must preserve the failed frame")
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
-	await frame.locator(".ap-line").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
+	await frame.locator(".xterm-rows > div").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
 	await frame.getByRole("button", { name: "Pause", exact: true }).click()
 	await seek(0.1)
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
@@ -487,7 +520,7 @@ try {
 	await frame.getByLabel("Pause on errors").uncheck()
 	await seek(0.1)
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
-	await frame.locator(".ap-line").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
+	await frame.locator(".xterm-rows > div").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
 	await frame.getByRole("button", { name: "Pause", exact: true }).click()
 	await frame.getByLabel("Recording part").selectOption("1")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
@@ -524,7 +557,7 @@ try {
 	await linkedOffline.locator('#trace-list .trace-step[data-step="8"]').click()
 	await linkedOffline.locator('#trace-list .trace-step[data-step="8"][aria-current="true"]').waitFor()
 	assert.equal(
-		(await linkedOffline.locator(".ap-line").allTextContents())[0].trimEnd(),
+		(await terminalLines(linkedOffline.locator(".xterm-rows > div")))[0].trimEnd(),
 		"SECOND ERROR: the next failure",
 		"Downloaded parts must retain working trace links offline",
 	)
@@ -597,7 +630,7 @@ try {
 		"Auto-pause must not advance into a same-clock later frame",
 	)
 	await frame.getByRole("button", { name: "Play", exact: true }).click()
-	await frame.locator(".ap-line").filter({ hasText: "SECOND RECOVERED FRAME" }).waitFor()
+	await frame.locator(".xterm-rows > div").filter({ hasText: "SECOND RECOVERED FRAME" }).waitFor()
 	await frame.getByRole("button", { name: "Pause", exact: true }).click()
 
 	const denseEvents: [number, string, string][] = []
@@ -630,7 +663,7 @@ try {
 	await selected(250)
 	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250")
 	await frame.locator("#playback-toggle").click()
-	await frame.locator(".ap-line").filter({ hasText: "DENSE STEP 501" }).waitFor()
+	await frame.locator(".xterm-rows > div").filter({ hasText: "DENSE STEP 501" }).waitFor()
 	await frame
 		.locator("#playback-toggle")
 		.filter({ hasText: /^Play$/ })
@@ -653,7 +686,7 @@ try {
 	assert.equal(await denseOffline.getByLabel("Seek recording").isVisible(), true)
 	await denseOffline.getByRole("button", { name: "Next error", exact: true }).click()
 	await denseOffline.locator('#trace-list .trace-step[data-step="250"][aria-current="true"]').waitFor()
-	assert.equal((await denseOffline.locator(".ap-line").allTextContents())[0].trimEnd(), "DENSE STEP 250")
+	assert.equal((await terminalLines(denseOffline.locator(".xterm-rows > div")))[0].trimEnd(), "DENSE STEP 250")
 	await denseOffline.close()
 	await frame.locator("#playback-toggle").click()
 	await frame
@@ -673,6 +706,82 @@ try {
 	await page.waitForTimeout(250)
 	assert.equal(Number(await frame.getByLabel("Seek recording").inputValue()), 0)
 	assert.deepEqual(await lines(), switchedScreen, "A newly selected dense part must remain paused at the beginning")
+
+	const largeOutput = `\x1b[2J\x1b[HLARGE WRITE START${"\x1b[0m".repeat(600_000)}\x1b[2J\x1b[HSTALE LARGE PART`
+	await writeFile(
+		path,
+		await addTerminalReplay(transcript, [
+			tracedPart(1, [
+				[0, "o", "\x1b[2J\x1b[HREADY LARGE PART"],
+				[0.1, "o", largeOutput],
+				[2, "o", ""],
+			]),
+			tracedPart(2, [
+				[0, "o", "\x1b[2J\x1b[HNEW SMALL PART"],
+				[2, "o", ""],
+			]),
+		]),
+	)
+	await page.goto(pathToFileURL(path).href)
+	await page.locator("#terminal-replay-open").click()
+	await frame.getByLabel("Recording part").selectOption("0")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	const partSelector = await frame.getByLabel("Recording part").elementHandle()
+	assert(partSelector)
+	await frame.getByLabel("Seek recording").evaluate((element, selector) => {
+		const slider = element as HTMLInputElement
+		slider.value = "1"
+		slider.dispatchEvent(new Event("input", { bubbles: true }))
+		const part = selector as HTMLSelectElement
+		part.value = "1"
+		part.dispatchEvent(new Event("change", { bubbles: true }))
+	}, partSelector)
+	await partSelector.dispose()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	await frame.locator(".xterm-rows > div").filter({ hasText: "NEW SMALL PART" }).waitFor()
+	await page.waitForTimeout(250)
+	assert.equal((await lines())[0].trimEnd(), "NEW SMALL PART", "Queued output from a disposed part must not leak")
+	assert.equal(await frame.locator("#player .xterm").count(), 1)
+	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).isVisible(), true)
+	assert.equal(Number(await frame.getByLabel("Seek recording").inputValue()), 0)
+
+	await writeFile(
+		path,
+		await addTerminalReplay(transcript, [
+			tracedPart(1, [
+				[0, "o", "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25hCURSOR DEMO"],
+				[0.1, "o", "\x1b[6 q"],
+				[0.4, "o", "\x1b[4 q"],
+				[0.4, "o", "\x1b[!p\x1b[HAFTER SOFT RESET"],
+				[0.4, "o", "\x1b[6 q"],
+				[0.4, "o", "\x1bc\x1b[?1049h\x1b[H\x1b[?25hHARD RESET"],
+				[0.3, "o", ""],
+			]),
+		]),
+	)
+	await page.goto(pathToFileURL(path).href)
+	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	for (const [fraction, shape] of [
+		[0.1, "bar"],
+		[0.3, "underline"],
+		[0.5, "block"],
+		[0.7, "bar"],
+		[0.9, "block"],
+		[0.1, "bar"],
+	] as const) {
+		await seek(fraction)
+		assert.match(
+			(await frame.locator(".xterm-cursor").getAttribute("class")) ?? "",
+			new RegExp(`xterm-cursor-${shape}\\b`),
+			"Recorded cursor shape must survive while the replay controls have focus",
+		)
+		assert.equal(await frame.locator(".xterm.focus").count(), 0)
+		assert.equal(await frame.locator("html").evaluate(() => document.activeElement?.id), "playback-seek")
+	}
+	await frame.getByLabel("Seek recording").focus()
+	await page.keyboard.press("Home")
+	await frame.locator(".xterm-cursor-block").waitFor()
 	assert.deepEqual(requests, [], "The standalone export must not request remote content")
 	assert.deepEqual(errors, [])
 	console.log(

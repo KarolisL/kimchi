@@ -23,17 +23,14 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
 		)
 	}
 	const assets = assetsDirectory()
-	const [template, js, css, license, vtLicense] = await Promise.all(
-		["player.html", "asciinema-player.min.js", "asciinema-player.css", "LICENSE", "VT-LICENSE-MIT"].map((file) =>
-			readFile(join(assets, file), "utf8"),
-		),
+	const [template, js, css] = await Promise.all(
+		["player.html", "player.js", "player.css"].map((file) => readFile(join(assets, file), "utf8")),
 	)
 	const enrichedRecordings = await enrichReplayDetails(html, recordings)
 	const document = template
 		.replace("/* PLAYER_JS */", () => js.replace(/<\/script/gi, "<\\/script"))
 		.replace("/* PLAYER_CSS */", () => css)
 		.replace("/* RECORDINGS */", () => JSON.stringify(enrichedRecordings).replaceAll("<", "\\u003c"))
-		.replace("/* LICENSES */", () => JSON.stringify(`${license}\n\n${vtLicense}`).replaceAll("<", "\\u003c"))
 	const encoded = Buffer.from(document).toString("base64")
 	return appendBeforeBody(
 		html,
