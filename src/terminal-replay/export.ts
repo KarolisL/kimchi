@@ -39,16 +39,16 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
 		html,
 		`
 <style id="terminal-replay-style">
-  #terminal-replay-toolbar { position:sticky;top:0;z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 20px;background:#191b1f;border-bottom:1px solid #303137;color:#eeece9;font:14px system-ui,sans-serif; }
-  #terminal-replay-toolbar strong { font-size:13px;font-weight:600;letter-spacing:.1px; }
-  #terminal-replay-toolbar [role="group"] { display:flex;gap:4px;padding:3px;background:#121316;border:1px solid #303137;border-radius:8px; }
-  #terminal-replay-toolbar button { padding:7px 14px;border:0;border-radius:5px;background:transparent;color:#aab1bd;cursor:pointer;font:500 13px system-ui,sans-serif; }
-  #terminal-replay-toolbar button[aria-pressed="true"] { background:#392c26;color:#f3bb9e;box-shadow:inset 0 0 0 1px #5a4235; }
-  #terminal-replay-toolbar button:hover { color:#fff; }
-  #terminal-replay-toolbar button:focus-visible { outline:2px solid #efaa86;outline-offset:2px; }
+  #terminal-replay-toolbar { position:sticky;top:0;z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 18px;background:var(--container-bg,#1e1e24);border-bottom:1px solid var(--borderMuted,#505050);color:var(--muted,#9999a5);font:12px/18px ui-monospace,Menlo,Consolas,monospace; }
+  #terminal-replay-toolbar strong { color:var(--borderAccent,#00d7ff);font-size:12px; }
+  #terminal-replay-toolbar [role="group"] { display:flex;gap:6px; }
+  #terminal-replay-toolbar button { padding:2px 8px;border:1px solid var(--border,#5f87ff);border-radius:3px;background:var(--container-bg,#1e1e24);color:var(--muted,#9999a5);cursor:pointer;font:inherit;font-size:10px; }
+  #terminal-replay-toolbar button[aria-pressed="true"] { background:var(--selectedBg,#3a3a4a);color:var(--accent,#8abeb7); }
+  #terminal-replay-toolbar button:hover { border-color:var(--borderAccent,#00d7ff);color:var(--accent,#8abeb7); }
+  #terminal-replay-toolbar button:focus-visible { outline:2px solid var(--accent,#8abeb7);outline-offset:2px; }
   body.terminal-replay-inline:not(.terminal-replay-active) #terminal-replay-toolbar { display:none; }
   body.terminal-replay-inline:not(.terminal-replay-active) #hamburger { top:12px; }
-  #terminal-replay-panel { display:none;position:fixed;inset:var(--terminal-replay-header-h,62px) 0 0;z-index:999;background:#111215; }
+  #terminal-replay-panel { display:none;position:fixed;inset:var(--terminal-replay-header-h,62px) 0 0;z-index:999;background:var(--body-bg,#18181e); }
   #terminal-replay-frame { display:block;width:100%;height:100%;border:0; }
   body.terminal-replay-active { overflow:hidden; }
   body.terminal-replay-active #app, body.terminal-replay-active #hamburger, body.terminal-replay-active #sidebar-overlay, body.terminal-replay-active #subagent-tabs, body.terminal-replay-active > iframe { display:none !important; }

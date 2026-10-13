@@ -5,105 +5,92 @@
 <title>Kimchi terminal replay</title>
 <style>/* PLAYER_CSS */</style>
 <style>
-  :root { color-scheme: dark; --accent: #efaa86; --muted: #a4a5ac; --line: #2c2e34; --gutter: clamp(12px, 2.2vw, 32px); }
+  :root { color-scheme: dark; --accent: #8abeb7; --title: #00d7ff; --muted: #9999a5; --line: #383842; --page: #18181e; --card: #1e1e24; --text: #c4c4cf; }
   * { box-sizing: border-box; }
-  body { display: flex; flex-direction: column; height: 100vh; margin: 0; background: #111215; color: #eeece9; font: 14px system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
-  .page-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-shrink: 0; padding: 24px var(--gutter) 20px; }
-  h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -.7px; line-height: 1.25; }
-  .intro { margin: 7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
-  .heading-actions { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
-  .raw-badge { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #51402c; border-radius: 6px; background: #2b231a; color: #e9c090; padding: 5px 8px; font-size: 11px; font-weight: 500; }
-  .raw-badge::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  body { display: flex; flex-direction: column; height: 100vh; margin: 0; background: var(--page); color: var(--text); font: 12px/18px ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace; }
+  .page-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-shrink: 0; padding: 12px 18px; background: var(--card); border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; color: var(--title); font-size: 12px; font-weight: bold; }
+  .heading-actions { display: flex; align-items: center; gap: 16px; }
+  .raw-badge { color: #d6ba79; font-size: 10px; }
   details { position: relative; }
-  summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 6px 0; }
-  summary:hover, details[open] summary { color: #eeece9; }
-  .details-body { position: absolute; z-index: 50; right: 0; top: 100%; width: min(340px, calc(100vw - 32px)); margin-top: 8px; padding: 16px; background: #232428; border: 1px solid #44454c; border-radius: 10px; box-shadow: 0 16px 48px #0008; color: #c1c0c5; font-size: 12px; line-height: 1.6; }
+  summary { cursor: pointer; color: var(--muted); font-size: 11px; padding: 6px 0; }
+  summary:hover, details[open] summary { color: var(--accent); }
+  .details-body { position: absolute; z-index: 50; right: 0; top: 100%; width: min(360px, calc(100vw - 36px)); margin-top: 8px; padding: 16px; background: var(--card); border: 1px solid #505050; border-radius: 4px; color: var(--text); font-size: 11px; line-height: 1.6; }
   .details-body p { margin: 0 0 12px; }
   .details-body p:last-child { margin-bottom: 0; }
-  .details-body strong { color: #f0d2af; font-weight: 500; }
-  .stage { display: flex; flex: 1; flex-direction: column; min-height: 360px; margin: 0 var(--gutter); background: #17191d; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 12px 40px #0003; }
-  .controls { display: flex; align-items: center; gap: 20px; flex-shrink: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
-  .controls label { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .details-body strong { color: #d6ba79; }
+  .stage { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+  .controls { display: flex; align-items: center; gap: 12px; flex-shrink: 0; padding: 10px 18px; border-bottom: 1px solid var(--line); }
+  .controls label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
   .controls label:last-child { margin-left: auto; }
-  select { min-height: 34px; max-width: 100%; padding: 6px 28px 6px 10px; border: 1px solid #3a3d45; border-radius: 6px; background-color: #22252b; color: #eeece9; font: 12px system-ui, sans-serif; cursor: pointer; }
-  select:hover { border-color: #68636a; }
-  select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  button, select { padding: 3px 8px; border: 1px solid #5f87ff; border-radius: 3px; background: var(--card); color: var(--text); font: inherit; font-size: 10px; line-height: 18px; cursor: pointer; }
+  select { max-width: 100%; }
+  button:hover:not(:disabled), select:hover { background: #282832; border-color: var(--title); }
+  button:focus-visible, select:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: .35; cursor: default; }
   select:disabled { opacity: .55; cursor: progress; }
-  #download { min-height: 34px; padding: 6px 12px; border: 1px solid #5a4235; border-radius: 6px; background: #392c26; color: #f3bb9e; cursor: pointer; font: 500 12px system-ui, sans-serif; white-space: nowrap; }
-  #download:hover { background: #48362b; }
-  #download:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 340px; flex: 1; min-height: 0; }
+  #download { white-space: nowrap; }
+  .workspace { display: grid; grid-template-columns: 400px minmax(0, 1fr); flex: 1; min-height: 0; }
   .terminal-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  #player { display: grid; flex: 1; grid-template-rows: minmax(0, 1fr); padding: 16px; min-height: 240px; min-width: 0; }
+  #player { display: grid; flex: 1; grid-template-rows: minmax(0, 1fr); padding: 18px; min-height: 240px; min-width: 0; }
   #player > div { grid-area: 1 / 1; min-width: 0; min-height: 0; }
-  #dense-controls { display: flex; align-items: center; gap: 12px; padding: 0 16px 14px; }
-  #dense-controls[hidden] { display: none; }
-  #dense-toggle { min-width: 56px; padding: 7px; border: 1px solid #3a3d45; border-radius: 5px; background: #22252b; color: #eeece9; cursor: pointer; }
-  #dense-seek { flex: 1; min-width: 0; accent-color: var(--accent); }
-  #dense-time { color: var(--muted); font: 11px ui-monospace, monospace; }
-  #trace { display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--line); }
-  .trace-heading { display: flex; align-items: baseline; justify-content: space-between; padding: 17px 16px 12px; }
-  .trace-heading h2 { margin: 0; font-size: 13px; font-weight: 600; }
-  #trace-count { color: var(--muted); font-size: 11px; }
-  .trace-controls { display: flex; gap: 5px; padding: 0 12px 10px; }
-  .trace-controls button { flex: 1; padding: 7px 5px; border: 1px solid #3a3d45; border-radius: 5px; background: #22252b; color: #eeece9; font: 11px system-ui, sans-serif; cursor: pointer; }
-  .trace-controls button:hover:not(:disabled) { background: #343036; border-color: #68636a; }
-  .trace-controls button:disabled { opacity: .35; cursor: default; }
-  #trace button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-  .trace-options { display: flex; align-items: center; gap: 7px; padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
+  #playback-controls { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-top: 1px solid var(--line); }
+  #playback-toggle { min-width: 56px; }
+  #playback-seek { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #playback-time { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+  #trace { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid #505050; background: var(--card); }
+  .trace-heading { display: flex; align-items: baseline; justify-content: space-between; padding: 13px 14px 10px; }
+  .trace-heading h2 { margin: 0; color: var(--accent); font-size: 12px; }
+  #trace-count { color: var(--muted); font-size: 10px; }
+  .trace-controls { display: flex; gap: 6px; padding: 0 14px 10px; }
+  .trace-controls button { flex: 1; padding: 2px 5px; }
+  #trace button:focus-visible { outline-offset: -2px; }
+  .trace-options { display: flex; align-items: center; gap: 7px; padding: 0 14px 12px; color: var(--muted); font-size: 10px; }
   .trace-options input { accent-color: var(--accent); margin: 0; }
   #trace-list { flex: 1; min-height: 70px; overflow: auto; margin: 0; padding: 0 6px 8px; list-style: none; border-bottom: 1px solid var(--line); }
-  .trace-step { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 10px; width: 100%; height: 38px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #c4c2c8; padding: 10px; text-align: left; font: 12px system-ui, sans-serif; cursor: pointer; }
-  .trace-step time { color: #888c97; font: 10px ui-monospace, monospace; padding-top: 2px; }
+  .trace-step { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; width: 100%; height: 38px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: var(--text); padding: 9px 8px; text-align: left; font-size: 11px; }
+  .trace-step time { color: var(--muted); font-size: 10px; }
   .trace-step span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .trace-step:hover { background: #22252b; }
-  .trace-step[aria-current="true"] { background: #352b26; border-color: #604535; color: #f3bb9e; }
-  .trace-step[data-error="true"] span::before { content: '● '; color: #f09389; font-size: 9px; }
-  .trace-inspector { display: flex; flex-direction: column; flex: 1; min-height: 130px; padding: 16px; overflow: auto; }
-  #trace-title { margin: 0 0 7px; font-size: 13px; font-weight: 600; }
-  #trace-state { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+  .trace-step:hover:not(:disabled) { background: #282832; border-color: transparent; }
+  .trace-step[aria-current="true"] { background: #343541; border-color: #505050; color: var(--accent); }
+  .trace-step[data-error="true"] span::before { content: '● '; color: #cc6666; font-size: 9px; }
+  .trace-inspector { display: flex; flex-direction: column; flex: 1; min-height: 130px; padding: 14px; overflow: auto; }
+  #trace-title { margin: 0 0 7px; color: var(--title); font-size: 12px; }
+  #trace-state { margin: 0 0 12px; color: var(--muted); font-size: 10px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
   .trace-inspector > * { flex-shrink: 0; }
-  .trace-inspector pre { margin: 0; color: #c9cbd2; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .trace-inspector pre { margin: 0; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 11px; line-height: 1.65; }
   .trace-inspector details { border-top: 1px solid var(--line); padding: 3px 0; }
   .trace-inspector details pre { padding: 7px 0 12px; }
   .trace-inspector details p { margin: 7px 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
   #trace-fields { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(0, 1.2fr); gap: 7px 12px; margin: 8px 0 12px; font-size: 11px; line-height: 1.5; }
   #trace-fields dt { color: var(--muted); }
-  #trace-fields dd { margin: 0; color: #d9d5d1; overflow-wrap: anywhere; }
+  #trace-fields dd { margin: 0; overflow-wrap: anywhere; }
   #trace-extra-state { margin: 7px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.6; }
   #trace-extra-state:empty { display: none; }
-  .trace-empty { padding: 16px 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
-  #coverage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; margin: 0; padding: 11px 18px; border-top: 1px solid var(--line); color: #b3afa9; font-size: 11px; line-height: 1.5; }
-  #coverage::before { content: ''; flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: #d8b184; }
-  #coverage[data-status="complete"]::before { background: #97b99b; }
-  #coverage[data-status$="limit"], #coverage[data-status="storage-error"] { color: #e9c090; }
-  .page-footer { display: flex; flex-shrink: 0; justify-content: space-between; gap: 12px; padding: 13px var(--gutter) 20px; color: #a4a5ac; font-size: 11px; line-height: 1.5; }
+  .trace-empty { padding: 16px 8px; color: var(--muted); font-size: 11px; }
+  #coverage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; margin: 0; padding: 7px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+  #coverage::before { content: ''; flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: #d6ba79; }
+  #coverage[data-status="complete"]::before { background: #b5bd68; }
+  #coverage[data-status$="limit"], #coverage[data-status="storage-error"] { color: #d6ba79; }
+  .page-footer { display: flex; flex-shrink: 0; justify-content: space-between; gap: 12px; padding: 7px 18px; color: var(--muted); font-size: 10px; background: var(--card); }
   #recording-summary { font-variant-numeric: tabular-nums; }
-  div.ap-wrapper div.ap-player { border-radius: 6px; }
-  div.ap-player div.ap-control-bar { background: #1d2025; border-top-color: #33363d; }
-  div.ap-control-bar .ap-progressbar .ap-bar .ap-gutter-full { background: var(--accent); }
-  div.ap-control-bar button.ap-button:hover { background: #333036; border-radius: 4px; }
-  .ap-player .ap-overlay-start .ap-play-button { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); box-shadow: 0 8px 32px #0006; }
-  #player .ap-overlay-start .ap-play-button svg { display: none; }
-  #player[data-inspecting="true"] .ap-overlay-start { display: none; }
-  .ap-player .ap-overlay-start .ap-play-button::after { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%); border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 17px solid #302018; }
-  @media (max-width: 600px) {
-    .page-heading { align-items: flex-start; gap: 12px; padding: 20px var(--gutter) 18px; }
-    h1 { font-size: 21px; }
-    .intro { max-width: 210px; font-size: 12px; }
-    .heading-actions { flex-direction: column; align-items: flex-end; gap: 6px; }
-    .controls { gap: 12px; padding: 12px; flex-wrap: wrap; }
-    .controls label { flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+  div.ap-wrapper div.ap-player { border-radius: 3px; }
+  #player .ap-overlay-start { display: none; }
+  @media (max-width: 900px) {
+    .workspace { display: flex; flex-direction: column; overflow: auto; }
+    .terminal-pane { flex-shrink: 0; min-height: 300px; }
+    #trace { order: 1; flex-shrink: 0; height: 500px; border-right: 0; border-top: 1px solid var(--line); }
+    .controls { flex-wrap: wrap; }
     .controls label:first-child { flex: 1 1 100%; }
-    #player { padding: 8px; }
-    #coverage { padding: 10px 12px; }
-    .page-footer { flex-wrap: wrap; gap: 4px 12px; padding-bottom: 14px; }
+    .page-heading, .heading-actions { gap: 8px; }
+    .page-heading, .controls, #playback-controls { padding: 10px 12px; }
+    #player { padding: 12px; }
+    .page-footer { flex-wrap: wrap; gap: 0 12px; }
   }
 </style>
 <header class="page-heading">
   <div>
     <h1>Session replay</h1>
-    <p class="intro">Pause on a step. Inspect what happened.</p>
   </div>
   <div class="heading-actions">
     <span class="raw-badge">Unredacted</span>
@@ -126,14 +113,6 @@
     <label>Speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
   </div>
   <div class="workspace">
-    <div class="terminal-pane">
-      <div id="player"></div>
-      <div id="dense-controls" hidden>
-        <button id="dense-toggle" type="button">Play</button>
-        <input id="dense-seek" type="range" aria-label="Seek recording" min="0" max="1" step="0.001" value="0">
-        <output id="dense-time"></output>
-      </div>
-    </div>
     <aside id="trace" aria-label="Harness steps">
       <div class="trace-heading"><h2>Harness steps</h2><span id="trace-count"></span></div>
       <div class="trace-controls">
@@ -153,6 +132,14 @@
         <pre id="trace-detail"></pre>
       </div>
     </aside>
+    <div class="terminal-pane">
+      <div id="player"></div>
+      <div id="playback-controls">
+        <button id="playback-toggle" type="button">Play</button>
+        <input id="playback-seek" type="range" aria-label="Seek recording" min="0" max="1" step="0.001" value="0">
+        <output id="playback-time"></output>
+      </div>
+    </div>
   </div>
   <p id="coverage" role="status"></p>
 </main>
@@ -187,10 +174,9 @@
   const nextStep = document.getElementById('trace-next');
   const nextError = document.getElementById('trace-error');
   const pauseErrors = document.getElementById('pause-errors');
-  const denseControls = document.getElementById('dense-controls');
-  const denseToggle = document.getElementById('dense-toggle');
-  const denseSeek = document.getElementById('dense-seek');
-  const denseTime = document.getElementById('dense-time');
+  const playbackToggle = document.getElementById('playback-toggle');
+  const playbackSeek = document.getElementById('playback-seek');
+  const playbackTime = document.getElementById('playback-time');
   let player;
   let playing = false;
   let cachedVisit;
@@ -348,10 +334,8 @@
   function followPlayback() {
     if (!player || selecting || container.getAttribute('aria-busy') === 'true') return;
     const time = player.getCurrentTime();
-    if (!denseControls.hidden) {
-      denseSeek.value = time;
-      denseTime.textContent = clock(time) + ' / ' + clock(Number(denseSeek.max));
-    }
+    playbackSeek.value = time;
+    playbackTime.textContent = clock(time) + ' / ' + clock(Number(playbackSeek.max));
     if (time === lastFollowTime) return;
     lastFollowTime = time;
     let low = 0, high = steps.length;
@@ -388,8 +372,8 @@
   previousStep.addEventListener('click', () => jumpToStep(selected - 1));
   nextStep.addEventListener('click', () => jumpToStep(selected + 1));
   nextError.addEventListener('click', () => jumpToStep(errorAfter(selected)));
-  denseToggle.addEventListener('click', () => playing ? player?.pause() : player?.play());
-  denseSeek.addEventListener('input', () => player?.seek(Number(denseSeek.value)));
+  playbackToggle.addEventListener('click', () => playing ? player?.pause() : player?.play());
+  playbackSeek.addEventListener('input', () => player?.seek(Number(playbackSeek.value)));
   setInterval(followPlayback, 100);
   function downloadPart() {
     const recording = recordings[Number(visit.value)];
@@ -416,7 +400,7 @@
     const selectedStep = keepPosition ? selected : -1;
     const previous = player;
     if (!keepPosition) playing = false;
-    denseToggle.textContent = playing ? 'Pause' : 'Play';
+    playbackToggle.textContent = playing ? 'Pause' : 'Play';
     if (!keepPosition) delete container.dataset.inspecting;
     visit.disabled = speed.disabled = true;
     container.setAttribute('aria-busy', 'true');
@@ -447,20 +431,17 @@
       const recording = await cachedCast;
       if (current !== generation) return;
       steps = recording.steps;
-      // Native timeline markers create three DOM nodes each; dense parts use one slider.
-      const dense = recording.markers.length > 500;
-      denseControls.hidden = !dense;
-      denseSeek.max = metadata.duration;
+      playbackSeek.max = metadata.duration;
       renderTrace(selectedStep);
       container.appendChild(host);
       next = AsciinemaPlayer.create({ data: recording.cast }, host, {
-        fit: 'both', controls: !dense,
+        fit: 'both', controls: false,
         preload: true, speed: Number(speed.value), terminalFontSize: 14,
         terminalFontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
       });
-      next.addEventListener('playing', () => { if (current === generation) { playing = true; denseToggle.textContent = 'Pause'; } });
+      next.addEventListener('playing', () => { if (current === generation) { playing = true; playbackToggle.textContent = 'Pause'; } });
       for (const event of ['pause', 'ended']) {
-        next.addEventListener(event, () => { if (current === generation) { playing = false; denseToggle.textContent = 'Play'; } });
+        next.addEventListener(event, () => { if (current === generation) { playing = false; playbackToggle.textContent = 'Play'; } });
       }
       next.addEventListener('marker', ({ index }) => {
         const step = recording.markers[index];

@@ -72,12 +72,14 @@ try {
 	await details.locator("summary").click()
 	await frame.getByLabel("Recording part").selectOption("0")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await frame.locator("#playback-controls").isVisible(), true)
+	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).count(), 1)
+	assert.equal(await frame.locator(".ap-control-bar").isVisible(), false, "Only the shared replay controls are visible")
 	async function seek(fraction: number) {
-		await frame.locator(".ap-control-bar").hover()
-		const bar = frame.locator(".ap-progressbar").first()
-		const box = await bar.boundingBox()
+		const slider = frame.getByRole("slider", { name: "Seek recording" })
+		const box = await slider.boundingBox()
 		assert(box)
-		await bar.click({ position: { x: box.width * fraction, y: box.height / 2 }, force: true })
+		await slider.click({ position: { x: box.width * fraction, y: box.height / 2 } })
 		await page.waitForTimeout(150)
 	}
 	const lines = () => frame.locator(".ap-line").allTextContents()
@@ -171,7 +173,7 @@ try {
 	const detailsBox = await details.locator(".details-body").boundingBox()
 	assert(detailsBox && detailsBox.x >= 0 && detailsBox.x + detailsBox.width <= 390)
 	await details.locator("summary").click()
-	const controls = await frame.locator(".ap-control-bar").boundingBox()
+	const controls = await frame.locator("#playback-controls").boundingBox()
 	assert(controls && controls.x >= 0 && controls.x + controls.width <= 390 && controls.y + controls.height <= 844)
 	await page.locator("#terminal-replay-close").click()
 	assert.equal(await page.locator("#app").isVisible(), true)
@@ -614,11 +616,12 @@ try {
 	await frame.getByLabel("Recording part").selectOption("0")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(await frame.locator("#trace-count").innerText(), "501 in this part")
-	assert.equal(await frame.locator("#dense-controls").isVisible(), true)
-	await frame.locator("#dense-toggle").click()
+	assert.equal(await frame.locator("#playback-controls").isVisible(), true)
+	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).count(), 1)
+	await frame.locator("#playback-toggle").click()
 	await selected(250)
 	await frame
-		.locator("#dense-toggle")
+		.locator("#playback-toggle")
 		.filter({ hasText: /^Play$/ })
 		.waitFor()
 	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250", "Dense controls must pause at the failed frame")
@@ -626,10 +629,10 @@ try {
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	await selected(250)
 	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250")
-	await frame.locator("#dense-toggle").click()
+	await frame.locator("#playback-toggle").click()
 	await frame.locator(".ap-line").filter({ hasText: "DENSE STEP 501" }).waitFor()
 	await frame
-		.locator("#dense-toggle")
+		.locator("#playback-toggle")
 		.filter({ hasText: /^Play$/ })
 		.waitFor()
 	await frame.getByLabel("Seek recording").focus()
@@ -652,15 +655,15 @@ try {
 	await denseOffline.locator('#trace-list .trace-step[data-step="250"][aria-current="true"]').waitFor()
 	assert.equal((await denseOffline.locator(".ap-line").allTextContents())[0].trimEnd(), "DENSE STEP 250")
 	await denseOffline.close()
-	await frame.locator("#dense-toggle").click()
+	await frame.locator("#playback-toggle").click()
 	await frame
-		.locator("#dense-toggle")
+		.locator("#playback-toggle")
 		.filter({ hasText: /^Pause$/ })
 		.waitFor()
 	await frame.getByLabel("Recording part").selectOption("1")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(
-		await frame.locator("#dense-toggle").innerText(),
+		await frame.locator("#playback-toggle").innerText(),
 		"Play",
 		"Switching a playing dense part must show its paused state",
 	)
