@@ -97,6 +97,13 @@ if (!isDev) {
 	mkdirSync(oauthDest, { recursive: true })
 	cpSync(oauthSrc, oauthDest, { recursive: true })
 
+	// Standalone, licensed terminal player used by self-contained HTML exports.
+	cpSync(
+		join(projectRoot, "resources", "terminal-replay"),
+		join(projectRoot, "dist", "share", "kimchi", "terminal-replay"),
+		{ recursive: true },
+	)
+
 	// Copy proxy-helper binary built by scripts/build-proxy-helper.js.
 	const buildTargetOS = process.env.KIMCHI_BUILD_TARGET_OS || platform()
 	const proxyHelperName = buildTargetOS === "win32" || buildTargetOS === "windows" ? "proxy-helper.exe" : "proxy-helper"

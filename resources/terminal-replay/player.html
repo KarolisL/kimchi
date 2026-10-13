@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; font-src data:; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Kimchi terminal replay</title>
+<style>/* PLAYER_CSS */</style>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #17191d; color: #e8ebef; font: 14px system-ui, sans-serif; }
+  header { padding: 16px 20px; }
+  p { margin: 8px 0; color: #aab1bd; line-height: 1.5; }
+  .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; margin: 16px 0 8px; }
+  select { background: #282c34; color: #eee; border: 1px solid #515762; border-radius: 5px; padding: 6px; margin-left: 6px; }
+  #coverage { color: #f4ca80; }
+  #player { padding: 0 20px 20px; height: calc(100vh - 230px); min-height: 260px; }
+  details { margin: 0 20px 20px; color: #89929f; }
+  pre { white-space: pre-wrap; font-size: 12px; }
+</style>
+<header>
+  <strong>Recorded terminal output · unredacted</strong>
+  <p>Includes visible drafts and cleared text. Review before sharing. The conversation transcript is redacted separately.</p>
+  <div class="controls">
+    <label>Recorded visit <select id="visit" aria-label="Recorded visit"></select></label>
+    <label>Speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+    <span>Original pauses preserved</span>
+  </div>
+  <p id="coverage" role="status"></p>
+  <p>Retained visits only; older recordings may have expired. Fonts, images and terminal-specific effects can differ from the original screen.</p>
+</header>
+<main id="player"></main>
+<details><summary>Player credits and licenses</summary><p>asciinema-player 3.17.0 by Marcin Kulik. Standalone distribution used without modification.</p><pre id="licenses"></pre></details>
+<script>/* PLAYER_JS */</script>
+<script>
+(() => {
+  const recordings = /* RECORDINGS */;
+  document.getElementById('licenses').textContent = /* LICENSES */;
+  const visit = document.getElementById('visit');
+  const speed = document.getElementById('speed');
+  const coverage = document.getElementById('coverage');
+  const container = document.getElementById('player');
+  let player;
+  let generation = 0;
+  for (const [index, recording] of recordings.entries()) {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = new Date(recording.metadata.startedAt).toLocaleString();
+    visit.appendChild(option);
+  }
+  visit.value = String(recordings.length - 1);
+  async function mount(keepPosition = false) {
+    const current = ++generation;
+    const position = keepPosition && player ? player.getCurrentTime() : 0;
+    player?.dispose();
+    player = undefined;
+    const { metadata, gzip } = recordings[Number(visit.value)];
+    const reasons = {
+      'recording': 'Captured up to export or interruption; the final unsaved fraction may be missing.',
+      'complete': 'Visit completed.',
+      'size-limit': 'Incomplete: recording stopped at the storage limit.',
+      'queue-limit': 'Incomplete: recording stopped because output exceeded the buffer limit.',
+      'storage-error': 'Incomplete: recording stopped after a storage error.'
+    };
+    coverage.textContent = (reasons[metadata.status] || 'Partial recording.') + ' ' + metadata.cols + '×' + metadata.rows + ' initially · ' + metadata.duration.toFixed(1) + ' seconds.';
+    try {
+      const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const cast = await new Response(stream).text();
+      if (current !== generation) return;
+      player = AsciinemaPlayer.create({ data: cast }, container, {
+        fit: 'both', controls: true,
+        preload: true, speed: Number(speed.value), terminalFontSize: 14,
+        terminalFontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+      });
+      player.addEventListener('error', () => { coverage.textContent = 'This recording could not be played. The conversation transcript is still available.'; });
+      await player.seek(position);
+    } catch {
+      coverage.textContent = 'Replay could not load. Open this file in a recent browser. The conversation transcript is still available.';
+    }
+  }
+  visit.addEventListener('change', () => mount());
+  speed.addEventListener('change', () => mount(true));
+  mount();
+})();
+</script>
+</html>
