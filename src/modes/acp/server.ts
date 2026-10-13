@@ -2407,24 +2407,30 @@ export function buildModelConfigOption(session: AgentSessionModelConfig): Sessio
 		modelId: orchId,
 	} = getOrchestratorModel(session.sessionId, modelRegistry)
 	const orchName = orchestrator?.name ?? orchId ?? orchRef
-	// `description` is the optional secondary line ACP clients render beneath an
-	// option's name. Only the two routing entries carry one — concrete models are
-	// self-describing — and a client that ignores the field still shows the name.
-	// Multi-model's deprecation label is harness-side: the virtual selection does
-	// not exist in the platform catalog, so no backend marker can carry it.
-	const options = [
-		{
-			value: "multi-model",
-			name: `Multi-model (${orchName})`,
-			description: `${MULTI_MODEL_DEPRECATION_LABEL} Routes each task to the best model, with an orchestrator and workers.`,
-		},
+	// Multi-model's deprecation label is harness-side: the virtual selection has
+	// no platform-catalog entry to carry a backend marker.
+	// Ordering mirrors sortModels() in src/models.ts: active entries sorted by
+	// ref first, deprecated entries last — deprecated lands at the bottom by
+	// flag, not by pinning a specific value.
+	const options: Array<{ value: string; name: string; description?: string | null; deprecated?: boolean }> = [
 		...modelRegistry
 			.getAvailable()
 			.map((m) =>
 				isAutoRoutedModel(m) ? autoModelOption(m, session.sessionId) : { value: refFromModel(m), name: m.name },
-			)
-			.sort((a, b) => a.value.localeCompare(b.value)),
+			),
+		{
+			value: "multi-model",
+			name: `Multi-model (${orchName})`,
+			description: `${MULTI_MODEL_DEPRECATION_LABEL} Routes each task to the best model, with an orchestrator and workers.`,
+			deprecated: true,
+		},
 	]
+	options.sort(
+		(a, b) => Number(a.deprecated ?? false) - Number(b.deprecated ?? false) || a.value.localeCompare(b.value),
+	)
+	// `deprecated` is an internal ordering key — not part of SessionConfigSelectOption
+	// — so strip it before the list goes on the wire.
+	const wireOptions = options.map(({ deprecated: _, ...opt }) => opt)
 	// biome-ignore lint/style/noNonNullAssertion: we assert model availability before session is created/loaded via assertSessionHasModel.
 	const currentValue = multiModelEnabled ? "multi-model" : refFromModel(session.model!)
 	return {
@@ -2434,7 +2440,7 @@ export function buildModelConfigOption(session: AgentSessionModelConfig): Sessio
 		category: "model",
 		description: "Select the active AI model: single-model or multi-model (orchestrator + workers).",
 		currentValue,
-		options,
+		options: wireOptions,
 	}
 }
 
