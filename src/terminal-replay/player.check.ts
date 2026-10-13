@@ -65,7 +65,7 @@ try {
 	await frame.locator(".ap-term").waitFor()
 	assert.doesNotMatch(await frame.locator("body").innerText(), /Player credits|asciinema-player|Marcin Kulik/)
 	assert.match((await frame.locator("#licenses").textContent()) ?? "", /Apache License/)
-	const details = frame.locator("details")
+	const details = frame.locator("details").filter({ has: frame.getByText("Recording details", { exact: true }) })
 	assert.equal(await details.locator(".details-body").isVisible(), false)
 	await details.locator("summary").click()
 	assert.equal(await details.getByText(/Includes visible drafts and cleared text/).isVisible(), true)
@@ -280,6 +280,16 @@ try {
 
 	// Known screens and times make trace navigation independent of live model timing.
 	const hostileDetail = '</script><img src="https://example.invalid/trace-leak" onerror="window.traceInjected=true">'
+	const savedFailedOutput = "FIRST_PART_SAVED_RESULT: the finalized tool output differs from the visible failure"
+	const savedResponse = "The saved response includes more context than the live trace excerpt."
+	const responseFields = {
+		Model: "part-one-only-model",
+		"Input tokens": "128",
+		"Output tokens": "24",
+		"Stop reason": "stop",
+	}
+	const responseDiagnostics = JSON.stringify({ status: 503, error: hostileDetail })
+	const secondDiagnostics = JSON.stringify({ requestId: "second-part-request", status: 503, error: hostileDetail })
 	const marker = (
 		step: number,
 		kind: string,
@@ -288,12 +298,17 @@ try {
 		extra: { error?: boolean; frame?: boolean; toolCallId?: string } = {},
 	) =>
 		JSON.stringify({ type: "kimchi.trace", version: 1, step, kind, title, detail, frame: true, delayMs: 20, ...extra })
-	const tracedPart = (part: number, events: [number, string, string][]) => {
+	const tracedPart = (
+		part: number,
+		events: [number, string, string][],
+		traceDetails?: Record<string, { fields: Record<string, string>; content?: string; diagnostics?: string }>,
+	) => {
 		const header = JSON.stringify({ version: 3, term: { cols: 60, rows: 8 } })
 		const cast = `${header}\n${events.map((event) => JSON.stringify(event)).join("\n")}\n`
 		const gzip = gzipSync(cast)
 		return {
 			gzip: gzip.toString("base64"),
+			traceDetails,
 			metadata: {
 				...recordings[0].metadata,
 				id: `trace-part-${part}`,
@@ -344,6 +359,17 @@ try {
 			[1.5, "o", ""],
 		]),
 	]
+	traced[0].traceDetails = {
+		3: { fields: { Tool: "read", "Saved result": "success" }, content: savedFailedOutput },
+		4: { fields: responseFields, content: savedResponse, diagnostics: responseDiagnostics },
+	}
+	traced[1].traceDetails = {
+		8: {
+			fields: { Model: "part-two-model", "Stop reason": "error" },
+			content: "SECOND_PART_SAVED_RESULT",
+			diagnostics: secondDiagnostics,
+		},
+	}
 	await writeFile(path, await addTerminalReplay(transcript, [...traced, recordings[0]]))
 	await page.setViewportSize({ width: 1440, height: 1000 })
 	await page.goto(pathToFileURL(path).href)
@@ -364,6 +390,14 @@ try {
 	)
 	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).isVisible(), true)
 	assert.match(await frame.locator("#trace-title").innerText(), /Read failed/)
+	assert.equal(await frame.locator("#trace-detail").innerText(), "missing.txt not found")
+	assert.equal(await frame.locator("#trace-saved").getAttribute("open"), null)
+	await frame.locator("#trace-saved summary").click()
+	assert.equal(await frame.locator("#trace-content").innerText(), savedFailedOutput)
+	assert.match(
+		await frame.locator("#trace-extra-state").innerText(),
+		/Final content can differ from the captured output/,
+	)
 	await frame.getByRole("button", { name: "Next step", exact: true }).click()
 	await selected(4)
 	await page.waitForTimeout(200)
@@ -374,6 +408,26 @@ try {
 	)
 	assert.equal(await frame.locator("#trace-detail").innerText(), hostileDetail)
 	assert.equal(await frame.locator("#trace-detail img").count(), 0, "Trace text must not become executable markup")
+	assert.equal(await frame.locator("#trace-metadata").getAttribute("open"), null)
+	await frame.locator("#trace-metadata summary").click()
+	assert.deepEqual(
+		await frame
+			.locator("#trace-fields")
+			.evaluate((element) =>
+				Object.fromEntries(
+					Array.from(element.querySelectorAll("dt"), (label) => [
+						label.textContent,
+						label.nextElementSibling?.textContent,
+					]),
+				),
+			),
+		responseFields,
+	)
+	assert.equal(await frame.locator("#trace-content").innerText(), savedResponse)
+	assert.equal(await frame.locator("#trace-diagnostics").getAttribute("open"), null)
+	await frame.locator("#trace-diagnostics summary").click()
+	assert.equal(await frame.locator("#trace-diagnostic-detail").innerText(), responseDiagnostics)
+	assert.equal(await frame.locator("#trace-diagnostic-detail img").count(), 0, "Diagnostics must remain literal text")
 	await frame.getByRole("button", { name: "Previous step", exact: true }).click()
 	await selected(3)
 	const failedScreen = await lines()
@@ -381,6 +435,10 @@ try {
 	assert.match(await frame.locator("#trace-state").innerText(), /No completed frame captured for this step\./)
 	assert.deepEqual(await lines(), failedScreen, "An unlinked step must not seek to a misleading frame")
 	await step(1).click()
+	assert.equal(await frame.locator("#trace-fields").textContent(), "")
+	assert.equal(await frame.locator("#trace-content").textContent(), "")
+	assert.equal(await frame.locator("#trace-diagnostic-detail").textContent(), "")
+	assert.match(await frame.locator("#trace-extra-state").innerText(), /No exact saved-session match/)
 	await frame.getByRole("button", { name: "Next error", exact: true }).click()
 	await selected(3)
 	assert.equal(
@@ -433,12 +491,24 @@ try {
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(await frame.locator("#trace-list .trace-step").count(), 2)
 	assert.equal(await step(3).count(), 0, "A different part must not retain the previous trace rows")
+	await step(7).click()
+	await selected(7)
+	assert.equal(await frame.locator("#trace-fields").textContent(), "")
+	assert.equal(await frame.locator("#trace-content").textContent(), "")
+	assert.equal(await frame.locator("#trace-diagnostic-detail").textContent(), "")
 	await step(8).click()
+	await selected(8)
 	assert.equal((await lines())[0].trimEnd(), "SECOND ERROR: the next failure")
+	assert.equal(await frame.locator("#trace-metadata").getAttribute("open"), null)
+	assert.equal(await frame.locator("#trace-saved").getAttribute("open"), null)
+	assert.equal(await frame.locator("#trace-diagnostics").getAttribute("open"), null)
 	const traceDownload = page.waitForEvent("download")
 	await frame.getByRole("button", { name: "Download part", exact: true }).click()
 	const traceDownloadPath = join(directory, "linked-part.html")
 	await (await traceDownload).saveAs(traceDownloadPath)
+	const downloadedTraceHtml = await readFile(traceDownloadPath, "utf8")
+	assert.equal(downloadedTraceHtml.includes("part-one-only-model"), false)
+	assert.equal(downloadedTraceHtml.includes("FIRST_PART_SAVED_RESULT"), false)
 	const linkedOffline = await browser.newPage()
 	await linkedOffline.context().setOffline(true)
 	linkedOffline.on("pageerror", (error) => errors.push(error.message))
@@ -450,11 +520,19 @@ try {
 	assert.equal(await linkedOffline.getByLabel("Recording part").locator("option").count(), 1)
 	assert.equal(await linkedOffline.locator("#trace-list .trace-step").count(), 2)
 	await linkedOffline.locator('#trace-list .trace-step[data-step="8"]').click()
+	await linkedOffline.locator('#trace-list .trace-step[data-step="8"][aria-current="true"]').waitFor()
 	assert.equal(
 		(await linkedOffline.locator(".ap-line").allTextContents())[0].trimEnd(),
 		"SECOND ERROR: the next failure",
 		"Downloaded parts must retain working trace links offline",
 	)
+	await linkedOffline.locator("#trace-metadata summary").click()
+	assert.match(await linkedOffline.locator("#trace-fields").innerText(), /part-two-model/)
+	await linkedOffline.locator("#trace-saved summary").click()
+	assert.equal(await linkedOffline.locator("#trace-content").innerText(), "SECOND_PART_SAVED_RESULT")
+	await linkedOffline.locator("#trace-diagnostics summary").click()
+	assert.equal(await linkedOffline.locator("#trace-diagnostic-detail").innerText(), secondDiagnostics)
+	assert.equal(await linkedOffline.locator("#trace-diagnostic-detail img").count(), 0)
 	await linkedOffline.close()
 	await frame.getByLabel("Recording part").selectOption("2")
 	await frame.locator('#player[aria-busy="false"]').waitFor()

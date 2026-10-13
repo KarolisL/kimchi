@@ -5,6 +5,7 @@ import { promisify } from "node:util"
 import { gunzip, gzip } from "node:zlib"
 import { lock } from "proper-lockfile"
 import { recordingCheckpoint } from "./checkpoint.js"
+import type { ReplayTraceDetail } from "./details.js"
 import { boundedTraceStep, type TraceStep } from "./trace.js"
 
 const compress = promisify(gzip)
@@ -62,6 +63,8 @@ export interface RecordingMetadata {
 export interface Recording {
 	metadata: RecordingMetadata
 	gzip: string
+	traceDetails?: Record<string, ReplayTraceDetail>
+	traceDetailsOmitted?: number
 }
 
 interface RecorderOptions {

@@ -6,9 +6,13 @@ import { waitForText, waitForTurnToSettle } from "./support/assertions.js"
 import { runKimchiSession, TUI_TEST_CONFIG } from "./support/kimchi-fixture.js"
 import { toolResultText } from "./support/mcp-model-script.js"
 
-function recordingPayload(
-	path: string,
-): { metadata: { sessionId: string; part: number; rawBytes: number }; gzip: string }[] {
+interface ExportedRecording {
+	metadata: { sessionId: string; part: number; rawBytes: number }
+	gzip: string
+	traceDetails?: Record<string, { fields: Record<string, string>; content?: string; diagnostics?: string }>
+}
+
+function recordingPayload(path: string): ExportedRecording[] {
 	const html = readFileSync(path, "utf8")
 	const document = html.match(/id="terminal-replay-document" type="application\/octet-stream">([^<]+)/)?.[1]
 	if (!document) throw new Error("Export did not contain a terminal replay")
@@ -29,6 +33,8 @@ function recordedSteps(recording: { gzip: string }): {
 	detail: string
 	error?: boolean
 	toolCallId?: string
+	messageTimestamp?: number
+	responseId?: string
 	frame: boolean
 	delayMs: number
 }[] {
@@ -132,7 +138,10 @@ test("links a failed tool and recovery to the recorded terminal frames", async (
 						{ id: recoveredId, function: { name: "read", arguments: JSON.stringify({ path: "existing-demo.txt" }) } },
 					],
 				},
-				{ stream: ["REPLAY_RECOVERED: the existing file was read."] },
+				{
+					stream: ["REPLAY_RECOVERED: the existing file was read."],
+					usage: { prompt_tokens: 128, completion_tokens: 24 },
+				},
 			],
 		},
 		async (fixture, trace) => {
@@ -148,7 +157,8 @@ test("links a failed tool and recovery to the recorded terminal frames", async (
 			terminal.keyDown()
 			terminal.submit("")
 			await waitForText(terminal, /Session exported to:\s+\S*failed-tool-replay\.html/)
-			const steps = recordingPayload(path).flatMap(recordedSteps)
+			const recordings = recordingPayload(path)
+			const steps = recordings.flatMap(recordedSteps)
 			const call = steps.find((step) => step.kind === "tool_call" && step.toolCallId === failedId)
 			const result = steps.find((step) => step.kind === "tool_result" && step.toolCallId === failedId)
 			const recoveredResult = steps.find((step) => step.kind === "tool_result" && step.toolCallId === recoveredId)
@@ -170,6 +180,25 @@ test("links a failed tool and recovery to the recorded terminal frames", async (
 			expect(result.step).toBeLessThan(recoveredResult.step)
 			expect(recoveredResult.step).toBeLessThan(recovery.step)
 			expect(new Set(steps.map((step) => step.step)).size).toBe(steps.length)
+			expect(prompt.messageTimestamp).toBeGreaterThan(0)
+			expect(recovery.messageTimestamp).toBeGreaterThan(0)
+			expect(recovery.responseId).toBe("chatcmpl_fake")
+			const savedDetails = new Map(recordings.flatMap((recording) => Object.entries(recording.traceDetails ?? {})))
+			const savedRecovery = savedDetails.get(String(recovery.step))
+			expect(savedRecovery).toBeDefined()
+			expect(savedRecovery?.fields).toEqual(
+				expect.objectContaining({
+					Model: "basic",
+					Provider: "fake",
+					"Stop reason": "stop",
+					"Input tokens": "128",
+					"Output tokens": "24",
+					"Response ID": "chatcmpl_fake",
+				}),
+			)
+			expect(savedRecovery?.content).toContain("REPLAY_RECOVERED")
+			expect(savedRecovery?.diagnostics).toContain("request_diagnostics")
+			expect(savedDetails.get(String(result.step))?.content).toMatch(/ENOENT|no such file|not found/i)
 			for (const step of [prompt, call, result, recoveredResult, recovery]) {
 				expect({ step: step.step, kind: step.kind, frame: step.frame }).toEqual({
 					step: step.step,

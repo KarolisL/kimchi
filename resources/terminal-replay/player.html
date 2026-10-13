@@ -62,7 +62,16 @@
   .trace-inspector { display: flex; flex-direction: column; flex: 1; min-height: 130px; padding: 16px; overflow: auto; }
   #trace-title { margin: 0 0 7px; font-size: 13px; font-weight: 600; }
   #trace-state { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
-  #trace-detail { margin: 0; color: #c9cbd2; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .trace-inspector > * { flex-shrink: 0; }
+  .trace-inspector pre { margin: 0; color: #c9cbd2; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .trace-inspector details { border-top: 1px solid var(--line); padding: 3px 0; }
+  .trace-inspector details pre { padding: 7px 0 12px; }
+  .trace-inspector details p { margin: 7px 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+  #trace-fields { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(0, 1.2fr); gap: 7px 12px; margin: 8px 0 12px; font-size: 11px; line-height: 1.5; }
+  #trace-fields dt { color: var(--muted); }
+  #trace-fields dd { margin: 0; color: #d9d5d1; overflow-wrap: anywhere; }
+  #trace-extra-state { margin: 7px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+  #trace-extra-state:empty { display: none; }
   .trace-empty { padding: 16px 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
   #coverage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; margin: 0; padding: 11px 18px; border-top: 1px solid var(--line); color: #b3afa9; font-size: 11px; line-height: 1.5; }
   #coverage::before { content: ''; flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: #d8b184; }
@@ -102,7 +111,7 @@
       <summary>Recording details</summary>
       <div class="details-body">
         <p><strong>Raw, unredacted output. Review before sharing.</strong> Includes visible drafts and cleared text. The conversation transcript is redacted separately.</p>
-        <p>Linked steps include prompt and response text, tool arguments and results. Their text is bounded and unredacted.</p>
+        <p>Linked steps include prompt and response text, tool arguments and results. Their captured text is bounded and unredacted. Saved session details and request diagnostics are added from the separately redacted transcript when an exact match exists.</p>
         <p>Long recordings continue in numbered parts. Only retained parts are included; older parts may have expired or been replaced.</p>
         <p>A step links to the next completed terminal frame. Several steps can share a frame, and collapsed or offscreen content may not be visible.</p>
         <p>Fonts, images and terminal-specific effects can differ from the original screen.</p>
@@ -137,6 +146,10 @@
       <div class="trace-inspector">
         <h3 id="trace-title">Select a step</h3>
         <p id="trace-state" role="status">Playback follows the steps in this part.</p>
+        <details id="trace-metadata" hidden><summary>Session details</summary><dl id="trace-fields"></dl></details>
+        <details id="trace-saved" hidden><summary>Saved session content</summary><pre id="trace-content"></pre></details>
+        <details id="trace-diagnostics" hidden><summary id="trace-diagnostic-label">Request diagnostics</summary><p id="trace-diagnostic-note">Request timing ends at HTTP headers. Response streaming continues afterward.</p><pre id="trace-diagnostic-detail"></pre></details>
+        <p id="trace-extra-state"></p>
         <pre id="trace-detail"></pre>
       </div>
     </aside>
@@ -161,6 +174,15 @@
   const traceTitle = document.getElementById('trace-title');
   const traceState = document.getElementById('trace-state');
   const traceDetail = document.getElementById('trace-detail');
+  const traceMetadata = document.getElementById('trace-metadata');
+  const traceFields = document.getElementById('trace-fields');
+  const traceSaved = document.getElementById('trace-saved');
+  const traceContent = document.getElementById('trace-content');
+  const traceDiagnostics = document.getElementById('trace-diagnostics');
+  const traceDiagnosticLabel = document.getElementById('trace-diagnostic-label');
+  const traceDiagnosticNote = document.getElementById('trace-diagnostic-note');
+  const traceDiagnosticDetail = document.getElementById('trace-diagnostic-detail');
+  const traceExtraState = document.getElementById('trace-extra-state');
   const previousStep = document.getElementById('trace-prev');
   const nextStep = document.getElementById('trace-next');
   const nextError = document.getElementById('trace-error');
@@ -214,6 +236,32 @@
   function errorAfter(index) {
     return steps.findIndex((step, i) => i > index && step.frame && step.error === true);
   }
+  function showSavedDetails(step) {
+    const recording = recordings[Number(visit.value)];
+    const detail = step && recording.traceDetails?.[String(step.step)];
+    traceFields.replaceChildren();
+    if (detail?.fields && typeof detail.fields === 'object') {
+      for (const [label, value] of Object.entries(detail.fields).slice(0, 40)) {
+        if (typeof value !== 'string') continue;
+        const name = document.createElement('dt');
+        const content = document.createElement('dd');
+        name.textContent = label.slice(0, 120);
+        content.textContent = value.slice(0, 8192);
+        traceFields.append(name, content);
+      }
+    }
+    traceMetadata.hidden = !traceFields.childElementCount;
+    traceContent.textContent = typeof detail?.content === 'string' ? detail.content.slice(0, 65536) : '';
+    traceDiagnosticDetail.textContent = typeof detail?.diagnostics === 'string' ? detail.diagnostics.slice(0, 65536) : '';
+    traceSaved.hidden = !traceContent.textContent;
+    traceDiagnostics.hidden = !traceDiagnosticDetail.textContent;
+    traceDiagnosticLabel.textContent = step?.kind === 'tool_result' ? 'Tool diagnostics' : 'Request diagnostics';
+    traceDiagnosticNote.hidden = step?.kind === 'tool_result';
+    traceExtraState.textContent = !step ? '' : detail
+      ? 'Saved session data. Final content can differ from the captured output below.' + (detail.truncated ? ' Some details were shortened.' : '')
+      : recording.traceDetailsOmitted > 0 ? 'Saved session details are unavailable for this step.' : 'No exact saved-session match is available for this step.';
+    if (step && recording.traceDetailsOmitted > 0) traceExtraState.textContent += ' Extra details for ' + recording.traceDetailsOmitted + ' steps were omitted at the part size limit.';
+  }
   function selectRow(index) {
     stepButtons.get(selected)?.removeAttribute('aria-current');
     selected = index;
@@ -223,6 +271,7 @@
     nextError.disabled = errorAfter(index) < 0;
     traceTitle.textContent = step ? step.title : 'Select a step';
     traceDetail.textContent = step ? step.detail : '';
+    showSavedDetails(step);
     traceState.textContent = !step ? 'Playback follows the steps in this part.' : !step.frame
       ? 'No completed frame captured for this step.'
       : 'Frame at ' + clock(step.time) + (Number.isFinite(step.delayMs) ? ' · ' + Math.round(step.delayMs) + ' ms after the event' : '')
@@ -281,6 +330,7 @@
     visibleStart = visibleEnd = -1;
     traceList.replaceChildren();
     traceList.scrollTop = 0;
+    traceMetadata.open = traceSaved.open = traceDiagnostics.open = false;
     renderRows();
     if (!steps.length) {
       const empty = document.createElement('li');

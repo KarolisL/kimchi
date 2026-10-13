@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { resolveAuxiliaryFilesDir } from "../auxiliary-files/resolver.js"
 import { appendBeforeBody } from "../utils/export-post-process.js"
+import { enrichReplayDetails } from "./details.js"
 import type { Recording } from "./recorder.js"
 
 function assetsDirectory(): string {
@@ -27,10 +28,11 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
 			readFile(join(assets, file), "utf8"),
 		),
 	)
+	const enrichedRecordings = await enrichReplayDetails(html, recordings)
 	const document = template
 		.replace("/* PLAYER_JS */", () => js.replace(/<\/script/gi, "<\\/script"))
 		.replace("/* PLAYER_CSS */", () => css)
-		.replace("/* RECORDINGS */", () => JSON.stringify(recordings).replaceAll("<", "\\u003c"))
+		.replace("/* RECORDINGS */", () => JSON.stringify(enrichedRecordings).replaceAll("<", "\\u003c"))
 		.replace("/* LICENSES */", () => JSON.stringify(`${license}\n\n${vtLicense}`).replaceAll("<", "\\u003c"))
 	const encoded = Buffer.from(document).toString("base64")
 	return appendBeforeBody(

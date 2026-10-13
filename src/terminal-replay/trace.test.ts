@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai"
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent"
 import { describe, expect, it } from "vitest"
-import { type TraceStep, traceStepForEvent } from "./trace.js"
+import { boundedTraceStep, type TraceStep, traceStepForEvent } from "./trace.js"
 
 function assistant(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
@@ -38,7 +38,7 @@ describe("readable replay trace", () => {
 					],
 				},
 			}),
-		).toEqual({ kind: "prompt", title: "Prompt", detail: "Check the build" })
+		).toEqual({ kind: "prompt", title: "Prompt", detail: "Check the build", messageTimestamp: 1 })
 		expect(
 			traceStepForEvent({
 				type: "message_end",
@@ -49,11 +49,30 @@ describe("readable replay trace", () => {
 					],
 				}),
 			}),
-		).toEqual({ kind: "response", title: "Model response", detail: "Build passed" })
+		).toEqual({ kind: "response", title: "Model response", detail: "Build passed", messageTimestamp: 1 })
 		expect(traceStepForEvent({ type: "message_start", message: assistant() })).toBeUndefined()
 		expect(
 			traceStepForEvent({ type: "message_end", message: { role: "user", content: "Check the build", timestamp: 1 } }),
 		).toBeUndefined()
+	})
+
+	it("carries only bounded original message identity for export-time matching", () => {
+		for (const stopReason of ["stop", "error", "aborted"] as const) {
+			const step = traceStepForEvent({
+				type: "message_end",
+				message: assistant({ timestamp: 123.456, responseId: "response-a", stopReason }),
+			})
+			expect(step).toMatchObject({ messageTimestamp: 123.456, responseId: "response-a" })
+		}
+		const bounded = boundedTraceStep({
+			kind: "response",
+			title: "Response",
+			detail: "Done",
+			messageTimestamp: Number.NaN,
+			responseId: "a".repeat(100_000),
+		})
+		expect(bounded.messageTimestamp).toBeUndefined()
+		expect(bounded.responseId?.length).toBeLessThanOrEqual(1024)
 	})
 
 	it("keeps tool call IDs and the displayed result without recording partial output", () => {

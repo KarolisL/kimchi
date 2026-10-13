@@ -58,6 +58,44 @@ describe("HTML terminal replay", () => {
 		expect(html).toContain("old session")
 	})
 
+	it("embeds saved redacted details safely without changing the recording or transcript", async () => {
+		const savedText = '</script><img src=x onerror="alert(1)"> redacted saved response'
+		const session = Buffer.from(
+			JSON.stringify({
+				header: { id: "session" },
+				entries: [
+					{
+						type: "message",
+						id: "saved",
+						parentId: null,
+						timestamp: "2026-10-13T10:00:01Z",
+						message: {
+							role: "assistant",
+							timestamp: 100,
+							responseId: "response",
+							content: [{ type: "text", text: savedText }],
+						},
+					},
+				],
+			}),
+		).toString("base64")
+		const transcript = `<script id="session-data" type="application/json">${session}</script>`
+		const traceCast = `${cast}${JSON.stringify([0, "m", JSON.stringify({ type: "kimchi.trace", version: 1, step: 1, kind: "response", messageTimestamp: 100, responseId: "response", detail: "raw live text", frame: true })])}\n`
+		const original = { ...recording, gzip: gzipSync(traceCast).toString("base64") }
+		const html = await addTerminalReplay(`<body>${transcript}</body>`, [original])
+		expect(html).toContain(transcript)
+		const encoded = html.match(/id="terminal-replay-document" type="application\/octet-stream">([^<]+)/)?.[1]
+		if (!encoded) throw new Error("Replay document missing")
+		const player = Buffer.from(encoded, "base64").toString("utf8")
+		const payload = player.match(/id="recordings" type="application\/json">([^<]+)/)?.[1]
+		if (!payload) throw new Error("Replay payload missing")
+		const [embedded] = JSON.parse(payload)
+		expect(embedded.traceDetails["1"].content).toBe(savedText)
+		expect(embedded.gzip).toBe(original.gzip)
+		expect(player).not.toContain(savedText)
+		expect(original).not.toHaveProperty("traceDetails")
+	})
+
 	it("keeps the pinned standalone player assets unchanged", async () => {
 		const { createHash } = await import("node:crypto")
 		const js = readFileSync(

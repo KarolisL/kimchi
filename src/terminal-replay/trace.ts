@@ -6,6 +6,8 @@ export interface TraceStep {
 	detail: string
 	error?: boolean
 	toolCallId?: string
+	messageTimestamp?: number
+	responseId?: string
 }
 
 const DETAIL_LIMIT = 8192
@@ -21,6 +23,8 @@ export function boundedTraceStep(step: TraceStep): TraceStep {
 		detail: shorten(step.detail, DETAIL_LIMIT),
 		...(step.error === undefined ? {} : { error: step.error }),
 		...(step.toolCallId === undefined ? {} : { toolCallId: shorten(step.toolCallId, 1024) }),
+		...(Number.isFinite(step.messageTimestamp) ? { messageTimestamp: step.messageTimestamp } : {}),
+		...(step.responseId === undefined ? {} : { responseId: shorten(step.responseId, 1024) }),
 	}
 }
 
@@ -99,23 +103,32 @@ function argumentsText(value: unknown): string {
 
 export function traceStepForEvent(event: AgentSessionEvent): TraceStep | undefined {
 	if (event.type === "message_start" && event.message.role === "user") {
-		return { kind: "prompt", title: "Prompt", detail: textContent(event.message.content) || "No text content" }
+		return boundedTraceStep({
+			kind: "prompt",
+			title: "Prompt",
+			detail: textContent(event.message.content) || "No text content",
+			messageTimestamp: event.message.timestamp,
+		})
 	}
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		const message = event.message
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
-			return {
+			return boundedTraceStep({
 				kind: "error",
 				title: message.stopReason === "aborted" ? "Response cancelled" : "Model request failed",
 				detail: shorten(message.errorMessage || textContent(message.content) || "No error details", DETAIL_LIMIT),
 				error: true,
-			}
+				messageTimestamp: message.timestamp,
+				responseId: message.responseId,
+			})
 		}
-		return {
+		return boundedTraceStep({
 			kind: "response",
 			title: message.stopReason === "length" ? "Response reached output limit" : "Model response",
 			detail: textContent(message.content) || "No text content",
-		}
+			messageTimestamp: message.timestamp,
+			responseId: message.responseId,
+		})
 	}
 	if (event.type === "tool_execution_start") {
 		return boundedTraceStep({

@@ -113,7 +113,12 @@ describe("terminal trace integration", () => {
 		mode.session.emit(prompt)
 		expect(state.order).toEqual(["ui", "trace"])
 		const first = state.recorders[0]
-		expect(first.trace).toHaveBeenCalledExactlyOnceWith({ kind: "prompt", title: "Prompt", detail: "First prompt" })
+		expect(first.trace).toHaveBeenCalledExactlyOnceWith({
+			kind: "prompt",
+			title: "Prompt",
+			detail: "First prompt",
+			messageTimestamp: 1,
+		})
 		await mode.rebindCurrentSession()
 		mode.session.emit(prompt)
 		expect(first.trace).toHaveBeenCalledTimes(2)
