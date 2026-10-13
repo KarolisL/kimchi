@@ -4,6 +4,28 @@ Kimchi automatically records interactive terminal output so an unexpected displa
 
 Changing speed preserves both position and play/pause state. Returning to the transcript pauses replay; reopening keeps the same position, speed and part. The browser retains only the selected part decoded while the HTML stays open. Switching parts replaces that cache. The previous screen stays visible while a speed change prepares its replacement; recorded output and pauses are unchanged. **Download part**, next to the part selector, saves the selected part and its player as a standalone HTML file that opens offline.
 
+## Linked harness steps
+
+New recordings include a **Harness steps** panel beside the terminal. Select a prompt, completed response, tool call, tool result or error to pause on its associated screen and inspect its text. **Previous step** and **Next step** move through the selected part. **Next error** jumps to its next captured failure; **Pause on errors** stops playback there automatically. Resuming continues beyond that failure. Scrubbing or playing the recording follows the trace. Selecting another recording part loads that part's steps, and **Download part** includes them in the offline file.
+
+The harness observes each step after the interactive UI handles it, then attaches it to the next completed terminal frame. The marker carries the delay between observation and that frame. Several steps can share a frame; collapsed tools, overlays and scrolling can hide their content. A step with no completed frame remains inspectable and says so rather than seeking to an unrelated screen. Older recordings say **No linked steps in this recording.** Their terminal playback still works.
+
+Tool results follow live completion order, including parallel calls. They contain the result and failure flag supplied to the TUI; later transcript replacements can differ. Error navigation relies on the harness reporting a failure, so an error returned as successful content remains a normal result in the trace. Distinct frames remain individually seekable even when they share a clock sample.
+
+Trace text is bounded and stored inside the same recording parts and storage budget. Tool arguments and results can contain sensitive text even when the terminal shows a collapsed summary. The raw export choice covers both the terminal and its trace; it does not apply transcript redaction to either. Model reasoning, image payloads and low-level debug logs are not added to the trace. Resumed history is not presented as newly executed steps, and expired parts also lose their steps.
+
+The browser mounts only the visible step rows. Parts with more than 500 markers use a simple play/pause button and seek slider to avoid creating a DOM node for every timeline marker. Trace navigation and error pauses stay available; this reduces browser work without changing harness capture.
+
+This supports inspection of a past run. It does not pause a live agent, inspect process memory, re-execute tools or prove that a later code change fixes the issue.
+
+### Research and implementation choice
+
+The useful pattern in [Playwright Trace Viewer](https://playwright.dev/docs/trace-viewer) is selecting an action to see the corresponding visual state and details. [rrweb custom events](https://github.com/rrweb-io/rrweb/blob/main/docs/recipes/custom-event.md) provide a similar link between semantic events and a recording timeline. Neither is a terminal recorder, so this implementation adds semantic markers to the existing terminal stream.
+
+The existing [player marker API](https://docs.asciinema.org/manual/player/markers/) already supports playback callbacks and seeking. Kimchi keeps those markers in captured order, gives them readable labels and adds its trace panel without another player or recording dependency. The [pinned player driver](https://github.com/asciinema/asciinema-player/blob/v3.17.0/src/driver/recording.js) and browser checks establish the behavior used here.
+
+Pinned Pi 0.85.1 supplies public session events but no terminal-to-trace mapping. Its extension hooks precede the interactive UI subscriber and can replace finalized messages; a subscriber after the UI sees the final event. The terminal redraw is scheduled later, so an event timestamp alone can stop before an error appears. Completed synchronized-output bursts supply the frame boundary. The [Pi package catalog](https://pi.dev/packages) and bounded upstream issue/PR searches did not reveal a ready-made adapter for this flow. No upstream patch is needed.
+
 The default export choice is **Transcript only (redacted)**. A terminal recording can contain visible drafts, secrets and text cleared from the screen. The recording is raw; the transcript keeps its existing redaction. Review the recording before sharing the file. JSONL and noninteractive exports do not include raw recordings.
 
 ## Recording limits

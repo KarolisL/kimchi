@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
+import { gzipSync } from "node:zlib"
 import { chromium } from "playwright"
 import { postProcessHtmlExport } from "../utils/export-post-process.js"
 import { addTerminalReplay } from "./export.js"
@@ -276,10 +277,325 @@ try {
 	await page.locator("#terminal-replay-open").click()
 	await page.locator("#terminal-replay-close").click()
 	assert.equal(await page.locator("#sa-body").evaluate((element) => element.scrollTop), 700)
+
+	// Known screens and times make trace navigation independent of live model timing.
+	const hostileDetail = '</script><img src="https://example.invalid/trace-leak" onerror="window.traceInjected=true">'
+	const marker = (
+		step: number,
+		kind: string,
+		title: string,
+		detail: string,
+		extra: { error?: boolean; frame?: boolean; toolCallId?: string } = {},
+	) =>
+		JSON.stringify({ type: "kimchi.trace", version: 1, step, kind, title, detail, frame: true, delayMs: 20, ...extra })
+	const tracedPart = (part: number, events: [number, string, string][]) => {
+		const header = JSON.stringify({ version: 3, term: { cols: 60, rows: 8 } })
+		const cast = `${header}\n${events.map((event) => JSON.stringify(event)).join("\n")}\n`
+		const gzip = gzipSync(cast)
+		return {
+			gzip: gzip.toString("base64"),
+			metadata: {
+				...recordings[0].metadata,
+				id: `trace-part-${part}`,
+				sessionId: "trace-debugging",
+				part,
+				cols: 60,
+				rows: 8,
+				duration: events.reduce((total, event) => total + event[0], 0),
+				rawBytes: Buffer.byteLength(cast),
+				compressedBytes: gzip.length,
+			},
+		}
+	}
+	const traced = [
+		tracedPart(1, [
+			[0.1, "o", "\x1b[2J\x1b[HREQUEST: inspect the demo"],
+			[0, "m", marker(1, "prompt", "Inspect the demo", "Read the demo file")],
+			[0.4, "o", "\x1b[2J\x1b[HRUNNING: read missing.txt"],
+			[0, "m", marker(2, "tool_call", "Read missing.txt", "Path: missing.txt", { toolCallId: "failed-read" })],
+			[0.75, "o", "\x1b[2J\x1b[HERROR: missing.txt not found"],
+			[
+				0,
+				"m",
+				marker(3, "tool_result", "Read failed", "missing.txt not found", { error: true, toolCallId: "failed-read" }),
+			],
+			[0, "m", marker(4, "response", "Explain the failure", hostileDetail)],
+			[1.25, "o", "\x1b[2J\x1b[HRECOVERED: read existing.txt"],
+			[
+				0,
+				"m",
+				marker(5, "tool_result", "Read succeeded", "The existing file was read", { toolCallId: "recovered-read" }),
+			],
+			[
+				1,
+				"m",
+				marker(6, "error", "Interrupted before redraw", "The terminal did not finish a frame", {
+					error: true,
+					frame: false,
+				}),
+			],
+			[0.5, "o", ""],
+		]),
+		tracedPart(2, [
+			[0.1, "o", "\x1b[2J\x1b[HCONTINUED: second part"],
+			[0, "m", marker(7, "response", "Continue in part two", "This step belongs to the second part")],
+			[0.4, "o", "\x1b[2J\x1b[HSECOND ERROR: the next failure"],
+			[0, "m", marker(8, "error", "Second failure", "The next operation failed", { error: true })],
+			[1.5, "o", ""],
+		]),
+	]
+	await writeFile(path, await addTerminalReplay(transcript, [...traced, recordings[0]]))
+	await page.setViewportSize({ width: 1440, height: 1000 })
+	await page.goto(pathToFileURL(path).href)
+	await page.locator("#terminal-replay-open").click()
+	await frame.getByLabel("Recording part").selectOption("0")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await frame.locator("#trace-list .trace-step").count(), 6, "Every linked step must be inspectable")
+	assert.equal(await frame.getByLabel("Pause on errors").isChecked(), true)
+	const step = (number: number) => frame.locator(`#trace-list .trace-step[data-step="${number}"]`)
+	const selected = (number: number) =>
+		frame.locator(`#trace-list .trace-step[data-step="${number}"][aria-current="true"]`).waitFor()
+	await step(3).click()
+	await selected(3)
+	assert.equal(
+		(await lines())[0].trimEnd(),
+		"ERROR: missing.txt not found",
+		"Selecting a failure must show its completed frame",
+	)
+	assert.equal(await frame.getByRole("button", { name: "Play", exact: true }).isVisible(), true)
+	assert.match(await frame.locator("#trace-title").innerText(), /Read failed/)
+	await frame.getByRole("button", { name: "Next step", exact: true }).click()
+	await selected(4)
+	await page.waitForTimeout(200)
+	assert.equal(
+		await step(4).getAttribute("aria-current"),
+		"true",
+		"Equal-time steps must keep the user's selection while paused",
+	)
+	assert.equal(await frame.locator("#trace-detail").innerText(), hostileDetail)
+	assert.equal(await frame.locator("#trace-detail img").count(), 0, "Trace text must not become executable markup")
+	await frame.getByRole("button", { name: "Previous step", exact: true }).click()
+	await selected(3)
+	const failedScreen = await lines()
+	await step(6).click()
+	assert.match(await frame.locator("#trace-state").innerText(), /No completed frame captured for this step\./)
+	assert.deepEqual(await lines(), failedScreen, "An unlinked step must not seek to a misleading frame")
+	await step(1).click()
+	await frame.getByRole("button", { name: "Next error", exact: true }).click()
+	await selected(3)
+	assert.equal(
+		await frame.getByRole("button", { name: "Next error", exact: true }).isEnabled(),
+		false,
+		"Unframed errors are not seek targets",
+	)
+	await seek(0.19)
+	await selected(2)
+	assert.equal(
+		(await lines())[0].trimEnd(),
+		"RUNNING: read missing.txt",
+		"Seeking video must select the matching trace step",
+	)
+	await seek(0.68)
+	await selected(5)
+	assert.equal((await lines())[0].trimEnd(), "RECOVERED: read existing.txt")
+	await frame.getByLabel("Playback speed").selectOption("4")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	await selected(5)
+	assert.equal((await lines())[0].trimEnd(), "RECOVERED: read existing.txt")
+	await step(1).click()
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await selected(3)
+	await frame.getByRole("button", { name: "Play", exact: true }).waitFor()
+	assert.equal(
+		(await lines())[0].trimEnd(),
+		"ERROR: missing.txt not found",
+		"Auto-pause must include the failed screen, not the previous running state",
+	)
+	await page.waitForTimeout(250)
+	assert.deepEqual(await lines(), failedScreen, "An error breakpoint must remain paused")
+	await frame.getByLabel("Playback speed").selectOption("1")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	await selected(3)
+	assert.deepEqual(await lines(), failedScreen, "Changing speed at a breakpoint must preserve the failed frame")
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await frame.locator(".ap-line").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
+	await frame.getByRole("button", { name: "Pause", exact: true }).click()
+	await seek(0.1)
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await selected(3)
+	await frame.getByRole("button", { name: "Play", exact: true }).waitFor()
+	await frame.getByLabel("Pause on errors").uncheck()
+	await seek(0.1)
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await frame.locator(".ap-line").filter({ hasText: "RECOVERED: read existing.txt" }).waitFor()
+	await frame.getByRole("button", { name: "Pause", exact: true }).click()
+	await frame.getByLabel("Recording part").selectOption("1")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await frame.locator("#trace-list .trace-step").count(), 2)
+	assert.equal(await step(3).count(), 0, "A different part must not retain the previous trace rows")
+	await step(8).click()
+	assert.equal((await lines())[0].trimEnd(), "SECOND ERROR: the next failure")
+	const traceDownload = page.waitForEvent("download")
+	await frame.getByRole("button", { name: "Download part", exact: true }).click()
+	const traceDownloadPath = join(directory, "linked-part.html")
+	await (await traceDownload).saveAs(traceDownloadPath)
+	const linkedOffline = await browser.newPage()
+	await linkedOffline.context().setOffline(true)
+	linkedOffline.on("pageerror", (error) => errors.push(error.message))
+	linkedOffline.on("request", (request) => {
+		if (/^https?:/.test(request.url())) requests.push(request.url())
+	})
+	await linkedOffline.goto(pathToFileURL(traceDownloadPath).href)
+	await linkedOffline.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await linkedOffline.getByLabel("Recording part").locator("option").count(), 1)
+	assert.equal(await linkedOffline.locator("#trace-list .trace-step").count(), 2)
+	await linkedOffline.locator('#trace-list .trace-step[data-step="8"]').click()
+	assert.equal(
+		(await linkedOffline.locator(".ap-line").allTextContents())[0].trimEnd(),
+		"SECOND ERROR: the next failure",
+		"Downloaded parts must retain working trace links offline",
+	)
+	await linkedOffline.close()
+	await frame.getByLabel("Recording part").selectOption("2")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.match(await frame.locator("#trace-list").innerText(), /No linked steps in this recording\./)
+	for (const name of ["Previous step", "Next step", "Next error"]) {
+		assert.equal(await frame.getByRole("button", { name, exact: true }).isEnabled(), false)
+	}
+	await seek(0.2)
+	assert.equal(
+		(await lines())[1].trimEnd(),
+		"DUPLICATE BUG",
+		"Old recordings must continue to play without trace metadata",
+	)
+
+	let simultaneousNow = 0
+	const simultaneous = await TerminalRecorder.create({
+		root: join(directory, "simultaneous"),
+		sessionId: "same-clock-frames",
+		cols: 60,
+		rows: 8,
+		now: () => simultaneousNow,
+	})
+	simultaneous.write("\x1b[2J\x1b[HREADY")
+	simultaneousNow = 100
+	simultaneous.trace({ kind: "error", title: "First failure", detail: "failed frame", error: true })
+	simultaneous.write("\x1b[?2026h\x1b[2J\x1b[HFIRST FAILED FRAME\x1b[?2026l")
+	await Promise.resolve()
+	simultaneous.trace({ kind: "response", title: "Recovery", detail: "recovered frame" })
+	simultaneous.write("\x1b[?2026h\x1b[2J\x1b[HSECOND RECOVERED FRAME\x1b[?2026l")
+	await Promise.resolve()
+	simultaneousNow = 2000
+	await simultaneous.close()
+	await writeFile(
+		path,
+		await addTerminalReplay(transcript, await readRecordings(join(directory, "simultaneous"), "same-clock-frames")),
+	)
+	await page.goto(pathToFileURL(path).href)
+	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	await step(1).click()
+	await selected(1)
+	assert.equal(
+		(await lines())[0].trimEnd(),
+		"FIRST FAILED FRAME",
+		"Two completed frames from the same clock sample must remain individually seekable",
+	)
+	await step(2).click()
+	await selected(2)
+	assert.equal((await lines())[0].trimEnd(), "SECOND RECOVERED FRAME")
+	await page.reload()
+	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal((await lines())[0].trimEnd(), "READY", "Fresh playback must precede both completed frames")
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await selected(1)
+	await frame.getByRole("button", { name: "Play", exact: true }).waitFor()
+	assert.equal(
+		(await lines())[0].trimEnd(),
+		"FIRST FAILED FRAME",
+		"Auto-pause must not advance into a same-clock later frame",
+	)
+	await frame.getByRole("button", { name: "Play", exact: true }).click()
+	await frame.locator(".ap-line").filter({ hasText: "SECOND RECOVERED FRAME" }).waitFor()
+	await frame.getByRole("button", { name: "Pause", exact: true }).click()
+
+	const denseEvents: [number, string, string][] = []
+	for (let index = 1; index <= 501; index++) {
+		denseEvents.push([0.004, "o", `\x1b[2J\x1b[HDENSE STEP ${index}`])
+		denseEvents.push([
+			0,
+			"m",
+			marker(index, "tool_result", `Dense step ${index}`, `Result ${index}`, { error: index === 250 }),
+		])
+	}
+	denseEvents.push([1, "o", ""])
+	await writeFile(path, await addTerminalReplay(transcript, [tracedPart(1, denseEvents), tracedPart(2, denseEvents)]))
+	await page.goto(pathToFileURL(path).href)
+	await page.locator("#terminal-replay-open").click()
+	await frame.getByLabel("Recording part").selectOption("0")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await frame.locator("#trace-count").innerText(), "501 in this part")
+	assert.equal(await frame.locator("#dense-controls").isVisible(), true)
+	await frame.locator("#dense-toggle").click()
+	await selected(250)
+	await frame
+		.locator("#dense-toggle")
+		.filter({ hasText: /^Play$/ })
+		.waitFor()
+	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250", "Dense controls must pause at the failed frame")
+	await frame.getByLabel("Playback speed").selectOption("2")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	await selected(250)
+	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250")
+	await frame.locator("#dense-toggle").click()
+	await frame.locator(".ap-line").filter({ hasText: "DENSE STEP 501" }).waitFor()
+	await frame
+		.locator("#dense-toggle")
+		.filter({ hasText: /^Play$/ })
+		.waitFor()
+	await frame.getByLabel("Seek recording").focus()
+	await page.keyboard.press("Home")
+	await frame.getByRole("button", { name: "Next error", exact: true }).click()
+	await selected(250)
+	assert.equal((await lines())[0].trimEnd(), "DENSE STEP 250", "Dense seeking must re-enable earlier trace navigation")
+	const denseDownload = page.waitForEvent("download")
+	await frame.getByRole("button", { name: "Download part", exact: true }).click()
+	const densePath = join(directory, "dense-part.html")
+	await (await denseDownload).saveAs(densePath)
+	const denseOffline = await browser.newPage()
+	await denseOffline.context().setOffline(true)
+	denseOffline.on("pageerror", (error) => errors.push(error.message))
+	await denseOffline.goto(pathToFileURL(densePath).href)
+	await denseOffline.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await denseOffline.locator("#trace-count").innerText(), "501 in this part")
+	assert.equal(await denseOffline.getByLabel("Seek recording").isVisible(), true)
+	await denseOffline.getByRole("button", { name: "Next error", exact: true }).click()
+	await denseOffline.locator('#trace-list .trace-step[data-step="250"][aria-current="true"]').waitFor()
+	assert.equal((await denseOffline.locator(".ap-line").allTextContents())[0].trimEnd(), "DENSE STEP 250")
+	await denseOffline.close()
+	await frame.locator("#dense-toggle").click()
+	await frame
+		.locator("#dense-toggle")
+		.filter({ hasText: /^Pause$/ })
+		.waitFor()
+	await frame.getByLabel("Recording part").selectOption("1")
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(
+		await frame.locator("#dense-toggle").innerText(),
+		"Play",
+		"Switching a playing dense part must show its paused state",
+	)
+	await page.waitForTimeout(150)
+	assert.equal(Number(await frame.getByLabel("Seek recording").inputValue()), 0)
+	const switchedScreen = await lines()
+	await page.waitForTimeout(250)
+	assert.equal(Number(await frame.getByLabel("Seek recording").inputValue()), 0)
+	assert.deepEqual(await lines(), switchedScreen, "A newly selected dense part must remain paused at the beginning")
 	assert.deepEqual(requests, [], "The standalone export must not request remote content")
 	assert.deepEqual(errors, [])
 	console.log(
-		"PASS: defect, clearing, Unicode, resize/wrap, seek, speed, pause/reopen, mobile controls, retained parts, standalone download playing offline, subagent views and embedded notices",
+		"PASS: terminal fidelity, controls, retained parts, offline download, subagents, linked steps, error breakpoints, legacy recordings and safe trace details",
 	)
 } finally {
 	await browser.close()

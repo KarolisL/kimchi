@@ -5,11 +5,20 @@ import { promisify } from "node:util"
 import { gunzip, gzip } from "node:zlib"
 import { lock } from "proper-lockfile"
 import { recordingCheckpoint } from "./checkpoint.js"
+import { boundedTraceStep, type TraceStep } from "./trace.js"
 
 const compress = promisify(gzip)
 const decompress = promisify(gunzip)
 const CHUNK_BYTES = 64 * 1024
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+const SYNC_BEGIN = "\x1b[?2026h"
+
+interface PendingTrace {
+	step: TraceStep
+	sequence: number
+	observedUs: number
+	bytes: number
+}
 
 /** A stalled disk must not hold up startup, session replacement or shutdown. */
 export async function recordingDeadline<T>(operation: Promise<T>, timeoutMs = 1000): Promise<T | undefined> {
@@ -127,8 +136,10 @@ export class TerminalRecorder {
 	private readonly limits: typeof RECORDING_LIMITS
 	private readonly now: () => number
 	private readonly started: number
-	private lastTimeMs = 0
-	private partStartedMs = 0
+	private readonly wallStartedMs: number
+	private lastTimeUs = 0
+	private lastEventWasMarker = false
+	private partStartedUs = 0
 	private queuedBytes = 0
 	private pending: string[] = []
 	private pendingBytes = 0
@@ -136,6 +147,12 @@ export class TerminalRecorder {
 	private timer: NodeJS.Timeout | undefined
 	private closed = false
 	private discardQueued = false
+	private traceSequence = 0
+	private traceBytes = 0
+	private pendingTrace: PendingTrace[] = []
+	private framedTrace: PendingTrace[] = []
+	private syncTail = ""
+	private syncOpen = false
 
 	private constructor(
 		public directory: string,
@@ -144,12 +161,13 @@ export class TerminalRecorder {
 		this.limits = { ...RECORDING_LIMITS, ...options.limits }
 		this.now = options.now ?? (() => performance.now())
 		this.started = this.now()
+		this.wallStartedMs = Date.now()
 		this.metadata = {
 			version: 1,
 			id: randomUUID(),
 			sessionId: options.sessionId,
 			pid: process.pid,
-			startedAt: new Date().toISOString(),
+			startedAt: new Date(this.wallStartedMs).toISOString(),
 			status: "recording",
 			cols: options.cols,
 			rows: options.rows,
@@ -174,23 +192,100 @@ export class TerminalRecorder {
 	}
 
 	write(data: string): void {
-		if (data) this.event("o", data)
+		if (!data) return
+		const watching = this.pendingTrace.length > 0 || this.framedTrace.length > 0
+		const scan = watching ? this.syncTail + data : ""
+		// A second synchronous frame must not overtake markers for the completed first frame.
+		if (this.framedTrace.length && scan.includes(SYNC_BEGIN)) this.drainTrace(true)
+		if (!this.event("o", data) || !watching) return
+		// Both pinned Pi renderers wrap frames in synchronized output, possibly split across writes.
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: Recorded terminal frame delimiters.
+		for (const match of scan.matchAll(/\x1b\[\?2026([hl])/g)) {
+			if (match[1] === "h") this.syncOpen = true
+			else if (this.syncOpen) {
+				this.syncOpen = false
+				if (!this.pendingTrace.length) continue
+				this.framedTrace.push(...this.pendingTrace)
+				this.pendingTrace = []
+				// Main-screen rendering positions the cursor after the synchronized-output end.
+				queueMicrotask(() => this.drainTrace(true))
+			}
+		}
+		this.syncTail = scan.slice(-7)
+	}
+
+	trace(step: TraceStep): void {
+		if (this.closed || this.metadata.status !== "recording") return
+		const bounded = boundedTraceStep(step)
+		const sequence = ++this.traceSequence
+		const marker = {
+			type: "kimchi.trace",
+			version: 1,
+			step: sequence,
+			...bounded,
+			frame: false,
+			delayMs: Number.MAX_SAFE_INTEGER,
+		}
+		const bytes = Buffer.byteLength(JSON.stringify([Number.MAX_SAFE_INTEGER, "m", JSON.stringify(marker)])) + 1
+		if (!this.hasCapacity(bytes)) return
+		this.pendingTrace.push({ step: bounded, sequence, observedUs: this.elapsedUs(), bytes })
+		this.traceBytes += bytes
+		this.metadata.queueHighWaterBytes = Math.max(this.metadata.queueHighWaterBytes, this.queuedBytes + this.traceBytes)
+	}
+
+	/** Export and close need an explicit trace boundary; ordinary disk flushes do not. */
+	finalizeTrace(): void {
+		this.drainTrace(true)
+		this.drainTrace(false)
+	}
+
+	private drainTrace(frame: boolean): void {
+		const pending = frame ? this.framedTrace : this.pendingTrace
+		if (frame) this.framedTrace = []
+		else this.pendingTrace = []
+		for (const item of pending) {
+			this.traceBytes -= item.bytes
+			const timeUs = this.elapsedUs()
+			this.event(
+				"m",
+				JSON.stringify({
+					type: "kimchi.trace",
+					version: 1,
+					step: item.sequence,
+					...item.step,
+					frame,
+					delayMs: (timeUs - item.observedUs) / 1000,
+				}),
+				timeUs,
+			)
+		}
+	}
+
+	private elapsedUs(): number {
+		return Math.max(this.lastTimeUs, Math.round((this.now() - this.started) * 1000))
 	}
 
 	resize(cols: number, rows: number): void {
 		this.event("r", `${Math.max(1, cols)}x${Math.max(1, rows)}`)
 	}
 
-	private event(code: "o" | "r", data: string): void {
-		if (this.closed || this.metadata.status !== "recording") return
+	private event(code: "o" | "r" | "m", data: string, observedUs?: number): boolean {
+		if (this.closed || this.metadata.status !== "recording") return false
 		// String length is a lower bound on encoded size. Reject huge writes before copying them into JSON.
-		if (!this.hasCapacity(data.length)) return
+		if (!this.hasCapacity(data.length)) return false
 		// Round the absolute elapsed time, then subtract, so rounding cannot accumulate drift.
-		const timeMs = Math.max(this.lastTimeMs, Math.round(this.now() - this.started))
-		const line = `${JSON.stringify([(timeMs - this.lastTimeMs) / 1000, code, data])}\n`
-		const previous = this.lastTimeMs
-		this.lastTimeMs = timeMs
-		if (!this.enqueue(line)) this.lastTimeMs = previous
+		let timeUs = observedUs ?? this.elapsedUs()
+		// Seeking is time-based: a later frame must not share the preceding marker's timestamp.
+		if (code !== "m" && this.lastEventWasMarker && timeUs === this.lastTimeUs) timeUs++
+		const line = `${JSON.stringify([(timeUs - this.lastTimeUs) / 1_000_000, code, data])}\n`
+		const previous = this.lastTimeUs
+		this.lastTimeUs = timeUs
+		if (!this.enqueue(line)) {
+			this.lastTimeUs = previous
+			return false
+		}
+		this.lastEventWasMarker = code === "m"
+		return true
 	}
 
 	private hasCapacity(bytes: number): boolean {
@@ -199,7 +294,7 @@ export class TerminalRecorder {
 			void this.flush()
 			return false
 		}
-		if (this.queuedBytes + bytes > this.limits.queuedBytes) {
+		if (this.queuedBytes + this.traceBytes + bytes > this.limits.queuedBytes) {
 			this.metadata.status = "queue-limit"
 			void this.flush()
 			return false
@@ -214,7 +309,7 @@ export class TerminalRecorder {
 		this.pending.push(line)
 		this.pendingBytes += bytes
 		this.queuedBytes += bytes
-		this.metadata.queueHighWaterBytes = Math.max(this.metadata.queueHighWaterBytes, this.queuedBytes)
+		this.metadata.queueHighWaterBytes = Math.max(this.metadata.queueHighWaterBytes, this.queuedBytes + this.traceBytes)
 		if (this.pendingBytes >= CHUNK_BYTES) void this.flush()
 		else if (!this.timer) this.timer = setTimeout(() => void this.flush(), 250).unref()
 		return true
@@ -225,7 +320,7 @@ export class TerminalRecorder {
 		this.timer = undefined
 		const data = this.pending.join("")
 		const bytes = this.pendingBytes
-		const duration = this.lastTimeMs / 1000
+		const durationUs = this.lastTimeUs
 		this.pending = []
 		this.pendingBytes = 0
 		this.writing = this.writing.then(async () => {
@@ -237,7 +332,7 @@ export class TerminalRecorder {
 						this.discardQueued = true
 					} else {
 						await this.appendChunk(compressed, bytes)
-						this.metadata.duration = duration - this.partStartedMs / 1000
+						this.metadata.duration = (durationUs - this.partStartedUs) / 1_000_000
 					}
 				}
 				await this.saveMetadata()
@@ -274,8 +369,10 @@ export class TerminalRecorder {
 			this.metadata.cols,
 			this.metadata.rows,
 		)
-		const startedAt = new Date(Date.parse(this.metadata.startedAt) + this.metadata.duration * 1000).toISOString()
-		const prefix = `${JSON.stringify({ version: 3, term: { cols: snapshot.cols, rows: snapshot.rows }, timestamp: Date.parse(startedAt) / 1000 })}\n${JSON.stringify([0, "o", snapshot.data])}\n`
+		const partStartedUs = this.partStartedUs + Math.round(this.metadata.duration * 1_000_000)
+		const startedAtMs = this.wallStartedMs + partStartedUs / 1000
+		const startedAt = new Date(startedAtMs).toISOString()
+		const prefix = `${JSON.stringify({ version: 3, term: { cols: snapshot.cols, rows: snapshot.rows }, timestamp: startedAtMs / 1000 })}\n${JSON.stringify([0, "o", snapshot.data])}\n`
 		const bytes = Buffer.byteLength(prefix)
 		const compressed = await compress(prefix, { level: 1 })
 		if (
@@ -285,7 +382,7 @@ export class TerminalRecorder {
 			return false
 		await this.saveMetadata({ ...this.metadata, status: "continued", pid: 0 })
 		this.directory = await reserveSlot(this.options, this.limits.slots)
-		this.partStartedMs += this.metadata.duration * 1000
+		this.partStartedUs = partStartedUs
 		this.metadata = {
 			...this.metadata,
 			id: randomUUID(),
@@ -297,7 +394,7 @@ export class TerminalRecorder {
 			rawBytes: 0,
 			compressedBytes: 0,
 			duration: 0,
-			queueHighWaterBytes: this.queuedBytes,
+			queueHighWaterBytes: this.queuedBytes + this.traceBytes,
 		}
 		await this.appendChunk(compressed, bytes)
 		return true
@@ -305,6 +402,7 @@ export class TerminalRecorder {
 
 	async close(): Promise<void> {
 		if (this.closed) return this.writing
+		this.finalizeTrace()
 		this.event("o", "") // Preserve the final idle interval.
 		this.closed = true
 		await this.flush()

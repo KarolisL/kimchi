@@ -1,12 +1,20 @@
 import { join } from "node:path"
-import { type ExtensionAPI, type ExtensionContext, getAgentDir, InteractiveMode } from "@earendil-works/pi-coding-agent"
+import {
+	type AgentSession,
+	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
+	InteractiveMode,
+} from "@earendil-works/pi-coding-agent"
 import { getParsedCliArgs } from "../cli-args.js"
 import { readConfigSetting } from "../config/settings.js"
 import { tapTerminalOutput } from "./output-tap.js"
 import { type Recording, readRecordings, recordingDeadline, TerminalRecorder } from "./recorder.js"
+import { traceStepForEvent } from "./trace.js"
 
 let active: TerminalRecorder | undefined
 let untap: (() => void) | undefined
+let untrace: (() => void) | undefined
 let installed = false
 const exportConsent = new Map<string, () => Promise<boolean>>()
 const recordingRoot = () => join(getAgentDir(), "terminal-recordings")
@@ -53,6 +61,8 @@ async function begin(manager: ExtensionContext["sessionManager"]): Promise<boole
 }
 
 async function finish(): Promise<void> {
+	untrace?.()
+	untrace = undefined
 	untap?.()
 	untap = undefined
 	const previous = active
@@ -61,6 +71,7 @@ async function finish(): Promise<void> {
 }
 
 interface ReplayInteractiveMode {
+	session: Pick<AgentSession, "subscribe" | "sessionManager">
 	sessionManager: ExtensionContext["sessionManager"]
 	ui: { requestRender(force?: boolean): void }
 	init(): Promise<void>
@@ -80,10 +91,25 @@ export function installTerminalRecording(): void {
 	}
 	const rebind = prototype.rebindCurrentSession
 	prototype.rebindCurrentSession = async function (options) {
+		untrace?.()
+		untrace = undefined
+		const session = this.session
 		const changed = await begin(this.sessionManager)
 		// A session visit needs a full initial frame; differential output alone is not replayable.
 		if (changed) this.ui.requestRender(true)
-		return rebind.call(this, options)
+		await rebind.call(this, options)
+		const recorder = active
+		if (this.session !== session || !recorder || recorder.metadata.sessionId !== session.sessionManager.getSessionId())
+			return
+		// Subscribe after the TUI: it has applied the event and requested its next frame.
+		untrace = session.subscribe((event) => {
+			try {
+				const step = traceStepForEvent(event)
+				if (step) recorder.trace(step)
+			} catch {
+				// An untyped extension result must not make optional recording interrupt the agent.
+			}
+		})
 	}
 }
 
@@ -94,7 +120,7 @@ export function terminalRecordingExtension(pi: ExtensionAPI): void {
 			const include = "Transcript + replay (raw terminal output)"
 			return (
 				(await ctx.ui.select(
-					"Include terminal replay? It can contain secrets, drafts and cleared output. Only the transcript is redacted.",
+					"Include terminal replay? Replay and trace tool arguments and results can contain secrets, drafts and cleared output. Only the transcript is redacted.",
 					["Transcript only (redacted)", include],
 				)) === include
 			)
@@ -112,6 +138,9 @@ export async function recordingsForExport(sessionId: string): Promise<Recording[
 	const consent = exportConsent.get(sessionId)
 	if (!consent) return undefined
 	if (!(await consent())) return undefined
-	if (active?.metadata.sessionId === sessionId) await recordingDeadline(active.flush())
+	if (active?.metadata.sessionId === sessionId) {
+		active.finalizeTrace()
+		await recordingDeadline(active.flush())
+	}
 	return (await recordingDeadline(readRecordings(recordingRoot(), sessionId), 30000)) ?? []
 }

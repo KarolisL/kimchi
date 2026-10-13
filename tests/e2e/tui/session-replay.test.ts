@@ -4,6 +4,7 @@ import { gunzipSync } from "node:zlib"
 import { expect, test } from "@microsoft/tui-test"
 import { waitForText, waitForTurnToSettle } from "./support/assertions.js"
 import { runKimchiSession, TUI_TEST_CONFIG } from "./support/kimchi-fixture.js"
+import { toolResultText } from "./support/mcp-model-script.js"
 
 function recordingPayload(
 	path: string,
@@ -19,6 +20,26 @@ function recordingPayload(
 
 function decodedCast(recording: { gzip: string }): string {
 	return gunzipSync(Buffer.from(recording.gzip, "base64")).toString("utf8")
+}
+
+function recordedSteps(recording: { gzip: string }): {
+	step: number
+	kind: string
+	title: string
+	detail: string
+	error?: boolean
+	toolCallId?: string
+	frame: boolean
+	delayMs: number
+}[] {
+	return decodedCast(recording)
+		.trim()
+		.split("\n")
+		.slice(1)
+		.map((line) => JSON.parse(line))
+		.filter((event) => event[1] === "m")
+		.map((event) => JSON.parse(event[2]))
+		.filter((event) => event.type === "kimchi.trace" && event.version === 1)
 }
 
 test.use(TUI_TEST_CONFIG)
@@ -50,7 +71,12 @@ test("exports recorded terminal output only after choosing replay", async ({ ter
 			expect(cast).toContain("REPLAY_STREAM_COMPLETE")
 			expect(cast).toContain('"r","100x35"')
 			expect(cast).toContain("\\u001b[")
-			trace.step("HTML contains actual output and resize")
+			const steps = recordings.flatMap(recordedSteps)
+			expect(steps.some((step) => step.kind === "prompt" && step.detail.includes("Show the replay marker"))).toBe(true)
+			expect(steps.some((step) => step.kind === "response" && step.detail.includes("REPLAY_STREAM_COMPLETE."))).toBe(
+				true,
+			)
+			trace.step("HTML contains actual output, resize and linked prompt/response steps")
 
 			const transcriptPath = join(fixture.workDir, "transcript-only.html")
 			terminal.submit(`/export ${transcriptPath}`)
@@ -77,7 +103,82 @@ test("exports recorded terminal output only after choosing replay", async ({ ter
 			const nextCast = decodedCast(next[0])
 			expect(nextCast).toContain("SECOND_SESSION_REPLAY_READY")
 			expect(nextCast).not.toContain("REPLAY_STREAM_COMPLETE")
-			trace.step("session replacement starts a fresh recording without old output")
+			const nextSteps = next.flatMap(recordedSteps)
+			expect(
+				nextSteps.some((step) => step.kind === "response" && step.detail.includes("SECOND_SESSION_REPLAY_READY.")),
+			).toBe(true)
+			expect(nextSteps.some((step) => step.detail.includes("Show the replay marker"))).toBe(false)
+			trace.step("session replacement starts a fresh recording without old output or trace steps")
+		},
+	)
+})
+
+test("links a failed tool and recovery to the recorded terminal frames", async ({ terminal }) => {
+	const failedId = "replay-failed-tool"
+	const recoveredId = "replay-recovered-tool"
+	await runKimchiSession(
+		terminal,
+		{
+			artifactName: "session-replay-failed-tool",
+			seedHome: (_home, workDir) => writeFileSync(join(workDir, "existing-demo.txt"), "REPLAY_EXISTING_FILE_OK\n"),
+			responses: [
+				{
+					toolCalls: [
+						{ id: failedId, function: { name: "read", arguments: JSON.stringify({ path: "missing-demo.txt" }) } },
+					],
+				},
+				{
+					toolCalls: [
+						{ id: recoveredId, function: { name: "read", arguments: JSON.stringify({ path: "existing-demo.txt" }) } },
+					],
+				},
+				{ stream: ["REPLAY_RECOVERED: the existing file was read."] },
+			],
+		},
+		async (fixture, trace) => {
+			terminal.submit("Read missing-demo.txt, then read existing-demo.txt and recover")
+			await waitForText(terminal, "REPLAY_RECOVERED")
+			await waitForTurnToSettle(fixture.fake.requests)
+			expect(toolResultText(fixture.fake.requests, failedId)).toMatch(/ENOENT|no such file|not found/i)
+			expect(toolResultText(fixture.fake.requests, recoveredId)).toContain("REPLAY_EXISTING_FILE_OK")
+			trace.step("a real tool failure reached the next model request and the session recovered")
+			const path = join(fixture.workDir, "failed-tool-replay.html")
+			terminal.submit(`/export ${path}`)
+			await waitForText(terminal, "Include terminal replay?", { full: false })
+			terminal.keyDown()
+			terminal.submit("")
+			await waitForText(terminal, /Session exported to:\s+\S*failed-tool-replay\.html/)
+			const steps = recordingPayload(path).flatMap(recordedSteps)
+			const call = steps.find((step) => step.kind === "tool_call" && step.toolCallId === failedId)
+			const result = steps.find((step) => step.kind === "tool_result" && step.toolCallId === failedId)
+			const recoveredResult = steps.find((step) => step.kind === "tool_result" && step.toolCallId === recoveredId)
+			const prompt = steps.find((step) => step.kind === "prompt" && step.detail.includes("Read missing-demo.txt"))
+			const recovery = steps.find((step) => step.kind === "response" && step.detail.includes("REPLAY_RECOVERED"))
+			expect(prompt).toBeDefined()
+			expect(call).toBeDefined()
+			expect(result).toBeDefined()
+			expect(recoveredResult).toBeDefined()
+			expect(recovery).toBeDefined()
+			if (!prompt || !call || !result || !recoveredResult || !recovery)
+				throw new Error("Expected prompt, tool call, failure and recovery steps")
+			expect({ toolCallId: result.toolCallId, error: result.error }).toEqual({ toolCallId: failedId, error: true })
+			expect(result.detail).toMatch(/ENOENT|no such file|not found/i)
+			expect(recoveredResult.error).toBe(false)
+			expect(recoveredResult.detail).toContain("REPLAY_EXISTING_FILE_OK")
+			expect(prompt.step).toBeLessThan(call.step)
+			expect(call.step).toBeLessThan(result.step)
+			expect(result.step).toBeLessThan(recoveredResult.step)
+			expect(recoveredResult.step).toBeLessThan(recovery.step)
+			expect(new Set(steps.map((step) => step.step)).size).toBe(steps.length)
+			for (const step of [prompt, call, result, recoveredResult, recovery]) {
+				expect({ step: step.step, kind: step.kind, frame: step.frame }).toEqual({
+					step: step.step,
+					kind: step.kind,
+					frame: true,
+				})
+				expect(step.delayMs).toBeGreaterThanOrEqual(0)
+			}
+			trace.step("export links ordered steps to frames and keeps the failed tool call ID and error detail")
 		},
 	)
 })
@@ -87,7 +188,7 @@ test("keeps recording after a full part and exports the continued screen", async
 		terminal,
 		{
 			artifactName: "session-replay-parts",
-			responses: [{ stream: ["BEFORE_ROTATION_VISIBLE."] }],
+			responses: [{ stream: ["BEFORE_ROTATION_VISIBLE."] }, { stream: ["AFTER_ROTATION_TRACE_READY."] }],
 			trustWorkDir: true,
 			seedHome: (_home, workDir) => {
 				const extensions = join(workDir, ".config/kimchi/harness/extensions")
@@ -105,6 +206,9 @@ test("keeps recording after a full part and exports the continued screen", async
 			terminal.submit("/replay-part-burst")
 			await waitForText(terminal, "REPLAY_PART_TWO_READY", { timeoutMs: 35000 })
 			trace.step("recording continued after the default 32 MiB part filled")
+			terminal.submit("Show the marker after recording continues")
+			await waitForText(terminal, "AFTER_ROTATION_TRACE_READY.")
+			await waitForTurnToSettle(fixture.fake.requests)
 			const htmlPath = join(fixture.workDir, "continued-replay.html")
 			terminal.submit(`/export ${htmlPath}`)
 			await waitForText(terminal, "Include terminal replay?", { full: false })
@@ -117,7 +221,15 @@ test("keeps recording after a full part and exports the continued screen", async
 			expect(parts[1].metadata.part).toBe(2)
 			expect(decodedCast(parts[1])).toContain("BEFORE_ROTATION_VISIBLE")
 			expect(decodedCast(parts[1])).toContain("REPLAY_PART_TWO_READY")
-			trace.step("later part contains the preceding screen and subsequent terminal output")
+			const firstSteps = recordedSteps(parts[0])
+			const continuedSteps = recordedSteps(parts[1])
+			expect(firstSteps.some((step) => step.detail.includes("BEFORE_ROTATION_VISIBLE."))).toBe(true)
+			expect(continuedSteps.some((step) => step.detail.includes("AFTER_ROTATION_TRACE_READY."))).toBe(true)
+			expect(continuedSteps.some((step) => step.detail.includes("BEFORE_ROTATION_VISIBLE."))).toBe(false)
+			expect(Math.min(...continuedSteps.map((step) => step.step))).toBeGreaterThan(
+				Math.max(...firstSteps.map((step) => step.step)),
+			)
+			trace.step("later part retains the preceding screen and carries only its own linked trace steps")
 		},
 	)
 })

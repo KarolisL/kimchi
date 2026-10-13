@@ -32,8 +32,38 @@
   #download { min-height: 34px; padding: 6px 12px; border: 1px solid #5a4235; border-radius: 6px; background: #392c26; color: #f3bb9e; cursor: pointer; font: 500 12px system-ui, sans-serif; white-space: nowrap; }
   #download:hover { background: #48362b; }
   #download:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-  #player { flex: 1; display: grid; grid-template-rows: minmax(0, 1fr); padding: 16px; min-height: 240px; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 340px; flex: 1; min-height: 0; }
+  .terminal-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #player { display: grid; flex: 1; grid-template-rows: minmax(0, 1fr); padding: 16px; min-height: 240px; min-width: 0; }
   #player > div { grid-area: 1 / 1; min-width: 0; min-height: 0; }
+  #dense-controls { display: flex; align-items: center; gap: 12px; padding: 0 16px 14px; }
+  #dense-controls[hidden] { display: none; }
+  #dense-toggle { min-width: 56px; padding: 7px; border: 1px solid #3a3d45; border-radius: 5px; background: #22252b; color: #eeece9; cursor: pointer; }
+  #dense-seek { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #dense-time { color: var(--muted); font: 11px ui-monospace, monospace; }
+  #trace { display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--line); }
+  .trace-heading { display: flex; align-items: baseline; justify-content: space-between; padding: 17px 16px 12px; }
+  .trace-heading h2 { margin: 0; font-size: 13px; font-weight: 600; }
+  #trace-count { color: var(--muted); font-size: 11px; }
+  .trace-controls { display: flex; gap: 5px; padding: 0 12px 10px; }
+  .trace-controls button { flex: 1; padding: 7px 5px; border: 1px solid #3a3d45; border-radius: 5px; background: #22252b; color: #eeece9; font: 11px system-ui, sans-serif; cursor: pointer; }
+  .trace-controls button:hover:not(:disabled) { background: #343036; border-color: #68636a; }
+  .trace-controls button:disabled { opacity: .35; cursor: default; }
+  #trace button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .trace-options { display: flex; align-items: center; gap: 7px; padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
+  .trace-options input { accent-color: var(--accent); margin: 0; }
+  #trace-list { flex: 1; min-height: 70px; overflow: auto; margin: 0; padding: 0 6px 8px; list-style: none; border-bottom: 1px solid var(--line); }
+  .trace-step { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 10px; width: 100%; height: 38px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #c4c2c8; padding: 10px; text-align: left; font: 12px system-ui, sans-serif; cursor: pointer; }
+  .trace-step time { color: #888c97; font: 10px ui-monospace, monospace; padding-top: 2px; }
+  .trace-step span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trace-step:hover { background: #22252b; }
+  .trace-step[aria-current="true"] { background: #352b26; border-color: #604535; color: #f3bb9e; }
+  .trace-step[data-error="true"] span::before { content: '● '; color: #f09389; font-size: 9px; }
+  .trace-inspector { display: flex; flex-direction: column; flex: 1; min-height: 130px; padding: 16px; overflow: auto; }
+  #trace-title { margin: 0 0 7px; font-size: 13px; font-weight: 600; }
+  #trace-state { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+  #trace-detail { margin: 0; color: #c9cbd2; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .trace-empty { padding: 16px 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
   #coverage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; margin: 0; padding: 11px 18px; border-top: 1px solid var(--line); color: #b3afa9; font-size: 11px; line-height: 1.5; }
   #coverage::before { content: ''; flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: #d8b184; }
   #coverage[data-status="complete"]::before { background: #97b99b; }
@@ -46,6 +76,7 @@
   div.ap-control-bar button.ap-button:hover { background: #333036; border-radius: 4px; }
   .ap-player .ap-overlay-start .ap-play-button { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); box-shadow: 0 8px 32px #0006; }
   #player .ap-overlay-start .ap-play-button svg { display: none; }
+  #player[data-inspecting="true"] .ap-overlay-start { display: none; }
   .ap-player .ap-overlay-start .ap-play-button::after { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%); border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 17px solid #302018; }
   @media (max-width: 600px) {
     .page-heading { align-items: flex-start; gap: 12px; padding: 20px var(--gutter) 18px; }
@@ -63,7 +94,7 @@
 <header class="page-heading">
   <div>
     <h1>Session replay</h1>
-    <p class="intro">Recorded terminal output, with its original timing.</p>
+    <p class="intro">Pause on a step. Inspect what happened.</p>
   </div>
   <div class="heading-actions">
     <span class="raw-badge">Unredacted</span>
@@ -71,7 +102,9 @@
       <summary>Recording details</summary>
       <div class="details-body">
         <p><strong>Raw, unredacted output. Review before sharing.</strong> Includes visible drafts and cleared text. The conversation transcript is redacted separately.</p>
+        <p>Linked steps include prompt and response text, tool arguments and results. Their text is bounded and unredacted.</p>
         <p>Long recordings continue in numbered parts. Only retained parts are included; older parts may have expired or been replaced.</p>
+        <p>A step links to the next completed terminal frame. Several steps can share a frame, and collapsed or offscreen content may not be visible.</p>
         <p>Fonts, images and terminal-specific effects can differ from the original screen.</p>
       </div>
     </details>
@@ -83,7 +116,31 @@
     <button id="download" type="button" title="Save this part as an offline HTML replay">Download part</button>
     <label>Speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
   </div>
-  <div id="player"></div>
+  <div class="workspace">
+    <div class="terminal-pane">
+      <div id="player"></div>
+      <div id="dense-controls" hidden>
+        <button id="dense-toggle" type="button">Play</button>
+        <input id="dense-seek" type="range" aria-label="Seek recording" min="0" max="1" step="0.001" value="0">
+        <output id="dense-time"></output>
+      </div>
+    </div>
+    <aside id="trace" aria-label="Harness steps">
+      <div class="trace-heading"><h2>Harness steps</h2><span id="trace-count"></span></div>
+      <div class="trace-controls">
+        <button id="trace-prev" type="button" disabled>Previous step</button>
+        <button id="trace-next" type="button" disabled>Next step</button>
+        <button id="trace-error" type="button" title="Next captured error in this part" disabled>Next error</button>
+      </div>
+      <label class="trace-options"><input id="pause-errors" type="checkbox" checked>Pause on errors</label>
+      <ol id="trace-list" aria-label="Recorded steps"></ol>
+      <div class="trace-inspector">
+        <h3 id="trace-title">Select a step</h3>
+        <p id="trace-state" role="status">Playback follows the steps in this part.</p>
+        <pre id="trace-detail"></pre>
+      </div>
+    </aside>
+  </div>
   <p id="coverage" role="status"></p>
 </main>
 <footer class="page-footer"><span id="recording-summary"></span><span>Original pauses preserved</span></footer>
@@ -100,11 +157,190 @@
   const speed = document.getElementById('speed');
   const coverage = document.getElementById('coverage');
   const container = document.getElementById('player');
+  const traceList = document.getElementById('trace-list');
+  const traceTitle = document.getElementById('trace-title');
+  const traceState = document.getElementById('trace-state');
+  const traceDetail = document.getElementById('trace-detail');
+  const previousStep = document.getElementById('trace-prev');
+  const nextStep = document.getElementById('trace-next');
+  const nextError = document.getElementById('trace-error');
+  const pauseErrors = document.getElementById('pause-errors');
+  const denseControls = document.getElementById('dense-controls');
+  const denseToggle = document.getElementById('dense-toggle');
+  const denseSeek = document.getElementById('dense-seek');
+  const denseTime = document.getElementById('dense-time');
   let player;
   let playing = false;
   let cachedVisit;
   let cachedCast;
   let generation = 0;
+  let steps = [];
+  const stepButtons = new Map();
+  let visibleStart = -1, visibleEnd = -1;
+  let selected = -1;
+  let selecting = false;
+  let selectionRequest = 0;
+  let lastFollowTime = -1;
+  const clock = time => Math.floor(time / 60) + ':' + String(Math.floor(time % 60)).padStart(2, '0');
+  function readTrace(cast) {
+    if (!cast.includes('kimchi.trace')) return { cast, steps: [], markers: [] };
+    const lines = cast.trimEnd().split('\n');
+    const header = JSON.parse(lines[0]);
+    const trace = [];
+    const markers = [];
+    let time = 0;
+    for (let i = 1; i < lines.length; i++) {
+      if (!lines[i].trim()) continue;
+      const event = JSON.parse(lines[i]);
+      time = header.version === 3 ? time + event[0] * 1000 : event[0] * 1000;
+      if (event[1] !== 'm') continue;
+      let step;
+      try { step = JSON.parse(event[2]); } catch {}
+      if (step?.type === 'kimchi.trace' && step.version === 1 && Number.isSafeInteger(step.step)
+        && typeof step.title === 'string' && typeof step.detail === 'string' && typeof step.frame === 'boolean'
+        && ['prompt', 'response', 'tool_call', 'tool_result', 'error'].includes(step.kind)) {
+        const entry = { ...step, time: time / 1000, title: step.title.slice(0, 120), detail: step.detail.slice(0, 8192) };
+        trace.push(entry);
+        if (step.frame) markers.push(entry);
+        // Preserve output/marker order: overriding markers would reorder equal-time events.
+        lines[i] = JSON.stringify([event[0], step.frame ? 'm' : 'o', step.frame ? entry.title : '']);
+      } else {
+        markers.push(undefined);
+        lines[i] = JSON.stringify([event[0], 'm', String(event[2]).slice(0, 120)]);
+      }
+    }
+    return { cast: lines.join('\n') + '\n', steps: trace, markers };
+  }
+  function errorAfter(index) {
+    return steps.findIndex((step, i) => i > index && step.frame && step.error === true);
+  }
+  function selectRow(index) {
+    stepButtons.get(selected)?.removeAttribute('aria-current');
+    selected = index;
+    const step = steps[index];
+    previousStep.disabled = index <= 0;
+    nextStep.disabled = index >= steps.length - 1;
+    nextError.disabled = errorAfter(index) < 0;
+    traceTitle.textContent = step ? step.title : 'Select a step';
+    traceDetail.textContent = step ? step.detail : '';
+    traceState.textContent = !step ? 'Playback follows the steps in this part.' : !step.frame
+      ? 'No completed frame captured for this step.'
+      : 'Frame at ' + clock(step.time) + (Number.isFinite(step.delayMs) ? ' · ' + Math.round(step.delayMs) + ' ms after the event' : '')
+        + (step.toolCallId ? '\nTool call: ' + step.toolCallId : '');
+    if (step) {
+      const top = index * 38;
+      if (top < traceList.scrollTop) traceList.scrollTop = top;
+      else if (top + 38 > traceList.scrollTop + traceList.clientHeight) traceList.scrollTop = top + 38 - traceList.clientHeight;
+      renderRows();
+      stepButtons.get(index)?.setAttribute('aria-current', 'true');
+    }
+  }
+  function renderRows() {
+    if (!steps.length) return;
+    const start = Math.max(0, Math.floor(traceList.scrollTop / 38) - 8);
+    const end = Math.min(steps.length, start + Math.ceil(traceList.clientHeight / 38) + 16);
+    if (start === visibleStart && end === visibleEnd) return;
+    visibleStart = start; visibleEnd = end;
+    const focused = [...stepButtons].find(([, button]) => button === document.activeElement)?.[0];
+    stepButtons.clear();
+    const rows = document.createDocumentFragment();
+    function spacer(height) {
+      const row = document.createElement('li');
+      row.style.height = height + 'px';
+      row.setAttribute('aria-hidden', 'true');
+      rows.append(row);
+    }
+    spacer(start * 38);
+    for (let i = start; i < end; i++) {
+      const step = steps[i];
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'trace-step';
+      button.dataset.step = String(step.step);
+      button.dataset.error = String(step.error === true);
+      const time = document.createElement('time');
+      time.textContent = step.frame ? clock(step.time) : '—';
+      const title = document.createElement('span');
+      title.textContent = step.title;
+      button.append(time, title);
+      button.addEventListener('click', () => jumpToStep(i));
+      if (i === selected) button.setAttribute('aria-current', 'true');
+      stepButtons.set(i, button);
+      const row = document.createElement('li');
+      row.setAttribute('aria-posinset', String(i + 1));
+      row.setAttribute('aria-setsize', String(steps.length));
+      row.append(button);
+      rows.append(row);
+    }
+    spacer((steps.length - end) * 38);
+    traceList.replaceChildren(rows);
+    if (focused !== undefined) stepButtons.get(focused)?.focus({ preventScroll: true });
+  }
+  function renderTrace(index) {
+    stepButtons.clear();
+    visibleStart = visibleEnd = -1;
+    traceList.replaceChildren();
+    traceList.scrollTop = 0;
+    renderRows();
+    if (!steps.length) {
+      const empty = document.createElement('li');
+      empty.className = 'trace-empty';
+      empty.textContent = 'No linked steps in this recording.';
+      traceList.append(empty);
+    }
+    document.getElementById('trace-count').textContent = steps.length + ' in this part';
+    pauseErrors.disabled = !steps.some(step => step.frame && step.error === true);
+    selected = -1;
+    selectRow(index);
+  }
+  traceList.addEventListener('scroll', renderRows);
+  new ResizeObserver(renderRows).observe(traceList);
+  function followPlayback() {
+    if (!player || selecting || container.getAttribute('aria-busy') === 'true') return;
+    const time = player.getCurrentTime();
+    if (!denseControls.hidden) {
+      denseSeek.value = time;
+      denseTime.textContent = clock(time) + ' / ' + clock(Number(denseSeek.max));
+    }
+    if (time === lastFollowTime) return;
+    lastFollowTime = time;
+    let low = 0, high = steps.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (steps[middle].time <= time) low = middle + 1;
+      else high = middle;
+    }
+    if (selected !== low - 1) selectRow(low - 1);
+  }
+  async function jumpToStep(index) {
+    const step = steps[index];
+    if (!step || !player || container.getAttribute('aria-busy') === 'true') return;
+    const current = generation;
+    const request = ++selectionRequest;
+    const target = player;
+    selecting = true;
+    playing = false;
+    try {
+      await target.pause();
+      if (current !== generation || request !== selectionRequest) return;
+      // Counter floating-point roundoff without crossing the recorder's 1 µs frame boundary.
+      if (step.frame) await target.seek(step.time + Number.EPSILON * Math.max(1, step.time));
+      if (current !== generation || request !== selectionRequest) return;
+      lastFollowTime = target.getCurrentTime();
+      container.dataset.inspecting = 'true';
+      selectRow(index);
+    } catch {
+      if (current === generation) traceState.textContent = 'This step could not be opened.';
+    } finally {
+      if (request === selectionRequest) selecting = false;
+    }
+  }
+  previousStep.addEventListener('click', () => jumpToStep(selected - 1));
+  nextStep.addEventListener('click', () => jumpToStep(selected + 1));
+  nextError.addEventListener('click', () => jumpToStep(errorAfter(selected)));
+  denseToggle.addEventListener('click', () => playing ? player?.pause() : player?.play());
+  denseSeek.addEventListener('input', () => player?.seek(Number(denseSeek.value)));
+  setInterval(followPlayback, 100);
   function downloadPart() {
     const recording = recordings[Number(visit.value)];
     const documentCopy = downloadDocument.cloneNode(true);
@@ -127,8 +363,11 @@
   async function mount(keepPosition = false) {
     const current = ++generation;
     const position = keepPosition && player ? player.getCurrentTime() : 0;
+    const selectedStep = keepPosition ? selected : -1;
     const previous = player;
     if (!keepPosition) playing = false;
+    denseToggle.textContent = playing ? 'Pause' : 'Play';
+    if (!keepPosition) delete container.dataset.inspecting;
     visit.disabled = speed.disabled = true;
     container.setAttribute('aria-busy', 'true');
     const host = document.createElement('div');
@@ -153,20 +392,32 @@
         cachedVisit = visit.value;
         const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
         const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-        cachedCast = new Response(stream).text();
+        cachedCast = new Response(stream).text().then(readTrace);
       }
-      const cast = await cachedCast;
+      const recording = await cachedCast;
       if (current !== generation) return;
+      steps = recording.steps;
+      // Native timeline markers create three DOM nodes each; dense parts use one slider.
+      const dense = recording.markers.length > 500;
+      denseControls.hidden = !dense;
+      denseSeek.max = metadata.duration;
+      renderTrace(selectedStep);
       container.appendChild(host);
-      next = AsciinemaPlayer.create({ data: cast }, host, {
-        fit: 'both', controls: true,
+      next = AsciinemaPlayer.create({ data: recording.cast }, host, {
+        fit: 'both', controls: !dense,
         preload: true, speed: Number(speed.value), terminalFontSize: 14,
         terminalFontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
       });
-      next.addEventListener('playing', () => { if (current === generation) playing = true; });
+      next.addEventListener('playing', () => { if (current === generation) { playing = true; denseToggle.textContent = 'Pause'; } });
       for (const event of ['pause', 'ended']) {
-        next.addEventListener(event, () => { if (current === generation) playing = false; });
+        next.addEventListener(event, () => { if (current === generation) { playing = false; denseToggle.textContent = 'Play'; } });
       }
+      next.addEventListener('marker', ({ index }) => {
+        const step = recording.markers[index];
+        if (current === generation && step?.error === true && pauseErrors.checked && !selecting) {
+          jumpToStep(steps.indexOf(step));
+        }
+      });
       next.addEventListener('error', () => {
         if (current === generation) coverage.textContent = 'This recording could not be played. The conversation transcript is still available.';
       });
@@ -177,6 +428,7 @@
       container.replaceChildren(host);
       host.style.visibility = '';
       player = next;
+      lastFollowTime = selectedStep >= 0 ? position : -1;
       if (playing) await player.play();
     } catch {
       next?.dispose();
