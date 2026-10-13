@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { promisify } from "node:util"
 import { gunzip, gzip } from "node:zlib"
 import { lock } from "proper-lockfile"
+import { recordingCheckpoint } from "./checkpoint.js"
 
 const compress = promisify(gzip)
 const decompress = promisify(gunzip)
@@ -31,7 +32,7 @@ export const RECORDING_LIMITS = {
 	queuedBytes: 1024 * 1024,
 }
 
-type RecordingStatus = "recording" | "complete" | "size-limit" | "queue-limit" | "storage-error"
+type RecordingStatus = "recording" | "complete" | "continued" | "size-limit" | "queue-limit" | "storage-error"
 export interface RecordingMetadata {
 	version: 1
 	id: string
@@ -46,11 +47,12 @@ export interface RecordingMetadata {
 	compressedBytes: number
 	queueHighWaterBytes: number
 	duration: number
+	part?: number
 }
 
 export interface Recording {
 	metadata: RecordingMetadata
-	cast: string
+	gzip: string
 }
 
 interface RecorderOptions {
@@ -119,14 +121,14 @@ async function reserveSlot(options: RecorderOptions, slots: number): Promise<str
 	}
 }
 
-/** Captures a playable prefix. No terminal write waits for compression or disk I/O. */
+/** Writes bounded, independently playable parts without making terminal writes wait. */
 export class TerminalRecorder {
-	readonly metadata: RecordingMetadata
+	metadata: RecordingMetadata
 	private readonly limits: typeof RECORDING_LIMITS
 	private readonly now: () => number
 	private readonly started: number
 	private lastTimeMs = 0
-	private admittedBytes = 0
+	private partStartedMs = 0
 	private queuedBytes = 0
 	private pending: string[] = []
 	private pendingBytes = 0
@@ -136,8 +138,8 @@ export class TerminalRecorder {
 	private discardQueued = false
 
 	private constructor(
-		readonly directory: string,
-		options: RecorderOptions,
+		public directory: string,
+		private readonly options: RecorderOptions,
 	) {
 		this.limits = { ...RECORDING_LIMITS, ...options.limits }
 		this.now = options.now ?? (() => performance.now())
@@ -156,6 +158,7 @@ export class TerminalRecorder {
 			compressedBytes: 0,
 			queueHighWaterBytes: 0,
 			duration: 0,
+			part: 1,
 		}
 	}
 
@@ -191,7 +194,7 @@ export class TerminalRecorder {
 	}
 
 	private hasCapacity(bytes: number): boolean {
-		if (this.admittedBytes + bytes > this.limits.rawBytes) {
+		if (bytes > this.limits.rawBytes) {
 			this.metadata.status = "size-limit"
 			void this.flush()
 			return false
@@ -207,9 +210,9 @@ export class TerminalRecorder {
 	private enqueue(line: string): boolean {
 		const bytes = Buffer.byteLength(line)
 		if (!this.hasCapacity(bytes)) return false
+		if (this.pendingBytes && this.pendingBytes + bytes > this.limits.rawBytes) void this.flush()
 		this.pending.push(line)
 		this.pendingBytes += bytes
-		this.admittedBytes += bytes
 		this.queuedBytes += bytes
 		this.metadata.queueHighWaterBytes = Math.max(this.metadata.queueHighWaterBytes, this.queuedBytes)
 		if (this.pendingBytes >= CHUNK_BYTES) void this.flush()
@@ -229,18 +232,12 @@ export class TerminalRecorder {
 			try {
 				if (data && !this.discardQueued && this.metadata.status !== "storage-error") {
 					const compressed = await compress(data, { level: 1 })
-					if (this.metadata.compressedBytes + compressed.length + 4 > this.limits.compressedBytes) {
+					if (!this.fits(bytes, compressed.length) && !(await this.rotate(bytes, compressed.length))) {
 						this.metadata.status = "size-limit"
 						this.discardQueued = true
 					} else {
-						// Length framing lets a reader ignore a partially written final chunk after a crash.
-						const length = Buffer.alloc(4)
-						length.writeUInt32BE(compressed.length)
-						await appendFile(join(this.directory, "output.bin"), Buffer.concat([length, compressed]), { mode: 0o600 })
-						this.metadata.chunks++
-						this.metadata.compressedBytes += compressed.length + 4
-						this.metadata.rawBytes += bytes
-						this.metadata.duration = duration
+						await this.appendChunk(compressed, bytes)
+						this.metadata.duration = duration - this.partStartedMs / 1000
 					}
 				}
 				await this.saveMetadata()
@@ -251,6 +248,59 @@ export class TerminalRecorder {
 			}
 		})
 		await this.writing
+	}
+
+	private fits(rawBytes: number, compressedBytes: number): boolean {
+		return (
+			this.metadata.rawBytes + rawBytes <= this.limits.rawBytes &&
+			this.metadata.compressedBytes + compressedBytes + 4 <= this.limits.compressedBytes
+		)
+	}
+
+	private async appendChunk(compressed: Buffer, rawBytes: number): Promise<void> {
+		// Length framing leaves an interrupted final chunk ignorable.
+		const length = Buffer.alloc(4)
+		length.writeUInt32BE(compressed.length)
+		await appendFile(join(this.directory, "output.bin"), Buffer.concat([length, compressed]), { mode: 0o600 })
+		this.metadata.chunks++
+		this.metadata.compressedBytes += compressed.length + 4
+		this.metadata.rawBytes += rawBytes
+	}
+
+	private async rotate(rawBytes: number, compressedBytes: number): Promise<boolean> {
+		if (!this.metadata.chunks) return false
+		const snapshot = await recordingCheckpoint(
+			recordingChunks(this.directory, this.metadata),
+			this.metadata.cols,
+			this.metadata.rows,
+		)
+		const startedAt = new Date(Date.parse(this.metadata.startedAt) + this.metadata.duration * 1000).toISOString()
+		const prefix = `${JSON.stringify({ version: 3, term: { cols: snapshot.cols, rows: snapshot.rows }, timestamp: Date.parse(startedAt) / 1000 })}\n${JSON.stringify([0, "o", snapshot.data])}\n`
+		const bytes = Buffer.byteLength(prefix)
+		const compressed = await compress(prefix, { level: 1 })
+		if (
+			bytes + rawBytes > this.limits.rawBytes ||
+			compressed.length + compressedBytes + 8 > this.limits.compressedBytes
+		)
+			return false
+		await this.saveMetadata({ ...this.metadata, status: "continued", pid: 0 })
+		this.directory = await reserveSlot(this.options, this.limits.slots)
+		this.partStartedMs += this.metadata.duration * 1000
+		this.metadata = {
+			...this.metadata,
+			id: randomUUID(),
+			startedAt,
+			cols: snapshot.cols,
+			rows: snapshot.rows,
+			part: (this.metadata.part ?? 1) + 1,
+			chunks: 0,
+			rawBytes: 0,
+			compressedBytes: 0,
+			duration: 0,
+			queueHighWaterBytes: this.queuedBytes,
+		}
+		await this.appendChunk(compressed, bytes)
+		return true
 	}
 
 	async close(): Promise<void> {
@@ -267,10 +317,29 @@ export class TerminalRecorder {
 		}
 	}
 
-	private async saveMetadata(): Promise<void> {
+	private async saveMetadata(metadata = this.metadata): Promise<void> {
 		const file = join(this.directory, "metadata.json")
-		await writeFile(`${file}.tmp`, JSON.stringify(this.metadata), { mode: 0o600 })
+		await writeFile(`${file}.tmp`, JSON.stringify(metadata), { mode: 0o600 })
 		await rename(`${file}.tmp`, file)
+	}
+}
+
+async function* recordingChunks(directory: string, metadata: RecordingMetadata): AsyncGenerator<Buffer> {
+	if (metadata.compressedBytes > RECORDING_LIMITS.compressedBytes || metadata.rawBytes > RECORDING_LIMITS.rawBytes) {
+		throw new Error("Recording exceeds its limit")
+	}
+	const encoded = await readFile(join(directory, "output.bin"))
+	let offset = 0
+	let remaining = RECORDING_LIMITS.rawBytes
+	for (let i = 0; i < metadata.chunks; i++) {
+		if (remaining <= 0) throw new Error("Recording exceeds its decoded limit")
+		const length = encoded.readUInt32BE(offset)
+		offset += 4
+		if (offset + length > metadata.compressedBytes) throw new Error("Incomplete recording chunk")
+		const decoded = await decompress(encoded.subarray(offset, offset + length), { maxOutputLength: remaining })
+		offset += length
+		remaining -= decoded.length
+		yield decoded
 	}
 }
 
@@ -283,10 +352,9 @@ export async function readRecordings(root: string, sessionId: string): Promise<R
 		return []
 	}
 	const recordings: Recording[] = []
-	let remainingBytes = RECORDING_LIMITS.rawBytes
 	const candidates = await Promise.all(
 		slots
-			.filter((name) => /^slot-\d+$/.test(name))
+			.filter((name) => /^slot-\d+$/.test(name) && Number(name.slice(5)) < RECORDING_LIMITS.slots)
 			.map(async (name) => ({
 				directory: join(root, name),
 				metadata: await readMetadata(join(root, name)),
@@ -295,28 +363,15 @@ export async function readRecordings(root: string, sessionId: string): Promise<R
 	candidates.sort((a, b) => (b.metadata?.startedAt ?? "").localeCompare(a.metadata?.startedAt ?? ""))
 	for (const { directory, metadata } of candidates) {
 		if (!metadata || metadata.sessionId !== sessionId || !metadata.chunks) continue
-		if (Date.now() - Date.parse(metadata.startedAt) > RETENTION_MS || metadata.rawBytes > remainingBytes) continue
+		if (Date.now() - Date.parse(metadata.startedAt) > RETENTION_MS) continue
 		try {
-			const encoded = await readFile(join(directory, "output.bin"))
-			if (metadata.compressedBytes > RECORDING_LIMITS.compressedBytes) continue
 			const chunks: Buffer[] = []
-			let bytes = 0
-			let offset = 0
-			for (let i = 0; i < metadata.chunks; i++) {
-				const length = encoded.readUInt32BE(offset)
-				offset += 4
-				if (offset + length > metadata.compressedBytes) throw new Error("Incomplete recording chunk")
-				const decoded = await decompress(encoded.subarray(offset, offset + length), {
-					maxOutputLength: remainingBytes - bytes,
-				})
-				offset += length
-				bytes += decoded.length
-				chunks.push(decoded)
-			}
+			for await (const chunk of recordingChunks(directory, metadata)) chunks.push(chunk)
+			// Repack one part at a time; exports never retain every part decoded in memory.
+			const gzip = (await compress(Buffer.concat(chunks), { level: 1 })).toString("base64")
 			// Allocation can reuse a closed slot while an export is reading it.
 			if ((await readMetadata(directory))?.id !== metadata.id) continue
-			remainingBytes -= bytes
-			recordings.push({ metadata, cast: Buffer.concat(chunks).toString("utf8") })
+			recordings.push({ metadata, gzip })
 		} catch {
 			// Missing/corrupt/evicted recordings do not break the conversation export.
 		}

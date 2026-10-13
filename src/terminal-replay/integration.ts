@@ -111,8 +111,7 @@ export function terminalRecordingExtension(pi: ExtensionAPI): void {
 export async function recordingsForExport(sessionId: string): Promise<Recording[] | undefined> {
 	const consent = exportConsent.get(sessionId)
 	if (!consent) return undefined
+	if (!(await consent())) return undefined
 	if (active?.metadata.sessionId === sessionId) await recordingDeadline(active.flush())
-	const recordings = (await recordingDeadline(readRecordings(recordingRoot(), sessionId), 3000)) ?? []
-	if (recordings.length === 0) return []
-	return (await consent()) ? recordings : undefined
+	return (await recordingDeadline(readRecordings(recordingRoot(), sessionId), 30000)) ?? []
 }

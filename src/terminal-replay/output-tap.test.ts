@@ -49,4 +49,31 @@ describe("terminal output tap", () => {
 		expect(events).toEqual(["120x40", "repaint"])
 		stop()
 	})
+
+	it("preserves byte decoding across buffers, text, explicit encodings and malformed UTF-16", () => {
+		const stdout = terminal()
+		const captured: string[] = []
+		const bytes: Buffer[] = []
+		stdout.on("data", (chunk: Buffer) => bytes.push(chunk))
+		const stop = tapTerminalOutput(
+			[stdout],
+			(text) => captured.push(text),
+			() => {},
+		)
+		stdout.write(Buffer.from([0xe7]))
+		stdout.write("text follows an incomplete byte")
+		stdout.write("plain UTF-8 界", "utf-8")
+		stdout.write("🙂")
+		stdout.write("🙂 and lone surrogate \ud800")
+		stdout.write(Buffer.from([0xe7]))
+		stdout.write("")
+		stdout.write(Buffer.from([0x95, 0x8c]))
+		stdout.write("e7958c", "hex")
+		stdout.write("w6k=", "base64")
+		stdout.write("é", "latin1")
+		stdout.write("reset after latin1")
+		stdout.write(Buffer.from([0xe7, 0x95]))
+		stop()
+		expect(captured.join("")).toBe(Buffer.concat(bytes).toString("utf8"))
+	})
 })

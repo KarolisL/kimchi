@@ -1,4 +1,5 @@
 import { StringDecoder } from "node:string_decoder"
+import { toUSVString } from "node:util"
 
 /** Observe all process writes, including cursor/mode methods that bypass Terminal.write(). */
 export function tapTerminalOutput(
@@ -11,10 +12,22 @@ export function tapTerminalOutput(
 		if (!stream.isTTY) continue
 		const original = stream.write
 		const decoder = new StringDecoder("utf8")
+		let byteWrites = false
 		const write: typeof stream.write = (chunk, encoding?, callback?) => {
-			const bytes =
-				typeof chunk === "string" ? Buffer.from(chunk, typeof encoding === "string" ? encoding : "utf8") : chunk
-			onOutput(decoder.write(bytes))
+			if (
+				typeof chunk === "string" &&
+				chunk.length > 0 &&
+				(typeof encoding !== "string" || encoding === "utf8" || encoding === "utf-8")
+			) {
+				// UTF-8 text cannot complete pending bytes. Flush them without a Buffer round trip.
+				onOutput((byteWrites ? decoder.end() : "") + toUSVString(chunk))
+				byteWrites = false
+			} else {
+				const bytes =
+					typeof chunk === "string" ? Buffer.from(chunk, typeof encoding === "string" ? encoding : "utf8") : chunk
+				onOutput(decoder.write(bytes))
+				byteWrites = true
+			}
 			// Preserve overload arguments, callback, receiver and backpressure exactly.
 			return original.apply(stream, [chunk, encoding, callback] as Parameters<typeof original>)
 		}

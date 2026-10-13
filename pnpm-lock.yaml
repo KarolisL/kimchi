@@ -74,6 +74,9 @@ importers:
       '@types/ssh2':
         specifier: ^1.15.5
         version: 1.15.5
+      '@xterm/addon-serialize':
+        specifier: 0.14.0
+        version: 0.14.0
       '@xterm/headless':
         specifier: ^6.0.0
         version: 6.0.0
@@ -1715,6 +1718,9 @@ packages:
 
   '@vitest/utils@4.1.10':
     resolution: {integrity: sha512-fy9am/HWxbaGt/Sawrp90vt6Y6jQwf1RX77cz3uwoJwJVMli/e1IEwRPnMNJ7vKfPTwo0diXifkpPvwH9v7nGA==}
+
+  '@xterm/addon-serialize@0.14.0':
+    resolution: {integrity: sha512-uteyTU1EkrQa2Ux6P/uFl2fzmXI46jy5uoQMKEOM0fKTyiW7cSn0WrFenHm5vO5uEXX/GpwW/FgILvv3r0WbkA==}
 
   '@xterm/headless@6.0.0':
     resolution: {integrity: sha512-5Yj1QINYCyzrZtf8OFIHi47iQtI+0qYFPHmouEfG8dHNxbZ9Tb9YGSuLcsEwj9Z+OL75GJqPyJbyoFer80a2Hw==}
@@ -4906,6 +4912,8 @@ snapshots:
       '@vitest/pretty-format': 4.1.10
       convert-source-map: 2.0.0
       tinyrainbow: 3.1.1
+
+  '@xterm/addon-serialize@0.14.0': {}
 
   '@xterm/headless@6.0.0': {}
 

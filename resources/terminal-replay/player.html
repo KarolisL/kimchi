@@ -5,78 +5,197 @@
 <title>Kimchi terminal replay</title>
 <style>/* PLAYER_CSS */</style>
 <style>
+  :root { color-scheme: dark; --accent: #efaa86; --muted: #a4a5ac; --line: #2c2e34; --gutter: clamp(12px, 2.2vw, 32px); }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #17191d; color: #e8ebef; font: 14px system-ui, sans-serif; }
-  header { padding: 16px 20px; }
-  p { margin: 8px 0; color: #aab1bd; line-height: 1.5; }
-  .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; margin: 16px 0 8px; }
-  select { background: #282c34; color: #eee; border: 1px solid #515762; border-radius: 5px; padding: 6px; margin-left: 6px; }
-  #coverage { color: #f4ca80; }
-  #player { padding: 0 20px 20px; height: calc(100vh - 230px); min-height: 260px; }
-  details { margin: 0 20px 20px; color: #89929f; }
-  pre { white-space: pre-wrap; font-size: 12px; }
+  body { display: flex; flex-direction: column; height: 100vh; margin: 0; background: #111215; color: #eeece9; font: 14px system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  .page-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-shrink: 0; padding: 24px var(--gutter) 20px; }
+  h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -.7px; line-height: 1.25; }
+  .intro { margin: 7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .heading-actions { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  .raw-badge { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #51402c; border-radius: 6px; background: #2b231a; color: #e9c090; padding: 5px 8px; font-size: 11px; font-weight: 500; }
+  .raw-badge::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  details { position: relative; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 6px 0; }
+  summary:hover, details[open] summary { color: #eeece9; }
+  .details-body { position: absolute; z-index: 50; right: 0; top: 100%; width: min(340px, calc(100vw - 32px)); margin-top: 8px; padding: 16px; background: #232428; border: 1px solid #44454c; border-radius: 10px; box-shadow: 0 16px 48px #0008; color: #c1c0c5; font-size: 12px; line-height: 1.6; }
+  .details-body p { margin: 0 0 12px; }
+  .details-body p:last-child { margin-bottom: 0; }
+  .details-body strong { color: #f0d2af; font-weight: 500; }
+  .stage { display: flex; flex: 1; flex-direction: column; min-height: 360px; margin: 0 var(--gutter); background: #17191d; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 12px 40px #0003; }
+  .controls { display: flex; align-items: center; gap: 20px; flex-shrink: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .controls label { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .controls label:last-child { margin-left: auto; }
+  select { min-height: 34px; max-width: 100%; padding: 6px 28px 6px 10px; border: 1px solid #3a3d45; border-radius: 6px; background-color: #22252b; color: #eeece9; font: 12px system-ui, sans-serif; cursor: pointer; }
+  select:hover { border-color: #68636a; }
+  select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  select:disabled { opacity: .55; cursor: progress; }
+  #download { min-height: 34px; padding: 6px 12px; border: 1px solid #5a4235; border-radius: 6px; background: #392c26; color: #f3bb9e; cursor: pointer; font: 500 12px system-ui, sans-serif; white-space: nowrap; }
+  #download:hover { background: #48362b; }
+  #download:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  #player { flex: 1; display: grid; grid-template-rows: minmax(0, 1fr); padding: 16px; min-height: 240px; }
+  #player > div { grid-area: 1 / 1; min-width: 0; min-height: 0; }
+  #coverage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; margin: 0; padding: 11px 18px; border-top: 1px solid var(--line); color: #b3afa9; font-size: 11px; line-height: 1.5; }
+  #coverage::before { content: ''; flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: #d8b184; }
+  #coverage[data-status="complete"]::before { background: #97b99b; }
+  #coverage[data-status$="limit"], #coverage[data-status="storage-error"] { color: #e9c090; }
+  .page-footer { display: flex; flex-shrink: 0; justify-content: space-between; gap: 12px; padding: 13px var(--gutter) 20px; color: #a4a5ac; font-size: 11px; line-height: 1.5; }
+  #recording-summary { font-variant-numeric: tabular-nums; }
+  div.ap-wrapper div.ap-player { border-radius: 6px; }
+  div.ap-player div.ap-control-bar { background: #1d2025; border-top-color: #33363d; }
+  div.ap-control-bar .ap-progressbar .ap-bar .ap-gutter-full { background: var(--accent); }
+  div.ap-control-bar button.ap-button:hover { background: #333036; border-radius: 4px; }
+  .ap-player .ap-overlay-start .ap-play-button { width: 64px; height: 64px; border-radius: 50%; background: var(--accent); box-shadow: 0 8px 32px #0006; }
+  #player .ap-overlay-start .ap-play-button svg { display: none; }
+  .ap-player .ap-overlay-start .ap-play-button::after { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%); border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 17px solid #302018; }
+  @media (max-width: 600px) {
+    .page-heading { align-items: flex-start; gap: 12px; padding: 20px var(--gutter) 18px; }
+    h1 { font-size: 21px; }
+    .intro { max-width: 210px; font-size: 12px; }
+    .heading-actions { flex-direction: column; align-items: flex-end; gap: 6px; }
+    .controls { gap: 12px; padding: 12px; flex-wrap: wrap; }
+    .controls label { flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+    .controls label:first-child { flex: 1 1 100%; }
+    #player { padding: 8px; }
+    #coverage { padding: 10px 12px; }
+    .page-footer { flex-wrap: wrap; gap: 4px 12px; padding-bottom: 14px; }
+  }
 </style>
-<header>
-  <strong>Recorded terminal output · unredacted</strong>
-  <p>Includes visible drafts and cleared text. Review before sharing. The conversation transcript is redacted separately.</p>
-  <div class="controls">
-    <label>Recorded visit <select id="visit" aria-label="Recorded visit"></select></label>
-    <label>Speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
-    <span>Original pauses preserved</span>
+<header class="page-heading">
+  <div>
+    <h1>Session replay</h1>
+    <p class="intro">Recorded terminal output, with its original timing.</p>
   </div>
-  <p id="coverage" role="status"></p>
-  <p>Retained visits only; older recordings may have expired. Fonts, images and terminal-specific effects can differ from the original screen.</p>
+  <div class="heading-actions">
+    <span class="raw-badge">Unredacted</span>
+    <details>
+      <summary>Recording details</summary>
+      <div class="details-body">
+        <p><strong>Raw, unredacted output. Review before sharing.</strong> Includes visible drafts and cleared text. The conversation transcript is redacted separately.</p>
+        <p>Long recordings continue in numbered parts. Only retained parts are included; older parts may have expired or been replaced.</p>
+        <p>Fonts, images and terminal-specific effects can differ from the original screen.</p>
+      </div>
+    </details>
+  </div>
 </header>
-<main id="player"></main>
-<details><summary>Player credits and licenses</summary><p>asciinema-player 3.17.0 by Marcin Kulik. Standalone distribution used without modification.</p><pre id="licenses"></pre></details>
+<main class="stage">
+  <div class="controls">
+    <label>Recording part <select id="visit" aria-label="Recording part"></select></label>
+    <button id="download" type="button" title="Save this part as an offline HTML replay">Download part</button>
+    <label>Speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+  </div>
+  <div id="player"></div>
+  <p id="coverage" role="status"></p>
+</main>
+<footer class="page-footer"><span id="recording-summary"></span><span>Original pauses preserved</span></footer>
+<!-- Third-party licenses are included in the standalone document source. -->
+<script id="licenses" type="application/json">/* LICENSES */</script>
+<script id="recordings" type="application/json">/* RECORDINGS */</script>
 <script>/* PLAYER_JS */</script>
 <script>
 (() => {
-  const recordings = /* RECORDINGS */;
-  document.getElementById('licenses').textContent = /* LICENSES */;
+  const recordings = JSON.parse(document.getElementById('recordings').textContent);
+  const downloadDocument = document.documentElement.cloneNode(true);
+  downloadDocument.querySelector('#recordings').textContent = '[]';
   const visit = document.getElementById('visit');
   const speed = document.getElementById('speed');
   const coverage = document.getElementById('coverage');
   const container = document.getElementById('player');
   let player;
+  let playing = false;
+  let cachedVisit;
+  let cachedCast;
   let generation = 0;
+  function downloadPart() {
+    const recording = recordings[Number(visit.value)];
+    const documentCopy = downloadDocument.cloneNode(true);
+    documentCopy.querySelector('#recordings').textContent = JSON.stringify([recording]).replaceAll('<', '\\u003c');
+    const url = URL.createObjectURL(new Blob(['<!doctype html>', documentCopy.outerHTML], { type: 'text/html;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'kimchi-replay-' + recording.metadata.startedAt.replace(/[^0-9T]/g, '-') + '-part-' + (recording.metadata.part || 1) + '.html';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  document.getElementById('download').addEventListener('click', downloadPart);
   for (const [index, recording] of recordings.entries()) {
     const option = document.createElement('option');
     option.value = String(index);
-    option.textContent = new Date(recording.metadata.startedAt).toLocaleString();
+    option.textContent = 'Part ' + (recording.metadata.part || 1) + ' · ' + new Date(recording.metadata.startedAt).toLocaleString();
     visit.appendChild(option);
   }
   visit.value = String(recordings.length - 1);
   async function mount(keepPosition = false) {
     const current = ++generation;
     const position = keepPosition && player ? player.getCurrentTime() : 0;
-    player?.dispose();
-    player = undefined;
+    const previous = player;
+    if (!keepPosition) playing = false;
+    visit.disabled = speed.disabled = true;
+    container.setAttribute('aria-busy', 'true');
+    const host = document.createElement('div');
+    host.style.visibility = 'hidden';
+    let next;
     const { metadata, gzip } = recordings[Number(visit.value)];
     const reasons = {
       'recording': 'Captured up to export or interruption; the final unsaved fraction may be missing.',
-      'complete': 'Visit completed.',
+      'complete': 'Recording completed.',
+      'continued': 'This part reached its limit. Recording continued in another part.',
       'size-limit': 'Incomplete: recording stopped at the storage limit.',
       'queue-limit': 'Incomplete: recording stopped because output exceeded the buffer limit.',
       'storage-error': 'Incomplete: recording stopped after a storage error.'
     };
-    coverage.textContent = (reasons[metadata.status] || 'Partial recording.') + ' ' + metadata.cols + '×' + metadata.rows + ' initially · ' + metadata.duration.toFixed(1) + ' seconds.';
+    coverage.textContent = reasons[metadata.status] || 'Partial recording.';
+    coverage.dataset.status = metadata.status;
+    document.getElementById('recording-summary').textContent = metadata.duration.toFixed(1) + ' seconds · ' + metadata.cols + '×' + metadata.rows + ' initially';
     try {
-      const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
-      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-      const cast = await new Response(stream).text();
+      await previous?.pause();
+      // Keep only the selected visit decoded; speed changes reuse its data.
+      if (cachedVisit !== visit.value) {
+        cachedVisit = visit.value;
+        const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        cachedCast = new Response(stream).text();
+      }
+      const cast = await cachedCast;
       if (current !== generation) return;
-      player = AsciinemaPlayer.create({ data: cast }, container, {
+      container.appendChild(host);
+      next = AsciinemaPlayer.create({ data: cast }, host, {
         fit: 'both', controls: true,
         preload: true, speed: Number(speed.value), terminalFontSize: 14,
         terminalFontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
       });
-      player.addEventListener('error', () => { coverage.textContent = 'This recording could not be played. The conversation transcript is still available.'; });
-      await player.seek(position);
+      next.addEventListener('playing', () => { if (current === generation) playing = true; });
+      for (const event of ['pause', 'ended']) {
+        next.addEventListener(event, () => { if (current === generation) playing = false; });
+      }
+      next.addEventListener('error', () => {
+        if (current === generation) coverage.textContent = 'This recording could not be played. The conversation transcript is still available.';
+      });
+      await next.seek(position);
+      if (current !== generation) { next.dispose(); host.remove(); return; }
+      // Keep the previous screen visible until the replacement is positioned.
+      previous?.dispose();
+      container.replaceChildren(host);
+      host.style.visibility = '';
+      player = next;
+      if (playing) await player.play();
     } catch {
+      next?.dispose();
+      host.remove();
+      if (current !== generation) return;
+      playing = false;
       coverage.textContent = 'Replay could not load. Open this file in a recent browser. The conversation transcript is still available.';
+    } finally {
+      if (current === generation) {
+        visit.disabled = speed.disabled = false;
+        container.setAttribute('aria-busy', 'false');
+      }
     }
   }
+  window.addEventListener('message', event => {
+    if (event.source !== parent || event.data !== 'kimchi-replay-pause') return;
+    playing = false;
+    player?.pause();
+  });
   visit.addEventListener('change', () => mount());
   speed.addEventListener('change', () => mount(true));
   mount();

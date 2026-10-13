@@ -16,6 +16,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync
 import { platform } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { stageTerminalReplay } from "./stage-terminal-replay.js"
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
 const piAgentDist = join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist")
@@ -29,6 +30,7 @@ const exportHtmlSkipSuffixes = [".d.ts", ".d.ts.map", ".js.map"]
 const exportHtmlSrc = join(piAgentDist, "core", "export-html")
 
 const isDev = process.argv.includes("--dev")
+await stageTerminalReplay(isDev ? undefined : join(projectRoot, "dist", "share", "kimchi", "terminal-replay"))
 const themeDest = isDev
 	? join(projectRoot, "src", "modes", "interactive", "theme")
 	: join(projectRoot, "dist", "share", "kimchi", "theme")
@@ -96,13 +98,6 @@ if (!isDev) {
 	const oauthDest = join(projectRoot, "dist", "share", "kimchi", "oauth")
 	mkdirSync(oauthDest, { recursive: true })
 	cpSync(oauthSrc, oauthDest, { recursive: true })
-
-	// Standalone, licensed terminal player used by self-contained HTML exports.
-	cpSync(
-		join(projectRoot, "resources", "terminal-replay"),
-		join(projectRoot, "dist", "share", "kimchi", "terminal-replay"),
-		{ recursive: true },
-	)
 
 	// Copy proxy-helper binary built by scripts/build-proxy-helper.js.
 	const buildTargetOS = process.env.KIMCHI_BUILD_TARGET_OS || platform()

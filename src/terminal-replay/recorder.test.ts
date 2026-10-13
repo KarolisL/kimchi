@@ -1,8 +1,13 @@
 import { appendFile, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { gunzipSync } from "node:zlib"
 import { afterEach, describe, expect, it } from "vitest"
-import { readRecordings, recordingDeadline, TerminalRecorder } from "./recorder.js"
+import { type Recording, readRecordings, recordingDeadline, TerminalRecorder } from "./recorder.js"
+
+function cast(recording: Recording): string {
+	return gunzipSync(Buffer.from(recording.gzip, "base64")).toString("utf8")
+}
 
 const roots: string[] = []
 async function root() {
@@ -15,10 +20,73 @@ afterEach(async () => {
 })
 
 describe("terminal recording", () => {
+	it("continues in bounded parts and retains the screen after earlier parts are evicted", async () => {
+		const directory = await root()
+		let now = 0
+		const recorder = await TerminalRecorder.create({
+			root: directory,
+			sessionId: "five-day-session",
+			cols: 30,
+			rows: 8,
+			limits: { slots: 2, rawBytes: 2048 },
+			now: () => now,
+		})
+		recorder.write("\x1b[2J\x1b[H\x1b[2;1HDUPLICATE BUG\x1b[3;1HDUPLICATE BUG\x1b[4;7H界")
+		await recorder.flush()
+		for (let index = 0; index < 20; index++) {
+			now += 6 * 60 * 60 * 1000
+			recorder.write(`\x1b[6;1H\x1b[2K${"\x1b[0m".repeat(30)}update ${index}`)
+			await recorder.flush()
+		}
+		await recorder.close()
+		const recordings = await readRecordings(directory, "five-day-session")
+		expect(recordings).toHaveLength(2)
+		expect(cast(recordings[recordings.length - 1])).toContain("update 19")
+		expect(recordings.every(({ metadata }) => metadata.rawBytes <= 2048)).toBe(true)
+		expect(recordings.at(-1)?.metadata.status).toBe("complete")
+		// The later part must retain the defect even when the part that drew it is gone.
+		expect(cast(recordings[recordings.length - 1])).toContain("DUPLICATE BUG")
+		expect(cast(recordings[recordings.length - 1])).toContain("界")
+	})
+
 	it("returns control if a disk operation stalls", async () => {
 		const start = performance.now()
 		expect(await recordingDeadline(new Promise(() => {}), 10)).toBeUndefined()
 		expect(performance.now() - start).toBeLessThan(500)
+	})
+
+	it("continues at the compressed cap with resized geometry and relative timing", async () => {
+		const directory = await root()
+		let now = 0
+		const recorder = await TerminalRecorder.create({
+			root: directory,
+			sessionId: "compressed-parts",
+			cols: 30,
+			rows: 8,
+			limits: { compressedBytes: 800 },
+			now: () => now,
+		})
+		recorder.resize(25, 7)
+		for (let index = 0; index < 25; index++) {
+			now += 1000
+			recorder.write(`\x1b[2J\x1b[Hframe ${index}`)
+			await recorder.flush()
+		}
+		await recorder.close()
+		const recordings = await readRecordings(directory, "compressed-parts")
+		expect(recordings.length).toBeGreaterThan(1)
+		for (const [index, recording] of recordings.entries()) {
+			expect(recording.metadata.compressedBytes).toBeLessThanOrEqual(800)
+			expect(recording.metadata.part).toBe(index + 1)
+			const [header, ...events] = cast(recording)
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line))
+			expect(events.reduce((sum, event) => sum + event[0], 0)).toBeCloseTo(recording.metadata.duration)
+			if (index) expect(header.term).toEqual({ cols: 25, rows: 7 })
+		}
+		expect(recordings.reduce((sum, recording) => sum + recording.metadata.duration, 0)).toBe(25)
+		expect(cast(recordings[recordings.length - 1])).toContain("frame 24")
 	})
 
 	it("reads a committed prefix after abrupt termination and ignores an unfinished final write", async () => {
@@ -28,7 +96,7 @@ describe("terminal recording", () => {
 		await recorder.flush()
 		await appendFile(join(recorder.directory, "output.bin"), Buffer.from([0, 0, 255, 255, 31, 139]))
 		const [recording] = await readRecordings(directory, "crashed")
-		expect(recording.cast).toContain("saved before interruption")
+		expect(cast(recording)).toContain("saved before interruption")
 		expect(recording.metadata.status).toBe("recording")
 		await recorder.close()
 	})
@@ -49,8 +117,8 @@ describe("terminal recording", () => {
 		recorder.write("later frame")
 		await recorder.close()
 		const [recording] = await readRecordings(directory, "compressed")
-		expect(recording.cast).toContain("small prefix")
-		expect(recording.cast).not.toContain("later frame")
+		expect(cast(recording)).toContain("small prefix")
+		expect(cast(recording)).not.toContain("later frame")
 		expect(recording.metadata.status).toBe("size-limit")
 		expect((await stat(join(recorder.directory, "output.bin"))).size).toBeLessThanOrEqual(180)
 	})
@@ -86,7 +154,7 @@ describe("terminal recording", () => {
 		recorder.write("\x1b[3;7H❄️ 界\x1b[K")
 		await recorder.close()
 		const [recording] = await readRecordings(directory, "session-a")
-		const [header, ...events] = recording.cast
+		const [header, ...events] = cast(recording)
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line))
@@ -115,8 +183,8 @@ describe("terminal recording", () => {
 		recorder.write("must not appear")
 		await recorder.close()
 		const [recording] = await readRecordings(directory, "capped")
-		expect(recording.cast).toContain("first frame")
-		expect(recording.cast).not.toContain("must not appear")
+		expect(cast(recording)).toContain("first frame")
+		expect(cast(recording)).not.toContain("must not appear")
 		expect(recording.metadata.status).toBe("size-limit")
 		expect(recording.metadata.rawBytes).toBeLessThanOrEqual(512)
 	})
@@ -149,7 +217,7 @@ describe("terminal recording", () => {
 		second.write("new")
 		await second.close()
 		expect(await readRecordings(directory, "first")).toEqual([])
-		expect((await readRecordings(directory, "second"))[0].cast).toContain("new")
+		expect(cast((await readRecordings(directory, "second"))[0])).toContain("new")
 		expect((await readdir(directory)).filter((name) => name.startsWith("slot-"))).toHaveLength(1)
 	})
 
