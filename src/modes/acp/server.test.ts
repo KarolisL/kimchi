@@ -132,6 +132,7 @@ import { isCredentialStale, markCredentialStale, resetCredentialStalenessForTest
 import { createMiniEventBus } from "../../extensions/__mocks__/mini-event-bus.js"
 import { PARENT_SESSION_ID_ENV_KEY } from "../../extensions/agents/manager/constants.js"
 import { clearAutoRoutingState, setAutoRoutingState } from "../../extensions/auto-model/state.js"
+import { preserveRawErrorMessage } from "../../extensions/error-preservation.js"
 import { setExperimentalFeaturesEnabled } from "../../extensions/experimental.js"
 import { setProcessOrchestratorRef } from "../../extensions/kimchi-process.js"
 import { getMultiModelEnabled, setMultiModelEnabled } from "../../extensions/multi-model.js"
@@ -5764,6 +5765,71 @@ describe("terminal turn errors surface instead of silent end_turn", () => {
 			.catch((e) => e)
 		expect((err as Error).message).toMatch(/something totally unusual/)
 		expect((err as { data?: unknown }).data).toBeUndefined()
+	})
+
+	// A retried turn that terminally fails must transmit the raw provider
+	// text — never the "Retrying…" display placeholder the
+	// interactive-error-surface extension writes into errorMessage. The
+	// placeholder defeats classifyLLMGatewayError, so data.kind/retryAtMs
+	// would be lost as well.
+	it("uses the preserved raw error text, not the retry placeholder, as the terminal turn error", async () => {
+		const fake = new FakeAgentSession("session-raw-error-after-retry")
+		const agent = makeAgent(fake)
+		await agent.newSession({ cwd: "/tmp", mcpServers: [] })
+		const rawError = "Request failed with status code 503: Service Unavailable"
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			const event = assistantErrorEvent(rawError)
+			if (event.type !== "message_end") throw new Error("unreachable")
+			// Mimic interactive-error-surface's message_end mutation: preserve
+			// the raw text first, then replace the display text. The final
+			// attempt ends with the placeholder still in place.
+			const message = event.message as AssistantMessage
+			preserveRawErrorMessage(message)
+			message.errorMessage = "Retrying…"
+			fake.emit(event)
+			fake.emit(agentEnd())
+		}
+
+		const err = await agent
+			.prompt({ sessionId: "session-raw-error-after-retry", prompt: [{ type: "text", text: "hello" }] })
+			.catch((e) => e)
+		expect((err as Error).message).toMatch(/503/)
+		expect((err as Error).message).not.toMatch(/Retrying/)
+		expect((err as { data?: unknown }).data).toEqual({ kind: "provider_5xx", httpStatusCode: 503 })
+	})
+
+	// Each retry attempt carries its own message object, and preservation is
+	// write-once per object — so the terminal error must come from the FINAL
+	// attempt's preserved raw text, never a stale first-attempt error.
+	it("uses the last retry attempt's preserved raw text when each attempt fails differently", async () => {
+		const fake = new FakeAgentSession("session-raw-error-last-attempt")
+		const agent = makeAgent(fake)
+		await agent.newSession({ cwd: "/tmp", mcpServers: [] })
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			// First attempt: 429, mutated to placeholder by the extension.
+			const first = assistantErrorEvent("Request failed with status code 429: rate limited")
+			if (first.type !== "message_end") throw new Error("unreachable")
+			preserveRawErrorMessage(first.message as AssistantMessage)
+			;(first.message as AssistantMessage).errorMessage = "Retrying…"
+			fake.emit(first)
+			fake.emit({ type: "agent_start" })
+			// Final attempt: 503 with different raw text, also placeholder-mutated.
+			const second = assistantErrorEvent("Request failed with status code 503: Service Unavailable")
+			if (second.type !== "message_end") throw new Error("unreachable")
+			preserveRawErrorMessage(second.message as AssistantMessage)
+			;(second.message as AssistantMessage).errorMessage = "Retrying…"
+			fake.emit(second)
+			fake.emit(agentEnd())
+		}
+
+		const err = await agent
+			.prompt({ sessionId: "session-raw-error-last-attempt", prompt: [{ type: "text", text: "hello" }] })
+			.catch((e) => e)
+		expect((err as Error).message).toMatch(/503/)
+		expect((err as Error).message).not.toMatch(/429/)
+		expect((err as { data?: unknown }).data).toEqual({ kind: "provider_5xx", httpStatusCode: 503 })
 	})
 
 	it("does not fail the turn when the final assistant message was aborted", async () => {
