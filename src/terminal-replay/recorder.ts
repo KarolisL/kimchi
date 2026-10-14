@@ -4,13 +4,13 @@ import { join } from "node:path"
 import { promisify } from "node:util"
 import { gunzip, gzip } from "node:zlib"
 import { lock } from "proper-lockfile"
-import { recordingCheckpoint } from "./checkpoint.js"
+import { recordingCheckpointInWorker } from "./checkpoint.js"
 import type { ReplayTraceDetail } from "./details.js"
 import { boundedTraceStep, type TraceStep } from "./trace.js"
 
 const compress = promisify(gzip)
 const decompress = promisify(gunzip)
-const CHUNK_BYTES = 64 * 1024
+const CHUNK_BYTES = 256 * 1024
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const SYNC_BEGIN = "\x1b[?2026h"
 
@@ -64,6 +64,7 @@ export interface Recording {
 	metadata: RecordingMetadata
 	gzip: string
 	traceDetails?: Record<string, ReplayTraceDetail>
+	traceDetailsGzip?: string
 	traceDetailsOmitted?: number
 }
 
@@ -314,13 +315,14 @@ export class TerminalRecorder {
 		this.queuedBytes += bytes
 		this.metadata.queueHighWaterBytes = Math.max(this.metadata.queueHighWaterBytes, this.queuedBytes + this.traceBytes)
 		if (this.pendingBytes >= CHUNK_BYTES) void this.flush()
-		else if (!this.timer) this.timer = setTimeout(() => void this.flush(), 250).unref()
+		else if (!this.timer) this.timer = setTimeout(() => void this.flush(), 1000).unref()
 		return true
 	}
 
 	async flush(): Promise<void> {
 		clearTimeout(this.timer)
 		this.timer = undefined
+		if (!this.pendingBytes && this.metadata.status === "recording") return this.writing
 		const data = this.pending.join("")
 		const bytes = this.pendingBytes
 		const durationUs = this.lastTimeUs
@@ -367,11 +369,7 @@ export class TerminalRecorder {
 
 	private async rotate(rawBytes: number, compressedBytes: number): Promise<boolean> {
 		if (!this.metadata.chunks) return false
-		const snapshot = await recordingCheckpoint(
-			recordingChunks(this.directory, this.metadata),
-			this.metadata.cols,
-			this.metadata.rows,
-		)
+		const snapshot = await recordingCheckpointInWorker(this.directory, { ...this.metadata })
 		const partStartedUs = this.partStartedUs + Math.round(this.metadata.duration * 1_000_000)
 		const startedAtMs = this.wallStartedMs + partStartedUs / 1000
 		const startedAt = new Date(startedAtMs).toISOString()
@@ -425,7 +423,7 @@ export class TerminalRecorder {
 	}
 }
 
-async function* recordingChunks(directory: string, metadata: RecordingMetadata): AsyncGenerator<Buffer> {
+export async function* recordingChunks(directory: string, metadata: RecordingMetadata): AsyncGenerator<Buffer> {
 	if (metadata.compressedBytes > RECORDING_LIMITS.compressedBytes || metadata.rawBytes > RECORDING_LIMITS.rawBytes) {
 		throw new Error("Recording exceeds its limit")
 	}
@@ -469,7 +467,7 @@ export async function readRecordings(root: string, sessionId: string): Promise<R
 			const chunks: Buffer[] = []
 			for await (const chunk of recordingChunks(directory, metadata)) chunks.push(chunk)
 			// Repack one part at a time; exports never retain every part decoded in memory.
-			const gzip = (await compress(Buffer.concat(chunks), { level: 1 })).toString("base64")
+			const gzip = (await compress(Buffer.concat(chunks), { level: 6 })).toString("base64")
 			// Allocation can reuse a closed slot while an export is reading it.
 			if ((await readMetadata(directory))?.id !== metadata.id) continue
 			recordings.push({ metadata, gzip })

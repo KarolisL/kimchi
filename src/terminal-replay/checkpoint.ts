@@ -1,4 +1,39 @@
+import { existsSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { Worker } from "node:worker_threads"
 import type { IBufferCell } from "@xterm/headless"
+import { resolveAuxiliaryFilesDir } from "../auxiliary-files/resolver.js"
+import type { RecordingMetadata } from "./recorder.js"
+
+/** A short-lived worker keeps part reconstruction off the terminal's event loop. */
+export async function recordingCheckpointInWorker(directory: string, metadata: RecordingMetadata) {
+	const staged = join(
+		resolveAuxiliaryFilesDir(process.env, homedir(), process.execPath),
+		"terminal-replay/checkpoint-worker.mjs",
+	)
+	const worker = new Worker(
+		existsSync(staged)
+			? staged
+			: fileURLToPath(new URL("../../resources/terminal-replay/generated/checkpoint-worker.mjs", import.meta.url)),
+		{ workerData: { directory, metadata } },
+	)
+	let timer: NodeJS.Timeout | undefined
+	try {
+		return await new Promise<Awaited<ReturnType<typeof recordingCheckpoint>>>((resolve, reject) => {
+			worker.once("message", resolve)
+			worker.once("error", reject)
+			worker.once("exit", (code) => reject(new Error(`Recording checkpoint worker exited with code ${code}`)))
+			timer = setTimeout(() => reject(new Error("Recording checkpoint worker timed out")), 30_000).unref()
+			// Recording is best effort; a checkpoint must not keep the harness alive at shutdown.
+			worker.unref()
+		})
+	} finally {
+		clearTimeout(timer)
+		await worker.terminate()
+	}
+}
 
 function rendition(cell: IBufferCell): string {
 	const codes = [0]

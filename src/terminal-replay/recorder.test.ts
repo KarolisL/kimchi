@@ -1,8 +1,8 @@
-import { appendFile, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { appendFile, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { type Recording, readRecordings, recordingDeadline, TerminalRecorder } from "./recorder.js"
 
 function cast(recording: Recording): string {
@@ -44,6 +44,184 @@ afterEach(async () => {
 })
 
 describe("terminal recording", () => {
+	it("does no work over five idle days and preserves the next event's full elapsed time", async () => {
+		const directory = await root()
+		let now = 0
+		const recorder = await TerminalRecorder.create({
+			root: directory,
+			sessionId: "idle-days",
+			cols: 80,
+			rows: 24,
+			now: () => now,
+		})
+		const output = join(recorder.directory, "output.bin")
+		const metadata = join(recorder.directory, "metadata.json")
+		const before = await Promise.all([stat(output, { bigint: true }), stat(metadata, { bigint: true })])
+		const flush = vi.spyOn(recorder, "flush")
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+		try {
+			const fiveDays = 5 * 24 * 60 * 60 * 1000
+			now = fiveDays
+			await vi.advanceTimersByTimeAsync(fiveDays)
+			expect(flush).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+			const after = await Promise.all([stat(output, { bigint: true }), stat(metadata, { bigint: true })])
+			expect(after.map(({ size, mtimeNs }) => ({ size, mtimeNs }))).toEqual(
+				before.map(({ size, mtimeNs }) => ({ size, mtimeNs })),
+			)
+			recorder.write("after five days")
+			await recorder.flush()
+			expect(events((await readRecordings(directory, "idle-days"))[0])).toEqual([[432000, "o", "after five days"]])
+			now += 1000
+			await recorder.close()
+			const [recording] = await readRecordings(directory, "idle-days")
+			expect(events(recording)).toEqual([
+				[432000, "o", "after five days"],
+				[1, "o", ""],
+			])
+			expect(recording.metadata).toMatchObject({ status: "complete", duration: 432001 })
+			expect(vi.getTimerCount()).toBe(0)
+		} finally {
+			vi.useRealTimers()
+			await recorder.close()
+		}
+	})
+
+	it("does not rewrite active metadata for repeated empty flushes", async () => {
+		const directory = await root()
+		const recorder = await TerminalRecorder.create({ root: directory, sessionId: "empty-flush", cols: 80, rows: 24 })
+		try {
+			const metadata = join(recorder.directory, "metadata.json")
+			await utimes(metadata, new Date(0), new Date(0))
+			const before = await stat(metadata, { bigint: true })
+			await Promise.all([recorder.flush(), recorder.flush(), recorder.flush()])
+			const after = await stat(metadata, { bigint: true })
+			expect(after.mtimeNs).toBe(before.mtimeNs)
+			expect(after.ino).toBe(before.ino)
+			expect(recorder.metadata.chunks).toBe(1)
+		} finally {
+			await recorder.close()
+		}
+	})
+
+	it("awaits an in-flight append when an empty flush is requested", async () => {
+		const directory = await root()
+		const recorder = await TerminalRecorder.create({ root: directory, sessionId: "waiting-flush", cols: 80, rows: 24 })
+		try {
+			recorder.write("pending append")
+			let persisted = false
+			const first = recorder.flush().then(() => {
+				persisted = true
+			})
+			await recorder.flush()
+			expect(persisted).toBe(true)
+			await first
+			expect(events((await readRecordings(directory, "waiting-flush"))[0]).map((event) => event[2])).toEqual([
+				"pending append",
+			])
+		} finally {
+			await recorder.close()
+		}
+	})
+
+	it("publishes a limit state even when the rejected write leaves no pending bytes", async () => {
+		const directory = await root()
+		const recorder = await TerminalRecorder.create({
+			root: directory,
+			sessionId: "empty-limit",
+			cols: 80,
+			rows: 24,
+			limits: { rawBytes: 512 },
+		})
+		recorder.write("x".repeat(1024))
+		await recorder.flush()
+		expect(JSON.parse(await readFile(join(recorder.directory, "metadata.json"), "utf8"))).toMatchObject({
+			status: "size-limit",
+			chunks: 1,
+		})
+		await recorder.close()
+	})
+
+	it("batches low-volume output for one second and flushes export and close immediately", async () => {
+		const directory = await root()
+		const recorder = await TerminalRecorder.create({ root: directory, sessionId: "flush-time", cols: 80, rows: 24 })
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+		const flush = vi.spyOn(recorder, "flush")
+		try {
+			recorder.write("first")
+			await vi.advanceTimersByTimeAsync(999)
+			expect(flush).not.toHaveBeenCalled()
+			await vi.advanceTimersByTimeAsync(1)
+			expect(flush).toHaveBeenCalledTimes(1)
+			await flush.mock.results[0].value
+			expect(events((await readRecordings(directory, "flush-time"))[0]).map((event) => event[2])).toEqual(["first"])
+			recorder.write("export")
+			await recorder.flush()
+			expect(events((await readRecordings(directory, "flush-time"))[0]).map((event) => event[2])).toEqual([
+				"first",
+				"export",
+			])
+			recorder.write("close")
+			await recorder.close()
+			expect(events((await readRecordings(directory, "flush-time"))[0]).map((event) => event[2])).toEqual([
+				"first",
+				"export",
+				"close",
+				"",
+			])
+			expect(vi.getTimerCount()).toBe(0)
+		} finally {
+			vi.useRealTimers()
+			await recorder.close()
+		}
+	})
+
+	it("flushes high-volume output at 256 KiB without waiting for the timer", async () => {
+		const directory = await root()
+		const recorder = await TerminalRecorder.create({ root: directory, sessionId: "flush-size", cols: 80, rows: 24 })
+		const flush = vi.spyOn(recorder, "flush")
+		recorder.write("x".repeat(128 * 1024))
+		expect(flush).not.toHaveBeenCalled()
+		recorder.write("y".repeat(128 * 1024))
+		expect(flush).toHaveBeenCalledTimes(1)
+		await flush.mock.results[0].value
+		expect(events((await readRecordings(directory, "flush-size"))[0]).map((event) => event[2])).toEqual([
+			"x".repeat(128 * 1024),
+			"y".repeat(128 * 1024),
+		])
+		await recorder.close()
+	})
+
+	it("preserves Unicode, escapes, resize order and exact accounting across automatic batches", async () => {
+		const directory = await root()
+		let now = 0
+		const recorder = await TerminalRecorder.create({
+			root: directory,
+			sessionId: "batch-fidelity",
+			cols: 80,
+			rows: 24,
+			now: () => now,
+		})
+		const expected: [number, string, string][] = []
+		const text = '界👩🏽‍💻❄️é\ud800\x1b[0m"\\\r\n'.repeat(48)
+		for (let i = 0; i < 128; i++) {
+			now += 1
+			recorder.write(text)
+			expected.push([0.001, "o", text])
+			if (i % 16 === 0) {
+				recorder.resize(80 + i, 24)
+				expected.push([0, "r", `${80 + i}x24`])
+			}
+		}
+		await recorder.close()
+		expected.push([0, "o", ""])
+		const [recording] = await readRecordings(directory, "batch-fidelity")
+		expect(events(recording)).toEqual(expected)
+		expect(recording.metadata.rawBytes).toBe(Buffer.byteLength(cast(recording)))
+		expect(recording.metadata.chunks).toBeGreaterThan(2)
+		expect(recording.metadata.queueHighWaterBytes).toBeLessThanOrEqual(1024 * 1024)
+	})
+
 	it("links a failed step after its complete split frame and final cursor writes, once", async () => {
 		const directory = await root()
 		let now = 0

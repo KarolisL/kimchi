@@ -35,6 +35,20 @@ const xtermSource = join(projectRoot, "node_modules", "@xterm", "xterm")
 // Replace only generated replay assets so previous engines cannot remain in the distribution.
 rmSync(replayDest, { recursive: true, force: true })
 mkdirSync(replayDest, { recursive: true })
+// A self-contained worker also runs in compiled binaries without node_modules.
+execFileSync(
+	"bun",
+	[
+		"build",
+		join(projectRoot, "src/terminal-replay/checkpoint-worker.ts"),
+		"--target=node",
+		"--format=esm",
+		"--minify",
+		"--outfile",
+		join(replayDest, "checkpoint-worker.mjs"),
+	],
+	{ stdio: "inherit" },
+)
 cpSync(join(replaySource, "player.html"), join(replayDest, "player.html"))
 cpSync(join(xtermSource, "css/xterm.css"), join(replayDest, "player.css"))
 writeFileSync(

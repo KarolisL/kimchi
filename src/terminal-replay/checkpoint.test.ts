@@ -1,7 +1,57 @@
+import { execFileSync } from "node:child_process"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { gzipSync } from "node:zlib"
 import { Unicode11Addon } from "@xterm/addon-unicode11"
 import { Terminal } from "@xterm/headless"
-import { describe, expect, it } from "vitest"
-import { recordingCheckpoint } from "./checkpoint.js"
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import { recordingCheckpoint, recordingCheckpointInWorker } from "./checkpoint.js"
+import type { RecordingMetadata } from "./recorder.js"
+
+let directory: string
+beforeAll(async () => {
+	directory = await mkdtemp(join(tmpdir(), "kimchi-checkpoint-"))
+	await mkdir(join(directory, "terminal-replay"))
+	execFileSync("bun", [
+		"build",
+		"src/terminal-replay/checkpoint-worker.ts",
+		"--target=node",
+		"--format=esm",
+		"--minify",
+		"--outfile",
+		join(directory, "terminal-replay/checkpoint-worker.mjs"),
+	])
+})
+afterEach(() => {
+	vi.unstubAllEnvs()
+	vi.useRealTimers()
+})
+afterAll(async () => rm(directory, { recursive: true, force: true }))
+
+async function fixture(data: string) {
+	const part = await mkdtemp(join(directory, "part-"))
+	const compressed = gzipSync(data)
+	const prefix = Buffer.alloc(4)
+	prefix.writeUInt32BE(compressed.length)
+	await writeFile(join(part, "output.bin"), Buffer.concat([prefix, compressed]))
+	const metadata: RecordingMetadata = {
+		version: 1,
+		id: "checkpoint",
+		sessionId: "checkpoint",
+		pid: process.pid,
+		startedAt: new Date(0).toISOString(),
+		status: "recording",
+		cols: 20,
+		rows: 6,
+		chunks: 1,
+		rawBytes: Buffer.byteLength(data),
+		compressedBytes: compressed.length + 4,
+		queueHighWaterBytes: 0,
+		duration: 0,
+	}
+	return { part, metadata }
+}
 
 async function screen(data: string) {
 	const terminal = new Terminal({ cols: 20, rows: 6, allowProposedApi: true, scrollback: 0 })
@@ -57,7 +107,7 @@ async function screen(data: string) {
 	}
 }
 
-describe("recording checkpoints", () => {
+describe.each(["in-process", "worker"])("recording checkpoints (%s)", (mode) => {
 	it.each([
 		["colours, wide characters and cursor", "\x1b[2;3H\x1b[38;2;255;0;0m界RED", " NEXT"],
 		["modern emoji wrapping and overwrite", "\x1b[2;18H🧑AB\x1b[2;20HX", "!"],
@@ -78,11 +128,48 @@ describe("recording checkpoints", () => {
 		["split colour sequence", "before\x1b[38;2;255;", "0;0mAFTER"],
 		["split window title", "before\x1b]0;unfinished ", "title\x07AFTER"],
 	])("preserves %s across parts", async (_name, before, after) => {
+		const data = `${JSON.stringify([0, "o", before])}\n`
 		async function* chunks() {
-			yield Buffer.from(`${JSON.stringify([0, "o", before])}\n`)
+			yield Buffer.from(data)
 		}
-		const checkpoint = await recordingCheckpoint(chunks(), 20, 6)
+		const { part, metadata } = await fixture(data)
+		vi.stubEnv("PI_PACKAGE_DIR", directory)
+		const checkpoint =
+			mode === "worker" ? await recordingCheckpointInWorker(part, metadata) : await recordingCheckpoint(chunks(), 20, 6)
 		expect(await screen(checkpoint.data)).toEqual(await screen(before))
 		expect(await screen(checkpoint.data + after)).toEqual(await screen(before + after))
+	})
+})
+
+describe("checkpoint worker lifecycle", () => {
+	it("keeps resize events and committed-chunk limits", async () => {
+		vi.stubEnv("PI_PACKAGE_DIR", directory)
+		const { part, metadata } = await fixture('[0,"r","40x10"]\n[0,"o","RESIZED"]\n')
+		const checkpoint = await recordingCheckpointInWorker(part, metadata)
+		expect(checkpoint).toMatchObject({ cols: 40, rows: 10 })
+		expect(checkpoint.data).toContain("RESIZED")
+		await expect(recordingCheckpointInWorker(part, { ...metadata, rawBytes: 32 * 1024 * 1024 + 1 })).rejects.toThrow(
+			"Recording exceeds its limit",
+		)
+	})
+
+	it("rejects damaged input without blocking later checkpoints", async () => {
+		vi.stubEnv("PI_PACKAGE_DIR", directory)
+		const { part, metadata } = await fixture("not JSON\n")
+		await expect(recordingCheckpointInWorker(part, metadata)).rejects.toThrow()
+		const valid = await fixture(`${JSON.stringify([0, "o", "RECOVERED"])}\n`)
+		expect((await recordingCheckpointInWorker(valid.part, valid.metadata)).data).toContain("RECOVERED")
+	})
+
+	it("terminates a stalled worker at the deadline", async () => {
+		const stalled = await mkdtemp(join(directory, "stalled-"))
+		await mkdir(join(stalled, "terminal-replay"))
+		await writeFile(join(stalled, "terminal-replay/checkpoint-worker.mjs"), "while (true) {}")
+		vi.stubEnv("PI_PACKAGE_DIR", stalled)
+		const { part, metadata } = await fixture("{}\n")
+		vi.useFakeTimers()
+		const rejected = expect(recordingCheckpointInWorker(part, metadata)).rejects.toThrow("timed out")
+		await vi.advanceTimersByTimeAsync(30_000)
+		await rejected
 	})
 })

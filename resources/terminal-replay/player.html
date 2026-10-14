@@ -179,6 +179,7 @@
   let playing = false;
   let cachedVisit;
   let cachedCast;
+  let cachedDetails;
   let generation = 0;
   let steps = [];
   const stepButtons = new Map();
@@ -233,7 +234,7 @@
   }
   function showSavedDetails(step) {
     const recording = recordings[Number(visit.value)];
-    const detail = step && recording.traceDetails?.[String(step.step)];
+    const detail = step && cachedDetails?.[String(step.step)];
     traceFields.replaceChildren();
     if (detail?.fields && typeof detail.fields === 'object') {
       for (const [label, value] of Object.entries(detail.fields).slice(0, 40)) {
@@ -403,6 +404,11 @@
     visit.appendChild(option);
   }
   visit.value = String(recordings.length - 1);
+  async function unpack(gzip) {
+    const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new Response(stream).text();
+  }
   async function mount() {
     const current = ++generation;
     const previous = player;
@@ -414,7 +420,7 @@
     const host = document.createElement('div');
     host.style.visibility = 'hidden';
     let next;
-    const { metadata, gzip } = recordings[Number(visit.value)];
+    const { metadata, gzip, traceDetails, traceDetailsGzip } = recordings[Number(visit.value)];
     const reasons = {
       'recording': 'Captured up to export or interruption; the final unsaved fraction may be missing.',
       'complete': 'Recording completed.',
@@ -431,12 +437,15 @@
       // Keep only the selected part decoded.
       if (cachedVisit !== visit.value) {
         cachedVisit = visit.value;
-        const bytes = Uint8Array.from(atob(gzip), c => c.charCodeAt(0));
-        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-        cachedCast = new Response(stream).text().then(readTrace);
+        cachedDetails = undefined;
+        cachedCast = Promise.all([
+          unpack(gzip).then(readTrace),
+          traceDetailsGzip ? unpack(traceDetailsGzip).then(JSON.parse) : traceDetails
+        ]);
       }
-      const recording = await cachedCast;
+      const [recording, details] = await cachedCast;
       if (current !== generation) return;
+      cachedDetails = details;
       steps = recording.steps;
       playbackSeek.max = metadata.duration;
       renderTrace(-1);

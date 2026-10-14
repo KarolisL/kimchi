@@ -3,10 +3,14 @@ import { readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
+import { gzip } from "node:zlib"
 import { resolveAuxiliaryFilesDir } from "../auxiliary-files/resolver.js"
 import { appendBeforeBody } from "../utils/export-post-process.js"
 import { enrichReplayDetails } from "./details.js"
 import type { Recording } from "./recorder.js"
+
+const compress = promisify(gzip)
 
 function assetsDirectory(): string {
 	const staged = join(resolveAuxiliaryFilesDir(process.env, homedir(), process.execPath), "terminal-replay")
@@ -27,11 +31,24 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
 		["player.html", "player.js", "player.css"].map((file) => readFile(join(assets, file), "utf8")),
 	)
 	const enrichedRecordings = await enrichReplayDetails(html, recordings)
+	const packedRecordings: Recording[] = []
+	for (const { traceDetails, ...recording } of enrichedRecordings) {
+		// Pack one part at a time; the player only expands details for the selected part.
+		packedRecordings.push(
+			traceDetails
+				? {
+						...recording,
+						traceDetailsGzip: (await compress(JSON.stringify(traceDetails), { level: 6 })).toString("base64"),
+					}
+				: recording,
+		)
+	}
 	const document = template
 		.replace("/* PLAYER_JS */", () => js.replace(/<\/script/gi, "<\\/script"))
 		.replace("/* PLAYER_CSS */", () => css)
-		.replace("/* RECORDINGS */", () => JSON.stringify(enrichedRecordings).replaceAll("<", "\\u003c"))
-	const encoded = Buffer.from(document).toString("base64")
+		.replace("/* RECORDINGS */", () => JSON.stringify(packedRecordings).replaceAll("<", "\\u003c"))
+	// JSON protects the script boundary without base64-encoding the gzip payload a second time.
+	const encoded = JSON.stringify(document).replaceAll("<", "\\u003c")
 	return appendBeforeBody(
 		html,
 		`
@@ -67,7 +84,7 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
 <section id="terminal-replay-panel" aria-label="Terminal replay">
   <iframe id="terminal-replay-frame" title="Terminal recording" sandbox="allow-scripts allow-downloads"></iframe>
 </section>
-<script id="terminal-replay-document" type="application/octet-stream">${encoded}</script>
+<script id="terminal-replay-document" type="application/json">${encoded}</script>
 <script id="terminal-replay-launcher">
 (() => {
   const toolbar = document.getElementById('terminal-replay-toolbar');
@@ -105,8 +122,7 @@ export async function addTerminalReplay(html: string, recordings: Recording[]): 
     replay.setAttribute('aria-pressed', String(show));
     transcript.setAttribute('aria-pressed', String(!show));
     if (show && !frame.hasAttribute('srcdoc')) {
-      const bytes = Uint8Array.from(atob(document.getElementById('terminal-replay-document').textContent.trim()), c => c.charCodeAt(0));
-      frame.srcdoc = new TextDecoder().decode(bytes);
+      frame.srcdoc = JSON.parse(document.getElementById('terminal-replay-document').textContent);
     }
     if (!show) {
       frame.contentWindow?.postMessage('kimchi-replay-pause', '*');

@@ -30,10 +30,11 @@ describe("HTML terminal replay", () => {
 		expect(html).toContain(transcript)
 		expect(html).toContain('sandbox="allow-scripts allow-downloads"')
 		expect(html).not.toContain("raw draft")
-		const encoded = html.match(/id="terminal-replay-document" type="application\/octet-stream">([^<]+)/)?.[1]
+		const encoded = html.match(/id="terminal-replay-document" type="application\/json">([^<]+)/)?.[1]
 		expect(encoded).toBeTruthy()
+		expect(encoded).toContain(recording.gzip)
 		if (!encoded) throw new Error("Replay document missing")
-		const player = Buffer.from(encoded, "base64").toString("utf8")
+		const player = JSON.parse(encoded)
 		expect(player).toContain("unredacted")
 		expect(player).toContain("Incomplete: recording stopped at the storage limit.")
 		expect(player).toContain("Original pauses preserved")
@@ -58,7 +59,7 @@ describe("HTML terminal replay", () => {
 	})
 
 	it("embeds saved redacted details safely without changing the recording or transcript", async () => {
-		const savedText = '</script><img src=x onerror="alert(1)"> redacted saved response'
+		const savedText = '</script><img src=x onerror="alert(1)"> redacted 界 🧑 e\u0301 \u2028\u2029 response'
 		const session = Buffer.from(
 			JSON.stringify({
 				header: { id: "session" },
@@ -83,13 +84,15 @@ describe("HTML terminal replay", () => {
 		const original = { ...recording, gzip: gzipSync(traceCast).toString("base64") }
 		const html = await addTerminalReplay(`<body>${transcript}</body>`, [original])
 		expect(html).toContain(transcript)
-		const encoded = html.match(/id="terminal-replay-document" type="application\/octet-stream">([^<]+)/)?.[1]
+		const encoded = html.match(/id="terminal-replay-document" type="application\/json">([^<]+)/)?.[1]
 		if (!encoded) throw new Error("Replay document missing")
-		const player = Buffer.from(encoded, "base64").toString("utf8")
+		const player = JSON.parse(encoded)
 		const payload = player.match(/id="recordings" type="application\/json">([^<]+)/)?.[1]
 		if (!payload) throw new Error("Replay payload missing")
 		const [embedded] = JSON.parse(payload)
-		expect(embedded.traceDetails["1"].content).toBe(savedText)
+		expect(embedded).not.toHaveProperty("traceDetails")
+		const details = JSON.parse(gunzipSync(Buffer.from(embedded.traceDetailsGzip, "base64")).toString("utf8"))
+		expect(details["1"].content).toBe(savedText)
 		expect(embedded.gzip).toBe(original.gzip)
 		expect(player).not.toContain(savedText)
 		expect(original).not.toHaveProperty("traceDetails")

@@ -8,7 +8,7 @@ import { injectTraceIdsIntoEntries, injectTraceIdsIntoExport } from "./trace-id-
 /** Append a snippet before `</body>` if present, otherwise append to the end of the document. */
 export function appendBeforeBody(html: string, snippet: string): string {
 	if (html.includes("</body>")) {
-		return html.replace("</body>", `${snippet}\n</body>`)
+		return html.replace("</body>", () => `${snippet}\n</body>`)
 	}
 	return `${html}\n${snippet}\n`
 }

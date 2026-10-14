@@ -35,7 +35,7 @@ export default function (pi) {
 					await delay(5)
 					continue
 				}
-				process.stdout.write("\x1b[0m".repeat(8000))
+				process.stdout.write("\x1b[0m".repeat(32000))
 				// Pace the synthetic producer to committed chunks rather than overflowing the queue.
 				while (Date.now() < deadline) {
 					await delay(5)

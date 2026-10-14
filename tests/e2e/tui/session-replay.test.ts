@@ -9,17 +9,23 @@ import { toolResultText } from "./support/mcp-model-script.js"
 interface ExportedRecording {
 	metadata: { sessionId: string; part: number; rawBytes: number }
 	gzip: string
+	traceDetailsGzip?: string
 	traceDetails?: Record<string, { fields: Record<string, string>; content?: string; diagnostics?: string }>
 }
 
 function recordingPayload(path: string): ExportedRecording[] {
 	const html = readFileSync(path, "utf8")
-	const document = html.match(/id="terminal-replay-document" type="application\/octet-stream">([^<]+)/)?.[1]
+	const document = html.match(/id="terminal-replay-document" type="application\/json">([^<]+)/)?.[1]
 	if (!document) throw new Error("Export did not contain a terminal replay")
-	const player = Buffer.from(document, "base64").toString("utf8")
+	const player = JSON.parse(document)
 	const payload = player.match(/id="recordings" type="application\/json">([^<]+)/)?.[1]
 	if (!payload) throw new Error("Recording payload missing")
-	return JSON.parse(payload)
+	return JSON.parse(payload).map((recording: ExportedRecording) => ({
+		...recording,
+		traceDetails: recording.traceDetailsGzip
+			? JSON.parse(gunzipSync(Buffer.from(recording.traceDetailsGzip, "base64")).toString("utf8"))
+			: recording.traceDetails,
+	}))
 }
 
 function decodedCast(recording: { gzip: string }): string {

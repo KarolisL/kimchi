@@ -49,6 +49,17 @@ try {
 	const transcript = `<!doctype html><html><head><style>body{margin:0}#app{min-height:2400px}</style></head><body><div id="app"><main id="content"><div id="messages">Transcript remains available</div></main></div></body></html>`
 	await writeFile(path, await addTerminalReplay(transcript, recordings))
 	const page = await browser.newPage({ viewport: { width: 1280, height: 960 } })
+	await page.context().setOffline(true)
+	await page.addInitScript(() => {
+		const state = { decompressions: 0 }
+		Object.assign(window, { replayCheck: state })
+		window.DecompressionStream = new Proxy(window.DecompressionStream, {
+			construct(target, args) {
+				state.decompressions++
+				return Reflect.construct(target, args)
+			},
+		})
+	})
 	const requests: string[] = []
 	const errors: string[] = []
 	page.on("request", (request) => {
@@ -63,6 +74,22 @@ try {
 	assert.equal(await page.locator("#terminal-replay-open").getAttribute("aria-pressed"), "true")
 	const frame = page.frameLocator("#terminal-replay-frame")
 	await frame.locator(".xterm-screen").waitFor()
+	const decompressions = () =>
+		frame
+			.locator("body")
+			.evaluate(() => (window as unknown as { replayCheck: { decompressions: number } }).replayCheck.decompressions)
+	assert.equal(await decompressions(), 1, "Opening replay must decode only the selected part")
+	assert.equal(
+		await frame.locator("body").evaluate(() => {
+			try {
+				return Boolean(parent.document.body)
+			} catch {
+				return false
+			}
+		}),
+		false,
+		"The replay iframe must not access the transcript document",
+	)
 	assert.doesNotMatch(await frame.locator("body").innerText(), /Player credits/)
 	assert.match(await frame.locator("html").innerHTML(), /Permission is hereby granted, free of charge/)
 	const details = frame.locator("details").filter({ has: frame.getByText("Recording details", { exact: true }) })
@@ -316,7 +343,8 @@ try {
 	// Known screens and times make trace navigation independent of live model timing.
 	const hostileDetail = '</script><img src="https://example.invalid/trace-leak" onerror="window.traceInjected=true">'
 	const savedFailedOutput = "FIRST_PART_SAVED_RESULT: the finalized tool output differs from the visible failure"
-	const savedResponse = "The saved response includes more context than the live trace excerpt."
+	const savedResponse =
+		"The saved response includes 界 🧑 e\u0301 \u2028\u2029 and more context than the live trace excerpt."
 	const responseFields = {
 		Model: "part-one-only-model",
 		"Input tokens": "128",
@@ -409,8 +437,11 @@ try {
 	await page.setViewportSize({ width: 1440, height: 1000 })
 	await page.goto(pathToFileURL(path).href)
 	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await decompressions(), 1, "Other parts' compressed details must remain undecoded")
 	await frame.getByLabel("Recording part").selectOption("0")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await decompressions(), 3, "Selecting a part must decode its cast and details once")
 	assert.equal(await frame.locator("#trace-list .trace-step").count(), 6, "Every linked step must be inspectable")
 	assert.equal(await frame.getByLabel("Pause on errors").isChecked(), true)
 	const step = (number: number) => frame.locator(`#trace-list .trace-step[data-step="${number}"]`)
@@ -542,6 +573,16 @@ try {
 	const traceDownloadPath = join(directory, "linked-part.html")
 	await (await traceDownload).saveAs(traceDownloadPath)
 	const downloadedTraceHtml = await readFile(traceDownloadPath, "utf8")
+	const downloadedPayload = downloadedTraceHtml.match(
+		/<script id="recordings" type="application\/json">(.*?)<\/script>/s,
+	)
+	assert(downloadedPayload)
+	assert.equal(
+		JSON.parse(downloadedPayload[1])[0].traceDetails,
+		undefined,
+		"Download must keep selected details compressed",
+	)
+	assert.equal(typeof JSON.parse(downloadedPayload[1])[0].traceDetailsGzip, "string")
 	assert.equal(downloadedTraceHtml.includes("part-one-only-model"), false)
 	assert.equal(downloadedTraceHtml.includes("FIRST_PART_SAVED_RESULT"), false)
 	const linkedOffline = await browser.newPage()
@@ -568,6 +609,20 @@ try {
 	await linkedOffline.locator("#trace-diagnostics summary").click()
 	assert.equal(await linkedOffline.locator("#trace-diagnostic-detail").innerText(), secondDiagnostics)
 	assert.equal(await linkedOffline.locator("#trace-diagnostic-detail img").count(), 0)
+	const legacyPath = join(directory, "legacy-details.html")
+	await writeFile(
+		legacyPath,
+		downloadedTraceHtml.replace(downloadedPayload[1], () => JSON.stringify([traced[1]]).replaceAll("<", "\\u003c")),
+	)
+	await linkedOffline.goto(pathToFileURL(legacyPath).href)
+	await linkedOffline.locator('#player[aria-busy="false"]').waitFor()
+	await linkedOffline.locator('#trace-list .trace-step[data-step="8"]').click()
+	await linkedOffline.locator("#trace-saved summary").click()
+	assert.equal(
+		await linkedOffline.locator("#trace-content").innerText(),
+		"SECOND_PART_SAVED_RESULT",
+		"Legacy uncompressed details must still display",
+	)
 	await linkedOffline.close()
 	await frame.getByLabel("Recording part").selectOption("2")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
@@ -646,6 +701,8 @@ try {
 	await writeFile(path, await addTerminalReplay(transcript, [tracedPart(1, denseEvents), tracedPart(2, denseEvents)]))
 	await page.goto(pathToFileURL(path).href)
 	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await decompressions(), 1, "Other parts' compressed details must remain undecoded")
 	await frame.getByLabel("Recording part").selectOption("0")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	assert.equal(await frame.locator("#trace-count").innerText(), "501 in this part")
@@ -724,6 +781,8 @@ try {
 	)
 	await page.goto(pathToFileURL(path).href)
 	await page.locator("#terminal-replay-open").click()
+	await frame.locator('#player[aria-busy="false"]').waitFor()
+	assert.equal(await decompressions(), 1, "Other parts' compressed details must remain undecoded")
 	await frame.getByLabel("Recording part").selectOption("0")
 	await frame.locator('#player[aria-busy="false"]').waitFor()
 	const partSelector = await frame.getByLabel("Recording part").elementHandle()
