@@ -142,7 +142,18 @@ test("experimental Ferment V2 leaves Plan mode, writes, and completes", async ({
 						},
 					],
 				},
-				{ stream: ["The requested file is verified."] },
+				{
+					stream: ["The requested file is verified. Claiming completion."],
+					toolCalls: [
+						{
+							id: "claim-plan-mode-ferment-complete",
+							function: {
+								name: "update_ferment_v2",
+								arguments: JSON.stringify({ status: "complete", completion_confidence: "proven" }),
+							},
+						},
+					],
+				},
 				{ stream: [acceptedFinal] },
 			],
 		},
@@ -185,12 +196,6 @@ test("experimental Ferment V2 continues after automatic compaction and then comp
 	}
 	const compactionResponse: FakeResponseScript = {
 		stream: [`${COMPACTION_SUMMARY_MARKER}: the Ferment V2 plan is ready and implementation remains.`],
-	}
-	const continueEvaluationResponse: FakeResponseScript = {
-		match: isFermentV2EvaluatorRequest,
-		stream: [
-			'{"verdict":"continue","checks":[{"requirement":"Implement feature A","met":false,"evidence":["m1"],"todoIds":[1]}],"reason":"Implementation is not evidenced yet."}',
-		],
 	}
 	const finishTodosResponse: FakeResponseScript = {
 		stream: ["Working toward the session objective.", " Verification is complete."],
@@ -235,7 +240,6 @@ test("experimental Ferment V2 continues after automatic compaction and then comp
 			artifactName: "ferment-v2-mode",
 			seedHome: (homeDir) => enableFermentV2Mode(homeDir, { reserveTokens: 1_000, keepRecentTokens: 1 }),
 			responses: [
-				continueEvaluationResponse,
 				metEvaluationResponse,
 				planningResponse,
 				planningStopResponse,
@@ -266,7 +270,7 @@ test("experimental Ferment V2 continues after automatic compaction and then comp
 
 			await waitForText(terminal, "Ferment V2 complete.", { timeoutMs: 5_000 })
 			terminal.submit("/ferment-v2")
-			await waitForText(terminal, "Evaluations: 2", { timeoutMs: 5_000 })
+			await waitForText(terminal, "Evaluations: 1", { timeoutMs: 5_000 })
 			await waitForText(terminal, "Last evaluation: met", { timeoutMs: 5_000 })
 			const finalView = viewText(terminal)
 			expect(finalView).not.toContain("Ferment V2 not met")
@@ -276,10 +280,13 @@ test("experimental Ferment V2 continues after automatic compaction and then comp
 			expect(finalView).not.toContain("Update Ferment V2")
 			await new Promise((resolve) => setTimeout(resolve, 2_000))
 			const requests = chatRequests(fixture.fake.requests)
-			expect(requests).toHaveLength(8)
+			expect(requests).toHaveLength(7)
 			expect(JSON.stringify(requests[2]?.body)).toContain("You are a context summarization assistant")
-			expect(JSON.stringify(requests[4]?.body)).toContain(COMPACTION_SUMMARY_MARKER)
-			trace.step("Ferment V2 compacted, continued from the summary, then completed")
+			expect(JSON.stringify(requests[3]?.body)).toContain(COMPACTION_SUMMARY_MARKER)
+			// The stop after compaction had no completion claim, so the continuation came
+			// from the deterministic host path, not an evaluator call.
+			expect(requests.filter(isFermentV2EvaluatorRequest)).toHaveLength(1)
+			trace.step("Ferment V2 compacted, continued deterministically from the summary, then completed on its claim")
 		},
 	)
 })
@@ -525,12 +532,10 @@ test("experimental Ferment V2 edit updates the revision while a tool is still ru
 	)
 })
 
-test("experimental Ferment V2 evaluates settled work without a completion-tool loop or extra nudge", async ({
-	terminal,
-}) => {
-	const firstHiddenCandidate = "TEXT_ONLY_CANDIDATE_MUST_NOT_TRIGGER_NUDGE"
-	const secondHiddenCandidate = "REVISED_TEXT_ONLY_CANDIDATE"
-	const acceptedFinal = "TEXT_ONLY_CANDIDATE_ACCEPTED"
+test("experimental Ferment V2 evaluates an explicit completion claim without extra nudges", async ({ terminal }) => {
+	const firstHiddenCandidate = "CLAIM_CANDIDATE_MUST_STAY_HIDDEN_UNTIL_VERDICT"
+	const secondHiddenCandidate = "REVISED_CLAIM_CANDIDATE"
+	const acceptedFinal = "CLAIM_CANDIDATE_ACCEPTED"
 	await runKimchiSession(
 		terminal,
 		{
@@ -584,11 +589,29 @@ test("experimental Ferment V2 evaluates settled work without a completion-tool l
 					thinking: ["Reviewing the first completion candidate."],
 					stream: [firstHiddenCandidate],
 					usage: { prompt_tokens: 100, completion_tokens: 10 },
+					toolCalls: [
+						{
+							id: "claim-text-only-candidate",
+							function: {
+								name: "update_ferment_v2",
+								arguments: JSON.stringify({ status: "complete", completion_confidence: "tested" }),
+							},
+						},
+					],
 				},
 				{
 					thinking: ["Reviewing the revised completion candidate."],
 					stream: [secondHiddenCandidate],
 					usage: { prompt_tokens: 20, completion_tokens: 5 },
+					toolCalls: [
+						{
+							id: "reclaim-text-only-candidate",
+							function: {
+								name: "update_ferment_v2",
+								arguments: JSON.stringify({ status: "complete", completion_confidence: "tested" }),
+							},
+						},
+					],
 				},
 				{
 					thinking: ["Returning the accepted final answer."],
@@ -614,7 +637,7 @@ test("experimental Ferment V2 evaluates settled work without a completion-tool l
 			expect(fullText(terminal)).not.toContain(secondHiddenCandidate)
 			expect(fullText(terminal).match(/Prompt summary/g)).toHaveLength(1)
 			expect(fullText(terminal).match(/Worked for/g)).toHaveLength(1)
-			trace.step("settled Todos reached evaluation without a completion-tool turn or empty-turn nudge")
+			trace.step("an explicit completion claim reached evaluation without extra nudges or empty-turn steers")
 		},
 	)
 })
@@ -679,7 +702,7 @@ test("experimental Ferment V2 reveals the final answer only after evaluation acc
 					],
 				},
 				{
-					stream: [firstHiddenCandidate],
+					stream: ["Finishing the gated completion Todo."],
 					toolCalls: [
 						{
 							id: "finish-gated-completion-todo",
@@ -695,6 +718,7 @@ test("experimental Ferment V2 reveals the final answer only after evaluation acc
 					],
 				},
 				{
+					stream: [firstHiddenCandidate],
 					toolCalls: [
 						{
 							id: "claim-gated-completion",
@@ -721,7 +745,7 @@ test("experimental Ferment V2 reveals the final answer only after evaluation acc
 					],
 				},
 				{
-					stream: [secondHiddenCandidate],
+					stream: ["Verifying the remaining evaluator concern."],
 					toolCalls: [
 						{
 							id: "finish-remaining-gated-todo",
@@ -737,6 +761,7 @@ test("experimental Ferment V2 reveals the final answer only after evaluation acc
 					],
 				},
 				{
+					stream: [secondHiddenCandidate],
 					toolCalls: [
 						{
 							id: "reclaim-gated-completion",
@@ -928,11 +953,44 @@ test("experimental Ferment V2 pauses after the same unresolved gap repeats three
 					toolCalls: [
 						{
 							id: `repeated-gap-check-${index + 1}`,
+							index: 0,
 							function: { name: "bash", arguments: JSON.stringify({ command: "pwd" }) },
+						},
+						// Round 1 settles the Todo list so the completion claim passes its gate.
+						...(index === 0
+							? [
+									{
+										id: "settle-repeated-gap-todo",
+										index: 1,
+										function: {
+											name: "create_todos",
+											arguments: JSON.stringify({
+												todos: [
+													{
+														content: "Verify the same requirement",
+														status: "completed",
+														note: "Evidence: scripted verification completed",
+													},
+												],
+											}),
+										},
+									},
+								]
+							: []),
+					],
+				},
+				{
+					stream: [`Checked source ${index + 1}.`],
+					toolCalls: [
+						{
+							id: `repeated-gap-claim-${index + 1}`,
+							function: {
+								name: "update_ferment_v2",
+								arguments: JSON.stringify({ status: "complete", completion_confidence: "tested" }),
+							},
 						},
 					],
 				},
-				{ stream: [`Checked source ${index + 1}.`] },
 				{
 					match: isFermentV2EvaluatorRequest,
 					stream: [JSON.stringify({ verdict: "continue", reason: repeatedGap })],
