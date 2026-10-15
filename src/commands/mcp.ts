@@ -19,13 +19,24 @@
  * Input:  { "name": "my-server", "server": { "command": "..." } }
  * Output: { "tools": [{ "name": "..." }], "needsAuth": false }
  * Exit:   0 on success (including needs-auth), 1 on error
+ *
+ * `kimchi mcp forget-grant` — one-shot OAuth grant forget; invocation contract and consent budget: docs/mcp-forget-grant.md
  */
 
 import type { ServerEntry } from "pi-mcp-adapter/types"
 import { Type } from "typebox"
 import { Value } from "typebox/value"
-import { verifyMcpKeyringRuntime } from "../extensions/mcp/keyring-require-bridge.js"
+import { forgetMcpOAuthGrant } from "../extensions/mcp/forget-oauth-grant.js"
+import {
+	McpKeychainDeniedError,
+	McpKeychainUnavailableError,
+	verifyMcpKeyringRuntime,
+} from "../extensions/mcp/keyring-require-bridge.js"
 import { type ProbeResult, UpstreamMcpProbe } from "../extensions/mcp/probe.js"
+
+const SERVER_NAME_PATTERN_SOURCE = "^(?!.*\\.\\.)[^/\\\\]+$"
+/** Server names follow one rule everywhere: no path separators or consecutive dots (guards path traversal in name-keyed credential paths). */
+const SERVER_NAME_PATTERN = new RegExp(SERVER_NAME_PATTERN_SOURCE)
 
 /**
  * TypeBox schema for the probe stdin input.
@@ -41,7 +52,7 @@ const ProbeInputSchema = Type.Object(
 	{
 		name: Type.String({
 			minLength: 1,
-			pattern: "^(?!.*\\.\\.)[^/\\\\]+$",
+			pattern: SERVER_NAME_PATTERN_SOURCE,
 		}),
 		server: Type.Object({}, { additionalProperties: true }),
 	},
@@ -67,12 +78,55 @@ export async function runMcp(args: string[]): Promise<number | undefined> {
 	if (subcommand === "keyring-check") {
 		return runKeyringCheck(args.slice(1))
 	}
+	if (subcommand === "forget-grant") {
+		return runForgetGrant(args.slice(1))
+	}
 
 	// Future: `kimchi mcp list`, `kimchi mcp status`, etc.
 	process.stderr.write(`Unknown mcp subcommand: ${subcommand ?? "(none)"}\n`)
 	process.stderr.write("Usage: kimchi mcp probe --json < server-config.json\n")
 	process.stderr.write("       kimchi mcp keyring-check --json\n")
+	process.stderr.write("       kimchi mcp forget-grant <server-name> --json\n")
 	return 1
+}
+
+type ForgetGrantFailureReason = "invalid-input" | "denied" | "unavailable" | "error"
+
+async function runForgetGrant(args: string[]): Promise<number> {
+	if (!args.includes("--json")) {
+		return emitForgetGrantFailure(null, "--json flag is required", "invalid-input")
+	}
+	const positional = args.filter((arg) => arg !== "--json")
+	const name = positional.length === 1 ? positional[0] : undefined
+	// Reject unknown flags as well: without this, `--name=x` would be treated
+	// as the server name and "successfully" forget a nonexistent server.
+	if (name === undefined || name.startsWith("-") || !SERVER_NAME_PATTERN.test(name)) {
+		return emitForgetGrantFailure(
+			name ?? null,
+			`Expected exactly one server name with no path separators or '..': kimchi mcp forget-grant <server-name> --json`,
+			"invalid-input",
+		)
+	}
+	try {
+		return emitJson({ ok: true, name, ...forgetMcpOAuthGrant(name) }, 0)
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		const reason: ForgetGrantFailureReason =
+			error instanceof McpKeychainDeniedError
+				? "denied"
+				: error instanceof McpKeychainUnavailableError
+					? "unavailable"
+					: "error"
+		return emitForgetGrantFailure(name, message, reason)
+	}
+}
+
+function emitForgetGrantFailure(
+	name: string | null,
+	message: string,
+	reason: ForgetGrantFailureReason,
+): Promise<number> {
+	return emitJson({ ok: false, name, error: message, reason }, 1)
 }
 
 async function runKeyringCheck(args: string[]): Promise<number> {
