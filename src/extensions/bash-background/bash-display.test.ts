@@ -8,6 +8,7 @@ import { bashStatus, bashStatusColor, createBashRenderers, safeBashText } from "
 import { createProcessRegistry, type ProcessDisplaySnapshot } from "./process-registry.js"
 import { createReviewCoordinator } from "./review-coordinator.js"
 import { getSessionState, setSessionState } from "./session-registry.js"
+import { createTerminalDelivery } from "./terminal-delivery.js"
 
 const sessionId = "display-test"
 const { renderCall: renderBashCall, renderResult: renderBashResult } = createBashRenderers(
@@ -18,6 +19,7 @@ function makeState(registry: ReturnType<typeof createProcessRegistry>) {
 	return {
 		registry,
 		coordinator: createReviewCoordinator({ registry }),
+		delivery: createTerminalDelivery(),
 		limitSeconds: 60,
 	}
 }

@@ -36,6 +36,7 @@ import {
 	type Skill,
 	type Theme,
 } from "@earendil-works/pi-coding-agent"
+import * as chokidar from "chokidar"
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest"
 import { ROUTED_MODEL_RESOLUTION_ENTRY } from "../../extensions/auto-model/index.js"
 import {
@@ -43,6 +44,13 @@ import {
 	resetProjectScopeTrustForTests,
 	setProjectScopeTrusted,
 } from "../../project-scope-trust.js"
+
+// Palette tests can inject file-change notifications without OS startup races.
+// Other tests keep native watching; skill-watcher.test.ts covers disk events.
+vi.mock("chokidar", async (importOriginal) => {
+	const actual = await importOriginal<typeof chokidar>()
+	return { ...actual, watch: vi.fn(actual.watch) }
+})
 
 // Mock the browser auth flow so authenticate() can be tested without
 // starting a real callback server or opening a browser.
@@ -6775,8 +6783,30 @@ describe("newSession skill commands", () => {
 		return { fake, reloads }
 	}
 
+	async function simulateSkillWatchEvents(): Promise<(path: string) => void> {
+		const watchers: chokidar.FSWatcher[] = []
+		const originalWatch = (await vi.importActual<typeof chokidar>("chokidar")).watch
+		const mockWatch = vi.mocked(chokidar.watch).mockImplementation((_paths, options) => {
+			const watcher = new chokidar.FSWatcher(options)
+			// Preserve the real event emitter and cleanup API without opening
+			// native subscriptions. The real skill watcher still handles events
+			// and debounce; its co-located tests cover filesystem integration.
+			vi.spyOn(watcher, "add").mockReturnValue(watcher)
+			watchers.push(watcher)
+			return watcher
+		})
+		onTestFinished(() => {
+			mockWatch.mockImplementation(originalWatch)
+		})
+		return (path) => {
+			expect(watchers.length).toBeGreaterThan(0)
+			for (const watcher of watchers) watcher.emit("all", "add", path)
+		}
+	}
+
 	it("re-advertises palettes when a global skill changes on disk", async () => {
 		const { dir, skillName, skill } = makeSkillDir()
+		const notifySkillAdded = await simulateSkillWatchEvents()
 		// Hermetic home: the watcher resolves roots from os.homedir() ($HOME),
 		// so without this the real dev harness dir is also watched.
 		vi.stubEnv("HOME", mkdtempSync(join(tmpdir(), "acp-server-home-")))
@@ -6804,15 +6834,12 @@ describe("newSession skill commands", () => {
 			// settings UI) — the agent notices on its own and re-advertises.
 			skills.push(skill)
 			updates.length = 0
-			// chokidar attaches asynchronously; writes landing before attach (or
-			// in the ignored initial-scan window) are silently lost, so wait past
-			// the attach window before mutating.
-			await new Promise((r) => setTimeout(r, 600))
 			updates.length = 0
 			const reloadsBase = reloads.n
 
 			mkdirSync(join(agentDir, "skills", skillName), { recursive: true })
 			writeFileSync(join(agentDir, "skills", skillName, "SKILL.md"), `---\nname: ${skillName}\n---\nbody`, "utf-8")
+			notifySkillAdded(join(agentDir, "skills", skillName, "SKILL.md"))
 			await waitFor(() => updates.some((u) => u.update.sessionUpdate === "available_commands_update"), 5000)
 
 			expect(reloads.n).toBe(reloadsBase + 1)
@@ -6828,6 +6855,7 @@ describe("newSession skill commands", () => {
 
 	it("re-advertises palettes when a project skill changes on disk", async () => {
 		const { dir, skillName, skill } = makeSkillDir()
+		const notifySkillAdded = await simulateSkillWatchEvents()
 		vi.stubEnv("HOME", mkdtempSync(join(tmpdir(), "acp-server-home-")))
 		// .claude/skills is one of the resolver's default config paths; it is
 		// picked up only while the project is trusted.
@@ -6852,8 +6880,6 @@ describe("newSession skill commands", () => {
 				...skill,
 				filePath: join(dir, ".claude", "skills", skillName, "SKILL.md"),
 			})
-			// Attach-settle (see the global test comment).
-			await new Promise((r) => setTimeout(r, 600))
 			updates.length = 0
 			const reloadsBase = reloads.n
 
@@ -6863,6 +6889,7 @@ describe("newSession skill commands", () => {
 				`---\nname: ${skillName}\n---\nbody`,
 				"utf-8",
 			)
+			notifySkillAdded(join(dir, ".claude", "skills", skillName, "SKILL.md"))
 			await waitFor(() => updates.some((u) => u.update.sessionUpdate === "available_commands_update"), 5000)
 
 			expect(reloads.n).toBe(reloadsBase + 1)
