@@ -1183,9 +1183,9 @@ export class KimchiAcpAgent implements Agent {
 			case AVAILABLE_EXT_METHODS.steering:
 				return handleSteering((sessionId) => this.getSessionTurnTarget(sessionId), params)
 			case AVAILABLE_EXT_METHODS.feedback:
-				// Session-scoped rating submission (ADR-0001): the rating window arms
-				// when the settled response's prompt() resolves end_turn and is
-				// cleared for cancelled/errored turns at finalize/fail time.
+				// Session-scoped rating submission (docs/acp-feedback.md): the rating
+				// window arms when the settled response's prompt() resolves end_turn
+				// and is cleared for cancelled/errored turns at finalize/fail time.
 				return handleFeedback((sessionId) => this.getSessionTurnTarget(sessionId), params)
 			case AVAILABLE_EXT_METHODS.import_discover:
 				// Sessionless, read-only source-app discovery for the import screen

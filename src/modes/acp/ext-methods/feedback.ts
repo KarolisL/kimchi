@@ -1,9 +1,7 @@
-// ACP extension method handler for rating the settled response (GLOSSARY:
-// "Rating" / "Rating window"; decision record: docs/adr/0001).
-//
-// Wire name: `_kimchi.dev/feedback` — the vendor-namespaced name advertised
-// via _meta["kimchi.dev"].feedback. Action-discriminated for future flows;
-// the only action today is "rate_response".
+// ACP extension method handler for rating the settled response.
+// Vendor contract: docs/acp-feedback.md. Wire name: `_kimchi.dev/feedback` —
+// advertised via _meta["kimchi.dev"].feedback. Action-discriminated for
+// future flows; the only action today is "rate_response".
 
 import { RequestError } from "@agentclientprotocol/sdk"
 import type { AgentSession } from "@earendil-works/pi-coding-agent"

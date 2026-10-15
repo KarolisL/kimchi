@@ -5,9 +5,14 @@ settles, the client submits exactly one rating — a sentiment plus an optional
 reason — recorded as a custom transcript entry and telemetry. Ratings never
 enter the model's context.
 
-Decision record: [ADR-0001](./adr/0001-acp-rating-feedback-vendor-extmethod.md).
-Vocabulary ("rating", "rating window", "predefined reason", "routed pick"):
-[GLOSSARY](../GLOSSARY.md).
+Vocabulary: a **rating** is the user's verdict (`positive`/`negative` plus an
+optional reason) on the **settled response** (assistant response whose full
+run chain — retries, queued follow-ups, compaction — has drained). A
+**predefined reason** is picked from the fixed vocabulary; a **custom reason**
+is typed (max 300 chars). The **rating window** is the interval in which a
+rating may be submitted: it arms when a response settles, is consumed by
+exactly one accepted submission, and clears on the next turn start or a
+session reset.
 
 ## The contract
 

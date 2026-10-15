@@ -1,5 +1,5 @@
 /**
- * Cross-surface rating-window registry (GLOSSARY: "Rating window").
+ * Cross-surface rating-window registry.
  *
  * The window arms when a response settles, is consumed by exactly one
  * accepted rating submission, and clears on the next turn start or a session

@@ -1,4 +1,5 @@
-// ACP integration — response rating (`_kimchi.dev/feedback`, ADR-0001).
+// ACP integration — response rating (`_kimchi.dev/feedback`; contract:
+// docs/acp-feedback.md).
 //
 // Mirrors the TUI's rating flow over the wire: after a response settles
 // (prompt resolves end_turn → agent_settled arms the rating window), the

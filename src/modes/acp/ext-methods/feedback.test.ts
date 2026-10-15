@@ -70,7 +70,7 @@ describe("KimchiAcpAgent extMethod feedback", () => {
 		await agent.initialize({ protocolVersion: 1 })
 		await agent.newSession({ cwd: "/tmp", mcpServers: [] })
 
-		// Real ordering (acp feedback plan, ADR-0001): agent_settled arms the
+		// Real ordering (docs/acp-feedback.md): agent_settled arms the
 		// window while prompt() is still draining; prompt() then resolves into
 		// finalizeTurn("end_turn"), which must NOT clear it.
 		const promptPromise = agent.prompt({
