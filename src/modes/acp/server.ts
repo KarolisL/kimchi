@@ -185,7 +185,7 @@ import {
 	pathTrustResponse,
 	requireAbsolutePath,
 } from "./trust-updates.js"
-import type { FileChange, PendingFileChange, TurnContext, TurnUsage } from "./types.js"
+import type { FileChange, PendingFileChange, SessionTurnTarget, TurnContext, TurnUsage } from "./types.js"
 import { emptyTurnUsage, updateTurnUsage } from "./usage.js"
 import { asString, extractImages, truncate } from "./utils.js"
 
@@ -2367,7 +2367,7 @@ export class KimchiAcpAgent implements Agent {
 	 * cancelled turn stays defined until the prompt settles, but cancel() has
 	 * already resolved its outcome — it is not "no turn in progress".
 	 */
-	private getSessionTurnTarget(sessionId: string): { session: AgentSession; turnActive: boolean } | undefined {
+	private getSessionTurnTarget(sessionId: string): SessionTurnTarget | undefined {
 		const entry = this.sessions.get(sessionId)
 		if (!entry) return undefined
 		const turnActive = entry.turn !== undefined && !entry.turn.cancelled

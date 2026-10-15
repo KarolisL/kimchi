@@ -4,21 +4,9 @@
 // future flows; the only action today is "rate_response".
 
 import { RequestError } from "@agentclientprotocol/sdk"
-import type { AgentSession } from "@earendil-works/pi-coding-agent"
-import type { FeedbackSentiment } from "../../../extensions/feedback/dialog.js"
 import { consumeRatingWindow, getRatingWindow } from "../../../extensions/feedback/rating-window.js"
 import { type RecordRatingResult, recordRating } from "../../../extensions/feedback/record-rating.js"
-
-/**
- * Lookup result for the session targeted by a feedback submission.
- * `turnActive` mirrors the steering/compact bookkeeping: a cancelled turn
- * stays defined until the prompt settles, but cancel() already resolved its
- * outcome — a rating must never attach to a turn that is still running.
- */
-export type FeedbackTarget = {
-	session: AgentSession
-	turnActive: boolean
-}
+import type { SessionTurnTarget } from "../types.js"
 
 const ACTION_RATE_RESPONSE = "rate_response"
 
@@ -36,7 +24,7 @@ const ACTION_RATE_RESPONSE = "rate_response"
  * then session existence, then the in-progress gate, then the window.
  */
 export async function handleFeedback(
-	getTarget: (sessionId: string) => FeedbackTarget | undefined,
+	getTarget: (sessionId: string) => SessionTurnTarget | undefined,
 	params: Record<string, unknown>,
 ): Promise<RecordRatingResult> {
 	const sessionId = params.sessionId
@@ -77,7 +65,7 @@ export async function handleFeedback(
 
 	const result = recordRating({
 		appendEntry: (customType, details) => target.session.sessionManager.appendCustomEntry(customType, details),
-		sentiment: sentiment as FeedbackSentiment,
+		sentiment,
 		reason: reason ?? "",
 		window: ratingWindow,
 	})
