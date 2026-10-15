@@ -157,6 +157,24 @@ describe("/pr-reporting status", () => {
 			"  login or set GH_TOKEN.",
 		])
 	})
+	it("leaves out repositories it could not report while reporting is off", () => {
+		expect(
+			statusText(
+				state([], {
+					enabled: false,
+					blockedRepositories: [
+						{ repository: "/work/app/.git", reason: "denied", provider: "github", message: "GitHub denied access." },
+					],
+					unsupportedRepositories: 1,
+				}),
+				undefined,
+				now,
+			),
+		).toEqual({
+			text: ["PR reporting   Disabled (SaaS default)", "Repositories   0 queued · 0 acknowledged"].join("\n"),
+			warning: false,
+		})
+	})
 	it("does not call requests held for an unidentified repository unevidenced", () => {
 		const { text } = statusText(
 			state([], {

@@ -119,7 +119,8 @@ export function statusText(
 			[state.error, ...pending.map((entry) => entry.lastError)].filter((value): value is string => value !== undefined),
 		),
 	]
-	const blocked = (state.blockedRepositories ?? []).map(unreported)
+	// Turning reporting off by following telemetry keeps the last capture's list; it has nothing to report then.
+	const blocked = state.enabled ? (state.blockedRepositories ?? []).map(unreported) : []
 	const sections = [
 		...(problems.length ? [["Delivery problems", ...problems.flatMap((problem) => wrap(problem, "- "))]] : []),
 		// Their requests stay local until Kimchi can read the repository, so they warn like delivery problems.
@@ -134,7 +135,7 @@ export function statusText(
 				"Repositories",
 				`${formatCount(pending.length)} queued · ${formatCount(acknowledged)} acknowledged`,
 				...(waiting ? [`${formatCount(waiting)} waiting for the 5-minute upload window`] : []),
-				...(state.unsupportedRepositories
+				...(state.enabled && state.unsupportedRepositories
 					? [`${formatCount(state.unsupportedRepositories)} not reported: no GitHub or GitLab remote`]
 					: []),
 			),
