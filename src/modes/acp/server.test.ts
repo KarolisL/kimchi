@@ -2312,6 +2312,10 @@ describe("KimchiAcpAgent turn lifecycle", () => {
 		const warnings = messageChunks(updates).filter((chunk) => chunk.text.includes("does not accept image input"))
 		expect(warnings).toHaveLength(1)
 		expect(warnings[0].text).toContain("remove the image and resend")
+		// The warning is harness-synthesized, not a model response: it carries
+		// no model-attribution _meta (docs/acp-model-attribution.md scopes
+		// attribution to model responses). Frozen by assertion, not accident.
+		expect(updates.find((u) => u.update.sessionUpdate === "agent_message_chunk")?.update._meta).toBeUndefined()
 	})
 
 	// Auto-routed models (kimchi-dev/auto*) have text-only descriptors but
@@ -3296,6 +3300,379 @@ describe("KimchiAcpAgent messageId on streaming chunks", () => {
 		})
 		expect(result.stopReason).toBe("end_turn")
 		expect(messageIdsFor("agent_message_chunk")).toEqual(["km.0", "km.1"])
+	})
+})
+
+// Per-message model attribution (docs/acp-model-attribution.md): the first
+// chunk emitted for a messageId carries `_meta["kimchi.dev"]` naming the
+// served and requested models as provider refs; later chunks of the same id
+// carry none unless the value changed (a mid-stream responseModel
+// correction). Replay after loadSession re-emits it from the persisted
+// message tuple, so attribution survives reload.
+describe("KimchiAcpAgent per-message model attribution", () => {
+	let fake: FakeAgentSession
+	let agent: KimchiAcpAgent
+	let sessionId: string
+	let updates: SessionNotification[]
+
+	beforeEach(async () => {
+		fake = new FakeAgentSession("session-model-meta")
+		const rec = makeRecordingConn()
+		updates = rec.updates
+		agent = new KimchiAcpAgent(rec.conn, {
+			extensionFactories: [],
+			agentDir: "/tmp/fake-agent-dir",
+			sessionFactory: async () => asSession(fake),
+		})
+		const res = await agent.newSession({ cwd: "/tmp", mcpServers: [] })
+		sessionId = res.sessionId
+	})
+
+	function partialMessage(fields: Partial<AssistantMessage>): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "kimchi-dev",
+			model: "auto",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+			...fields,
+		}
+	}
+
+	function emitDelta(
+		type: "text_delta" | "thinking_delta",
+		contentIndex: number,
+		delta: string,
+		message: AssistantMessage,
+	): void {
+		fake.emit({
+			type: "message_update",
+			assistantMessageEvent: {
+				type,
+				delta,
+				contentIndex,
+				partial: {} as unknown as AssistantMessage,
+			},
+			message,
+		})
+	}
+
+	function metasFor(update: string): Array<{ [key: string]: unknown } | null | undefined> {
+		return updates.filter((u) => u.update.sessionUpdate === update).map((u) => u.update._meta)
+	}
+
+	it("attaches _meta on the first chunk of a message and not on later chunks", async () => {
+		const routed = partialMessage({ model: "auto", responseModel: "glm-5.3" })
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			emitDelta("text_delta", 0, "hel", routed)
+			emitDelta("text_delta", 0, "lo", routed)
+			fake.emit(agentEnd())
+		}
+		const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		expect(result.stopReason).toBe("end_turn")
+		expect(metasFor("agent_message_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			undefined,
+		])
+	})
+
+	it("attaches the same _meta on the first agent_thought_chunk", async () => {
+		const routed = partialMessage({ model: "auto", responseModel: "glm-5.3" })
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			emitDelta("thinking_delta", 0, "pondering", routed)
+			emitDelta("thinking_delta", 0, " more", routed)
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		expect(metasFor("agent_thought_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			undefined,
+		])
+	})
+
+	it("re-attaches a corrected _meta when responseModel arrives mid-stream", async () => {
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			// First delta: the pick is not yet known — attribution falls back to
+			// the requested ref.
+			emitDelta("text_delta", 0, "hel", partialMessage({ model: "auto" }))
+			// The backend reports the served model with a later chunk.
+			emitDelta("text_delta", 0, "lo", partialMessage({ model: "auto", responseModel: "glm-5.3" }))
+			emitDelta("text_delta", 0, "!", partialMessage({ model: "auto", responseModel: "glm-5.3" }))
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		expect(metasFor("agent_message_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/auto",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			undefined,
+		])
+	})
+
+	it("emits identical refs for a pinned model (no responseModel)", async () => {
+		const pinned = partialMessage({ provider: "anthropic", model: "claude" })
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			emitDelta("text_delta", 0, "hi", pinned)
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		expect(metasFor("agent_message_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "anthropic/claude",
+					requestedModelId: "anthropic/claude",
+				},
+			},
+		])
+	})
+
+	it("attaches _meta on message_end's un-streamed text chunks", async () => {
+		// A provider that skips incremental deltas entirely: the full text
+		// surfaces only in message_end's returned message.
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			fake.emit({
+				type: "message_end",
+				message: partialMessage({
+					model: "auto",
+					responseModel: "glm-5.3",
+					content: [{ type: "text", text: "full reply" }],
+				}),
+			})
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		expect(metasFor("agent_message_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+		])
+	})
+
+	it("emits a zero-length correction chunk when responseModel arrives only at message_end", async () => {
+		// The fully-streamed gap: every delta carried the requested-id
+		// fallback, and the restore path emits nothing when no text is left —
+		// so the authoritative tuple must land via an explicit zero-length
+		// correction chunk on the same messageId. Clients append nothing and
+		// apply the _meta (docs/acp-model-attribution.md).
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			emitDelta("text_delta", 0, "fully streamed", partialMessage({ model: "auto" }))
+			fake.emit({
+				type: "message_end",
+				message: partialMessage({
+					model: "auto",
+					responseModel: "glm-5.3",
+					content: [{ type: "text", text: "fully streamed" }],
+				}),
+			})
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+		const chunks = updates.filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+		expect(chunks).toHaveLength(2)
+		expect(metasFor("agent_message_chunk")).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/auto",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+		])
+		// The correction carries no text and reuses the streamed block's id.
+		const texts = chunks.map((u) => (u.update as { content: { text: string } }).content.text)
+		expect(texts).toEqual(["fully streamed", ""])
+		expect((chunks[1].update as { messageId?: string }).messageId).toBe(
+			(chunks[0].update as { messageId?: string }).messageId,
+		)
+	})
+
+	it("corrects a thinking block as agent_thought_chunk, matching the block's streamed kind", async () => {
+		// A correction must not invent a kind: a thinking block's id corrected
+		// via agent_message_chunk would render a spurious empty agent message on
+		// clients keyed by update kind.
+		fake.promptImpl = async () => {
+			fake.emit({ type: "agent_start" })
+			emitDelta("thinking_delta", 0, "ponder", partialMessage({ model: "auto" }))
+			emitDelta("text_delta", 1, "answer", partialMessage({ model: "auto" }))
+			fake.emit({
+				type: "message_end",
+				message: partialMessage({
+					model: "auto",
+					responseModel: "glm-5.3",
+					content: [
+						{ type: "thinking", thinking: "ponder" },
+						{ type: "text", text: "answer" },
+					],
+				}),
+			})
+			fake.emit(agentEnd())
+		}
+		await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] })
+
+		// Each block's correction matches its streamed kind and reuses its id.
+		const idsFor = (update: string) =>
+			updates
+				.filter((u) => u.update.sessionUpdate === update)
+				.map((u) => (u.update as { messageId?: string | null }).messageId)
+		expect(idsFor("agent_thought_chunk")).toEqual(["km.0", "km.0"])
+		expect(idsFor("agent_message_chunk")).toEqual(["km.1", "km.1"])
+
+		// Both corrections are zero-length and carry the corrected tuple.
+		const corrected = { "kimchi.dev": { modelId: "kimchi-dev/glm-5.3", requestedModelId: "kimchi-dev/auto" } }
+		const emptyChunks = updates.filter((u) => {
+			if (u.update.sessionUpdate !== "agent_message_chunk" && u.update.sessionUpdate !== "agent_thought_chunk")
+				return false
+			const { content } = u.update
+			return content.type === "text" && content.text === ""
+		})
+		expect(emptyChunks.map((u) => [u.update.sessionUpdate, u.update._meta])).toEqual([
+			["agent_thought_chunk", corrected],
+			["agent_message_chunk", corrected],
+		])
+	})
+
+	it("re-emits _meta from the persisted tuple when replaying a loaded session", async () => {
+		const loaded = new FakeAgentSession("session-model-meta-load")
+		loaded.branch = [
+			{
+				type: "message",
+				id: "e1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "hi", timestamp: 0 },
+			},
+			{
+				type: "message",
+				id: "e2",
+				parentId: "e1",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: partialMessage({
+					model: "auto",
+					responseModel: "glm-5.3",
+					content: [{ type: "text", text: "reply" }],
+				}),
+			},
+			{
+				type: "message",
+				id: "e3",
+				parentId: "e2",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				message: partialMessage({
+					provider: "anthropic",
+					model: "claude",
+					content: [{ type: "text", text: "pinned reply" }],
+				}),
+			},
+		]
+		const rec = makeRecordingConn()
+		const loadAgent = new KimchiAcpAgent(rec.conn, {
+			extensionFactories: [],
+			agentDir: "/tmp/fake-agent-dir",
+			sessionLoader: async () => asSession(loaded),
+		})
+		await loadAgent.loadSession({ sessionId: "session-model-meta-load", cwd: "/tmp", mcpServers: [] })
+		const replayed = replayOnly(rec.updates).filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+		expect(replayed.map((u) => u.update._meta)).toEqual([
+			{
+				"kimchi.dev": {
+					modelId: "kimchi-dev/glm-5.3",
+					requestedModelId: "kimchi-dev/auto",
+				},
+			},
+			{
+				"kimchi.dev": {
+					modelId: "anthropic/claude",
+					requestedModelId: "anthropic/claude",
+				},
+			},
+		])
+	})
+
+	it("still attributes replayed chunks when the session record is missing", async () => {
+		// The defensive no-record replay branch (replayAssistantBlocks with an
+		// unloaded SessionRecord): messageIds stay off the wire, and since
+		// first-chunk dedup is impossible without the record's seen-map, `_meta`
+		// must attach anyway — attribution never silently drops. Reached by
+		// diverging the session's id from its registration key, so
+		// replayTranscript's record lookup misses.
+		const fake = new FakeAgentSession("session-model-meta-norecord")
+		fake.branch = [
+			{
+				type: "message",
+				id: "e1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: partialMessage({
+					model: "auto",
+					responseModel: "glm-5.3",
+					content: [{ type: "text", text: "reply" }],
+				}),
+			},
+		]
+		const rec = makeRecordingConn()
+		const agent = new KimchiAcpAgent(rec.conn, {
+			extensionFactories: [],
+			agentDir: "/tmp/fake-agent-dir",
+			sessionFactory: async () => asSession(fake),
+		})
+		await agent.newSession({ cwd: "/tmp", mcpServers: [] })
+		// The record stays registered under the original id; the session now
+		// reports a different one, so replay's record lookup misses.
+		;(fake as { sessionId: string }).sessionId = "session-model-meta-norecord-moved"
+		await agent.loadSession({ sessionId: "session-model-meta-norecord", cwd: "/tmp", mcpServers: [] })
+		const replayed = replayOnly(rec.updates).filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+		expect(replayed).toHaveLength(1)
+		// No record → no messageId, but the attribution still lands.
+		expect((replayed[0].update as { messageId?: string | null }).messageId).toBeUndefined()
+		expect(replayed[0].update._meta).toEqual({
+			"kimchi.dev": {
+				modelId: "kimchi-dev/glm-5.3",
+				requestedModelId: "kimchi-dev/auto",
+			},
+		})
 	})
 })
 
@@ -5927,7 +6304,7 @@ describe("routed model notifications", () => {
 		expect(extNotifications.filter((n) => n.method === "_kimchi.dev/routed_model")).toEqual([
 			{
 				method: "_kimchi.dev/routed_model",
-				params: { sessionId: "session-routed-1", requestedId: "auto", routedId: "glm-5.3" },
+				params: { sessionId: "session-routed-1", requestedId: "kimchi-dev/auto", routedId: "kimchi-dev/glm-5.3" },
 			},
 		])
 	})
@@ -5947,11 +6324,11 @@ describe("routed model notifications", () => {
 		expect(extNotifications.filter((n) => n.method === "_kimchi.dev/routed_model")).toEqual([
 			{
 				method: "_kimchi.dev/routed_model",
-				params: { sessionId: "session-routed-6", requestedId: "auto", routedId: "glm-5.3" },
+				params: { sessionId: "session-routed-6", requestedId: "kimchi-dev/auto", routedId: "kimchi-dev/glm-5.3" },
 			},
 			{
 				method: "_kimchi.dev/routed_model",
-				params: { sessionId: "session-routed-6", requestedId: "auto", routedId: "kimi-k3" },
+				params: { sessionId: "session-routed-6", requestedId: "kimchi-dev/auto", routedId: "kimchi-dev/kimi-k3" },
 			},
 		])
 	})
@@ -5978,12 +6355,12 @@ describe("routed model notifications", () => {
 		expect(extNotifications.filter((n) => n.method === "_kimchi.dev/routed_model")).toEqual([
 			{
 				method: "_kimchi.dev/routed_model",
-				params: { sessionId: "session-routed-2", requestedId: "auto", routedId: "glm-5.3" },
+				params: { sessionId: "session-routed-2", requestedId: "kimchi-dev/auto", routedId: "kimchi-dev/glm-5.3" },
 			},
 		])
 	})
 
-	it("forwards unknown-model picks with the raw backend id", async () => {
+	it("forwards unknown-model picks with the provider-prefixed raw id", async () => {
 		const fake = new FakeAgentSession("session-routed-3")
 		const { conn, extNotifications } = makeRecordingConn()
 		const agent = await startRoutedTestSession(fake, conn)
@@ -5997,7 +6374,11 @@ describe("routed model notifications", () => {
 		expect(extNotifications.filter((n) => n.method === "_kimchi.dev/routed_model")).toEqual([
 			{
 				method: "_kimchi.dev/routed_model",
-				params: { sessionId: "session-routed-3", requestedId: "auto", routedId: "brand-new-backend-model" },
+				params: {
+					sessionId: "session-routed-3",
+					requestedId: "kimchi-dev/auto",
+					routedId: "kimchi-dev/brand-new-backend-model",
+				},
 			},
 		])
 	})

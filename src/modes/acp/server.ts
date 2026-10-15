@@ -134,7 +134,7 @@ import { getVersion } from "../../utils.js"
 import { createAcpPermissionPrompter } from "./acp-prompter.js"
 import { createAcpUIContext } from "./acp-ui-context.js"
 import { emitAgentActivityUpdate } from "./activity-updates.js"
-import { ADVERTISED_CAPABILITIES, AVAILABLE_EXT_METHODS, CAPABILITIES_KEY } from "./capabilities.js"
+import { ADVERTISED_CAPABILITIES, AVAILABLE_EXT_METHODS, kimchiDevMetaOf } from "./capabilities.js"
 import { composeAvailableCommands, createCommandsRefresher, discoverSkillCommandsMap } from "./commands.js"
 import { handleAuthStatus } from "./ext-methods/auth-status.js"
 import { handleCompact } from "./ext-methods/compact.js"
@@ -154,6 +154,7 @@ import { handleListResources, handleSetResourceEnabled } from "./ext-methods/res
 import { handleSetOnboardingFlag } from "./ext-methods/set-onboarding-flag.js"
 import { handleSetSessionTitle } from "./ext-methods/set-session-title.js"
 import { handleSteering } from "./ext-methods/steering.js"
+import { type ModelAttribution, modelAttributionFrom, modelMetaFor, spreadModelMeta } from "./model-attribution.js"
 import { registerAcpPrompter, unregisterAcpPrompter } from "./permission-prompter-registry.js"
 import { AcpPlanTracker } from "./plans.js"
 import { emitRoutedModelUpdate } from "./routed-model-updates.js"
@@ -314,6 +315,15 @@ type SessionRecord = {
 	 * per-message lifetime.
 	 */
 	streamedText: Map<number, string>
+	/**
+	 * Per-messageId model attribution already carried on the wire, for the
+	 * first-chunk dedup (docs/acp-model-attribution.md): a messageId's
+	 * `_meta` re-attaches only when the value changed (a served-model
+	 * correction after `responseModel` arrives mid-stream). Cleared everywhere
+	 * contentIndexToBlockId is cleared, so it shares the same per-message
+	 * lifetime — messageIds never repeat, so the clear is memory hygiene only.
+	 */
+	emittedModelMeta: Map<string, ModelAttribution>
 	/**
 	 * Session-wide monotonic counter for ACP toolCallIds.
 	 *
@@ -477,12 +487,10 @@ export class KimchiAcpAgent implements Agent {
 				promptCapabilities: { image: supportsImages, audio: false, embeddedContext: false },
 				mcpCapabilities: { http: true, sse: false },
 				// Extended capabilities
-				_meta: {
-					[CAPABILITIES_KEY]: {
-						...ADVERTISED_CAPABILITIES,
-						...(this.mcpProbe ? {} : { probe_mcp_server: false }),
-					},
-				},
+				_meta: kimchiDevMetaOf({
+					...ADVERTISED_CAPABILITIES,
+					...(this.mcpProbe ? {} : { probe_mcp_server: false }),
+				}),
 			},
 			authMethods,
 		}
@@ -622,6 +630,7 @@ export class KimchiAcpAgent implements Agent {
 				nextBlockId: 0,
 				contentIndexToBlockId: new Map(),
 				streamedText: new Map(),
+				emittedModelMeta: new Map(),
 				nextToolCallId: 0,
 				toolCallIdMap: new Map(),
 				skillCommands: new Map(),
@@ -900,6 +909,7 @@ export class KimchiAcpAgent implements Agent {
 				nextBlockId: 0,
 				contentIndexToBlockId: new Map(),
 				streamedText: new Map(),
+				emittedModelMeta: new Map(),
 				nextToolCallId: 0,
 				toolCallIdMap: new Map(),
 				skillCommands: new Map(),
@@ -1364,6 +1374,7 @@ export class KimchiAcpAgent implements Agent {
 				// don't reuse old ids.
 				entry.contentIndexToBlockId.clear()
 				entry.streamedText.clear()
+				entry.emittedModelMeta.clear()
 				entry.toolCallIdMap.clear()
 				// A held plan-review turn seeing the follow-up turn begin: pi events
 				// derive "decision applied with work" — no extension notification.
@@ -1387,6 +1398,7 @@ export class KimchiAcpAgent implements Agent {
 				// message's assignment.
 				entry.contentIndexToBlockId.clear()
 				entry.streamedText.clear()
+				entry.emittedModelMeta.clear()
 				// A resolved pick may already be known here (e.g. restored from the
 				// last session), so push the resolved label once per change so clients
 				// showing the selected model reflect what the auto model chose.
@@ -1402,12 +1414,21 @@ export class KimchiAcpAgent implements Agent {
 						messageId = `km.${entry.nextBlockId++}`
 						entry.contentIndexToBlockId.set(ame.contentIndex, messageId)
 					}
+					// modelAttributionFrom reads the partial assistant message — the
+					// same best-known tuple the auto-model extension learns from — so
+					// the first chunk of a block carries its attribution and a later
+					// chunk corrects it if `responseModel` lands mid-stream.
+					const modelMeta =
+						event.message.role === "assistant"
+							? modelMetaFor(entry.emittedModelMeta, messageId, modelAttributionFrom(event.message))
+							: undefined
 					this.send({
 						sessionId,
 						update: {
 							sessionUpdate: ame.type === "text_delta" ? "agent_message_chunk" : "agent_thought_chunk",
 							content: { type: "text", text: ame.delta },
 							messageId,
+							...spreadModelMeta(modelMeta),
 						},
 					})
 					// Track streamed text length only — thinking is not restored at
@@ -1560,15 +1581,48 @@ export class KimchiAcpAgent implements Agent {
 							messageId = `km.${entry.nextBlockId++}`
 							entry.contentIndexToBlockId.set(index, messageId)
 						}
+						const modelMeta = modelMetaFor(entry.emittedModelMeta, messageId, modelAttributionFrom(msg))
 						this.send({
 							sessionId,
 							update: {
 								sessionUpdate: "agent_message_chunk",
 								content: { type: "text", text: block.text.slice(streamed.length) },
 								messageId,
+								...spreadModelMeta(modelMeta),
 							},
 						})
 						entry.streamedText.set(index, block.text)
+					})
+				}
+				// A provider may report the served model only on this final message,
+				// so every streamed chunk carried the requested-id fallback. When the
+				// authoritative attribution differs from what a block id already
+				// emitted — and the restore loop above sent no chunk for it — land the
+				// correction explicitly: a zero-length chunk on that id. Content-append
+				// is a no-op and the client's last-wins rule (docs/acp-model-attribution.md)
+				// applies the served ref.
+				const authoritativeAttribution = modelAttributionFrom(msg)
+				for (const [contentIndex, blockId] of entry.contentIndexToBlockId) {
+					// Correction only: ids that already carried an attribution. A block
+					// that streamed without one (malformed partial events) has nothing to
+					// correct, and the restore loop above covers un-streamed text.
+					if (!entry.emittedModelMeta.has(blockId)) continue
+					const modelMeta = modelMetaFor(entry.emittedModelMeta, blockId, authoritativeAttribution)
+					if (modelMeta === undefined) continue
+					// Match the correction's update kind to the block's real chunks — a
+					// thinking block corrected as agent_message_chunk would render a
+					// spurious empty agent message on clients keyed by kind. The final
+					// message's content array is index-aligned with the streamed
+					// contentIndexes (the restore loop above relies on the same pairing).
+					const blockKind = msg.content[contentIndex]?.type
+					this.send({
+						sessionId,
+						update: {
+							sessionUpdate: blockKind === "thinking" ? "agent_thought_chunk" : "agent_message_chunk",
+							content: { type: "text", text: "" },
+							messageId: blockId,
+							...spreadModelMeta(modelMeta),
+						},
 					})
 				}
 				const usage = msg.usage
@@ -1735,7 +1789,13 @@ export class KimchiAcpAgent implements Agent {
 					},
 				})
 			} else if (msg.role === "assistant") {
-				this.replayAssistantBlocks(sessionId, msg.content, toolResults, this.sessions.get(sessionId))
+				this.replayAssistantBlocks(
+					sessionId,
+					msg.content,
+					toolResults,
+					this.sessions.get(sessionId),
+					modelAttributionFrom(msg),
+				)
 			}
 			// toolResult: handled inline alongside its originating toolCall above.
 		}
@@ -1799,6 +1859,7 @@ export class KimchiAcpAgent implements Agent {
 		content: AssistantMessage["content"],
 		toolResults: Map<string, ReplayToolResult>,
 		record: SessionRecord | undefined,
+		attribution: ModelAttribution,
 	): void {
 		if (!Array.isArray(content)) return
 		// Allocates a fresh session-unique messageId for every emitted chunk
@@ -1817,12 +1878,14 @@ export class KimchiAcpAgent implements Agent {
 		const flushText = () => {
 			if (textBuffer.length === 0) return
 			const messageId = nextMessageId()
+			const modelMeta = modelMetaFor(record?.emittedModelMeta, messageId, attribution)
 			this.send({
 				sessionId,
 				update: {
 					sessionUpdate: "agent_message_chunk",
 					content: { type: "text", text: textBuffer },
 					...(messageId !== undefined ? { messageId } : {}),
+					...spreadModelMeta(modelMeta),
 				},
 			})
 			textBuffer = ""
@@ -1839,12 +1902,14 @@ export class KimchiAcpAgent implements Agent {
 					} else if (part.kind === "thinking") {
 						flushText()
 						const messageId = nextMessageId()
+						const modelMeta = modelMetaFor(record?.emittedModelMeta, messageId, attribution)
 						this.send({
 							sessionId,
 							update: {
 								sessionUpdate: "agent_thought_chunk",
 								content: { type: "text", text: part.text },
 								...(messageId !== undefined ? { messageId } : {}),
+								...spreadModelMeta(modelMeta),
 							},
 						})
 					}
@@ -1857,12 +1922,14 @@ export class KimchiAcpAgent implements Agent {
 				// payload only matters for multi-turn provider continuity.
 				if (redacted || typeof thinking !== "string" || thinking.length === 0) continue
 				const messageId = nextMessageId()
+				const modelMeta = modelMetaFor(record?.emittedModelMeta, messageId, attribution)
 				this.send({
 					sessionId,
 					update: {
 						sessionUpdate: "agent_thought_chunk",
 						content: { type: "text", text: stripAnsi(thinking) },
 						...(messageId !== undefined ? { messageId } : {}),
+						...spreadModelMeta(modelMeta),
 					},
 				})
 			} else if (b.type === "toolCall") {
