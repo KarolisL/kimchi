@@ -407,11 +407,15 @@ async function writeChatCompletion(res: ServerResponse, script: FakeResponseScri
 	// Substitute dynamic ids from previous tool results into scripted tool args.
 	const fermentId = extractFermentId(body)
 	const agentId = extractAgentId(body)
+	const bashHandles = extractBashHandles(body)
 	const firstMcpTool = extractFirstMcpTool(body)
 	for (const toolCall of script.toolCalls ?? []) {
 		const fn = { ...toolCall.function }
 		if (fermentId) fn.arguments = fn.arguments.replaceAll("__FERMENT_ID__", fermentId)
 		if (agentId) fn.arguments = fn.arguments.replaceAll("__AGENT_ID__", agentId)
+		// Most recent handle first, the one before it second (cohort tests).
+		if (bashHandles[0]) fn.arguments = fn.arguments.replaceAll("__BASH_HANDLE__", bashHandles[0])
+		if (bashHandles[1]) fn.arguments = fn.arguments.replaceAll("__BASH_HANDLE_2__", bashHandles[1])
 		if (firstMcpTool) fn.arguments = fn.arguments.replaceAll("__MCP_FIRST_TOOL__", firstMcpTool)
 		chunk([
 			{
@@ -465,6 +469,26 @@ async function writeChatCompletion(res: ServerResponse, script: FakeResponseScri
 	}
 	res.write("data: [DONE]\n\n")
 	res.end()
+}
+
+/** Pull the background bash process handle from a prior bash tool result. */
+function extractBashHandles(body: unknown): string[] {
+	const messages = asRecord(body).messages
+	if (!Array.isArray(messages)) return []
+	// Distinct handles, most recent first: __BASH_HANDLE__ is the latest,
+	// __BASH_HANDLE_2__ the one before it (multi-process cohort tests).
+	const handles: string[] = []
+	for (const message of [...messages].reverse()) {
+		const record = asRecord(message)
+		if (record.role !== "tool") continue
+		const text = readMessageContent(record.content)
+		// The background bash result carries the handle identity in its
+		// facts block (` handle: <uuid>`).
+		for (const match of text.matchAll(/ handle: ([0-9a-fA-F-]{8,})/g)) {
+			if (match[1] && !handles.includes(match[1])) handles.push(match[1])
+		}
+	}
+	return handles
 }
 
 /** Pull the ferment id the host put in the scoping nudge (`ferment_id: "<uuid>"`). */

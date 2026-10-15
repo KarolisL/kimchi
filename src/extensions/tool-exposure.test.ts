@@ -620,7 +620,7 @@ describe("tool exposure at session start", () => {
 		expect(harness.active.has("bash_control"), "bash_control visible from session start").toBe(true)
 		const transitionsAtStart = harness.activeTransitions.length
 
-		// Background handles close the gate but must not change the advertised
+		// Background handles must not change the advertised
 		// tool set (cache-stable surface).
 		await harness.fireEvent("tool_result", {
 			toolName: "bash",
@@ -628,7 +628,7 @@ describe("tool exposure at session start", () => {
 			input: { command: "long build" },
 			content: [{ type: "text", text: "still running" }],
 			isError: false,
-			details: { handle: "h1", checkin: true, exited: false },
+			details: { handle: "h1", handoff: true, exited: false },
 		})
 		expect(harness.active.has("bash_control")).toBe(true)
 		expect(harness.activeTransitions.length).toBe(transitionsAtStart)

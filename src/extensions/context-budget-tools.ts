@@ -24,11 +24,6 @@ import {
 	type ExtensionAPI,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent"
-// Import order is load-bearing: resources/definitions.ts embeds
-// DEFAULT_BASH_TIMEOUT_SECONDS in a description at module scope, so a headless
-// import of bash-control/agents/questionnaire must see the timeout module already
-// initialized (otherwise TDZ ReferenceError).
-import "./bash-default-timeout.js"
 import { AGENT_CONTINUATION_TOOL_NAMES } from "./agents/index.js"
 import bashControlExtension from "./bash-background/bash-control-extension.js"
 import { createLayer1Tools, createLayer2Tools, type DapToolDeps } from "./dap/tools.js"
@@ -179,7 +174,7 @@ async function measureBuiltinTools(out: Map<string, ToolSurfaceEntry>): Promise<
 	// `session_start`; capture it here rather than via EXTENSION_SOURCES so its
 	// tool appears alongside builtins/dap in deterministic order.
 	const { api: bashControlApi, tools: bashTools, fire: fireBashControl } = createCaptureApi()
-	bashControlExtension(bashControlApi as never)
+	bashControlExtension(bashControlApi as never, { getState: () => undefined })
 	await fireBashControl("session_start")
 	for (const tool of bashTools.values()) {
 		out.set(tool.name, entry("extension:bash-control", tool))

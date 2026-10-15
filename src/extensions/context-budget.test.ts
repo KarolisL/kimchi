@@ -75,15 +75,17 @@ const BUDGET = {
 	/** Total canonical tool surface (18 tools after the DAP entry/session and
 	 *  Agent-continuation deferrals, the Skill resource gate, the mcp
 	 *  zero-server registration gate, and the lsp no-server detection gate;
-	 *  ~5% headroom over measured). Dev
+	 *  Includes the redesigned bash_control schema; ~2% headroom over
+	 *  measured 5623). Dev
 	 *  sessions in a repo WITH a detected language server will exceed this by
 	 *  the five gated lsp_* tools — that is by design, see LSP_TOOL_NAMES in
 	 *  lsp.ts. */
-	toolSurface: 5470,
+	toolSurface: 5732,
 	/** Print-mode slice (16 tools — the canonical surface minus questionnaire
 	 *  and set_phase, which the registration gates drop in headless --print
-	 *  runs; ~5% headroom over measured). */
-	printToolSurface: 4690,
+	 *  runs; includes the redesigned bash_control schema, with ~1.5%
+	 *  headroom over measured 4880). */
+	printToolSurface: 4952,
 	/** Per-tool cap: any single tool above this many est tokens must be deliberate. */
 	singleTool: 1400,
 }
