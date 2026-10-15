@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
@@ -10,7 +19,6 @@ import { readConfigSetting } from "../../config/settings.js"
 import { savePlanMarkdown } from "../../shared/planning/plan-markdown.js"
 import { createContext } from "../__mocks__/context.js"
 import { createModel, createModelRegistry } from "../__mocks__/model-registry.js"
-import { DEFAULT_CLASSIFIER_CANDIDATE_REFS } from "../model-catalog/classifier-models.js"
 import * as redactionConfig from "../pii-redaction/config.js"
 import { redactTextOrThrow } from "../pii-redaction/redactor.js"
 import { getWorkId, setWorkId } from "../work-attribution.js"
@@ -19,8 +27,12 @@ import {
 	classifyWorkIntent,
 	loadWorkIntents,
 	rememberWorkIntent,
+	WORK_MATCHING_CALL_TIMEOUT_MS,
+	WORK_MATCHING_MODEL_REFS,
 	WorkMatchingLimit,
 	workIntentPath,
+	workMatchingAvailable,
+	workMatchingEnabled,
 } from "./semantic.js"
 import { flushWorkSummaries, readWorkRecords } from "./summary.js"
 
@@ -58,7 +70,14 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function provider(answer: string | string[], status = 200, headers: Record<string, string> = {}) {
+/** Candidate checks run at once, so a reply is chosen by what was asked rather than by arrival order. */
+type Reply = string | { content: string; delay: number; afterHeaders?: boolean }
+type Answer = string | string[] | ((data: Record<string, unknown>) => Reply)
+function byCheck(candidates: Record<string, Reply>, precheck: Reply = JSON.stringify({ decision: "specific" })) {
+	return (data: Record<string, unknown>) =>
+		typeof data.selectedWorkId === "string" ? (candidates[data.selectedWorkId] ?? "{}") : precheck
+}
+async function provider(answer: Answer, status = 200, headers: Record<string, string> = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "kimchi-selected-model-")))
 	roots.push(root)
 	vi.stubEnv("PI_CODING_AGENT_DIR", join(root, "agent"))
@@ -74,10 +93,19 @@ async function provider(answer: string | string[], status = 200, headers: Record
 				(row) => row.type === "request" && row.requestId === request.headers["x-request-id"],
 			),
 		})
-		const content = Array.isArray(answer) ? (answer[requests.length - 1] ?? "{}") : answer
-		const delay = delays[requests.length - 1]
+		const reply =
+			typeof answer === "function"
+				? answer(JSON.parse(JSON.parse(body).messages.at(-1).content))
+				: Array.isArray(answer)
+					? (answer[requests.length - 1] ?? "{}")
+					: answer
+		const content = typeof reply === "string" ? reply : reply.content
+		const delay = typeof reply === "string" ? delays[requests.length - 1] : reply.delay
+		// A stream can also stall after its headers, which the SDK's request timeout no longer covers.
+		const afterHeaders = typeof reply !== "string" && reply.afterHeaders
+		if (afterHeaders) response.writeHead(status, { "content-type": "text/event-stream", ...headers }).flushHeaders()
 		if (delay) await new Promise((resolve) => setTimeout(resolve, delay))
-		response.writeHead(status, { "content-type": "text/event-stream", ...headers })
+		if (!afterHeaders) response.writeHead(status, { "content-type": "text/event-stream", ...headers })
 		response.end(
 			`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n` +
 				`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
@@ -127,28 +155,104 @@ it("uses the selected model without shared classifier models, with normal auth a
 	for (const row of overhead) expect(row.segment).toMatchObject({ attribution: "session", reason: "work-matching" })
 })
 
-it("decides on the shared classifier models in order, the next one answering when a model cannot", async () => {
+it("decides on the matching models in order, the next one answering when a model cannot", async () => {
 	const failing = await provider("{}", 500)
 	const server = await provider([JSON.stringify({ decision: "specific" }), JSON.stringify({ decision: "match" })])
-	const [unauthorized, broken, answering] = DEFAULT_CLASSIFIER_CANDIDATE_REFS.map((ref, index) => {
+	const [broken, answering] = WORK_MATCHING_MODEL_REFS.map((ref, index) => {
 		const [name, id] = ref.split("/")
-		return { ...createModel(id, name), baseUrl: [server, failing, server][index].model.baseUrl }
+		return { ...createModel(id, name), baseUrl: [failing, server][index].model.baseUrl }
 	})
-	const registry = createModelRegistry([server.model, unauthorized, broken, answering])
-	registry.getApiKeyAndHeaders.mockImplementation(async (model) =>
-		model === unauthorized ? { ok: false, error: "No API key" } : { ok: true, apiKey: "classifier-key" },
-	)
+	// Permission classifier models that are not matching models never decide.
+	const permissionOnly = createModel("minimax-m3", "kimchi-dev")
+	const registry = createModelRegistry([server.model, permissionOnly, broken, answering])
+	registry.getApiKeyAndHeaders.mockResolvedValue({ ok: true, apiKey: "classifier-key" })
 	const ctx = createContext({ cwd: server.root, model: server.model, modelRegistry: registry })
 	expect(await classifyWorkIntent(ctx, input)).toEqual({
 		decision: "continue",
 		workId,
-		model: DEFAULT_CLASSIFIER_CANDIDATE_REFS[2],
+		model: WORK_MATCHING_MODEL_REFS[1],
 	})
-	expect(registry.getApiKeyAndHeaders.mock.calls.map(([model]) => model)).toEqual([unauthorized, broken, answering])
+	expect(registry.getApiKeyAndHeaders.mock.calls.map(([model]) => model)).toEqual([broken, answering])
 	expect(failing.requests).toHaveLength(1)
 	expect(server.requests.map((request) => JSON.parse(request.body).model)).toEqual([answering.id, answering.id])
 	const overhead = readWorkRecords(join(server.root, "agent")).filter((row) => row.type === "request")
 	expect(overhead.map((row) => row.model)).toEqual([broken.id, answering.id, answering.id])
+})
+
+it("lets the next matching model decide when a check's stream stalls after its headers", async () => {
+	const stalled = await provider(
+		byCheck({}, { content: JSON.stringify({ decision: "specific" }), delay: 6000, afterHeaders: true }),
+	)
+	const server = await provider(byCheck({ [workId]: JSON.stringify({ decision: "match" }) }))
+	const [first, second] = WORK_MATCHING_MODEL_REFS.map((ref, index) => {
+		const [name, id] = ref.split("/")
+		return { ...createModel(id, name), baseUrl: [stalled, server][index].model.baseUrl }
+	})
+	const registry = createModelRegistry([server.model, first, second])
+	registry.getApiKeyAndHeaders.mockResolvedValue({ ok: true, apiKey: "classifier-key" })
+	const ctx = createContext({ cwd: server.root, model: server.model, modelRegistry: registry })
+	const started = Date.now()
+	expect(await classifyWorkIntent(ctx, input)).toEqual({
+		decision: "continue",
+		workId,
+		model: WORK_MATCHING_MODEL_REFS[1],
+	})
+	expect(Date.now() - started).toBeLessThan(WORK_MATCHING_CALL_TIMEOUT_MS + 1500)
+	expect(stalled.requests).toHaveLength(1)
+})
+
+it("gives the last matching model the rest of the deadline, with no model left to hand over to", async () => {
+	const failing = await provider("{}", 500)
+	const slow = await provider(
+		byCheck({
+			[workId]: {
+				content: JSON.stringify({ decision: "match" }),
+				delay: WORK_MATCHING_CALL_TIMEOUT_MS + 500,
+				afterHeaders: true,
+			},
+		}),
+	)
+	const [broken, last] = WORK_MATCHING_MODEL_REFS.map((ref, index) => {
+		const [name, id] = ref.split("/")
+		return { ...createModel(id, name), baseUrl: [failing, slow][index].model.baseUrl }
+	})
+	const registry = createModelRegistry([slow.model, broken, last])
+	registry.getApiKeyAndHeaders.mockResolvedValue({ ok: true, apiKey: "classifier-key" })
+	const ctx = createContext({ cwd: slow.root, model: slow.model, modelRegistry: registry })
+	expect(await classifyWorkIntent(ctx, input)).toEqual({
+		decision: "continue",
+		workId,
+		model: WORK_MATCHING_MODEL_REFS[1],
+	})
+})
+
+it("never sends a check through backend-routed auto", async () => {
+	const server = await provider(JSON.stringify({ decision: "specific" }))
+	const auto = { ...createModel("auto", "kimchi-dev"), baseUrl: server.model.baseUrl }
+	const ctx = createContext({ cwd: server.root, model: auto, modelRegistry: createModelRegistry([auto]) })
+	expect(workMatchingAvailable(ctx.modelRegistry, auto)).toBe(false)
+	expect(await classifyWorkIntent(ctx, input)).toBeUndefined()
+	expect(server.requests).toHaveLength(0)
+})
+
+it("is on by default only where a matching model can decide", () => {
+	const [provider, id] = WORK_MATCHING_MODEL_REFS[0].split("/")
+	const selected = createModel("chat", "selected")
+	const shared = createModelRegistry([createModel(id, provider)])
+	const own = createModelRegistry([selected])
+	const permissionOnly = createModelRegistry([createModel("minimax-m3", "kimchi-dev")])
+	vi.mocked(readConfigSetting).mockReturnValue(undefined)
+	expect([
+		workMatchingEnabled(),
+		workMatchingAvailable(shared, selected),
+		workMatchingAvailable(own, selected),
+		workMatchingAvailable(permissionOnly, selected),
+	]).toEqual([true, true, false, false])
+	// Matching on the selected model, which another provider may bill, needs /work matching on.
+	vi.mocked(readConfigSetting).mockReturnValue(true)
+	expect(workMatchingAvailable(own, selected)).toBe(true)
+	vi.mocked(readConfigSetting).mockReturnValue(false)
+	expect([workMatchingEnabled(), workMatchingAvailable(shared, selected)]).toEqual([false, false])
 })
 
 it("does not authenticate or send private task history when matching is disabled", async () => {
@@ -267,8 +371,8 @@ it("does not call auth or inference without history or a selected model", async 
 it("bounds stalled authentication by the shared deadline", async () => {
 	const server = await provider("{}")
 	vi.mocked(server.registry.getApiKeyAndHeaders).mockImplementation(() => new Promise(() => {}))
-	const pending = classifyWorkIntent(server.ctx, input)
-	expect(await pending).toMatchObject({ decision: "unknown" })
+	const pending = classifyWorkIntent(server.ctx, input, undefined, undefined, 200)
+	expect(await pending).toMatchObject({ decision: "unknown", cause: "timeout" })
 	expect(server.requests).toHaveLength(0)
 })
 
@@ -315,22 +419,38 @@ const otherCandidate = { workId: "20000000-0000-4000-8000-000000000002", summary
 
 it("requires every other candidate to be ruled out before adopting one match", async () => {
 	const candidates = [...input.candidates, otherCandidate]
-	const server = await provider([
-		JSON.stringify({ decision: "specific" }),
-		JSON.stringify({ decision: "match" }),
-		JSON.stringify({ decision: "different" }),
-	])
+	const server = await provider(
+		byCheck({
+			[workId]: JSON.stringify({ decision: "match" }),
+			[otherCandidate.workId]: JSON.stringify({ decision: "different" }),
+		}),
+	)
 	expect(await classifyWorkIntent(server.ctx, { ...input, candidates })).toMatchObject({
 		decision: "continue",
 		workId,
 	})
 	expect(server.requests).toHaveLength(3)
-	for (const [index, candidate] of candidates.entries()) {
-		const checked = JSON.parse(JSON.parse(server.requests[index + 1].body).messages.at(-1).content)
-		expect(checked).toEqual({ ...input, candidates, selectedWorkId: candidate.workId })
-	}
-	const precheck = JSON.parse(JSON.parse(server.requests[0].body).messages.at(-1).content)
-	expect(precheck).toEqual({ message: input.message })
+	const sent = server.requests.map((request) => JSON.parse(JSON.parse(request.body).messages.at(-1).content))
+	expect(sent[0]).toEqual({ message: input.message })
+	// Each request carries only the task it checks, so history size cannot crowd out the message.
+	for (const candidate of candidates)
+		expect(sent).toContainEqual({
+			current: null,
+			candidates: [candidate],
+			message: input.message,
+			selectedWorkId: candidate.workId,
+		})
+})
+
+it("checks every saved task at once, within one deadline", async () => {
+	const candidates = [...input.candidates, otherCandidate]
+	const slow = (decision: string) => ({ content: JSON.stringify({ decision }), delay: 600 })
+	const server = await provider(byCheck({ [workId]: slow("match"), [otherCandidate.workId]: slow("different") }))
+	// One after the other, the two 600 ms checks would overrun the 1,000 ms deadline.
+	expect(await classifyWorkIntent(server.ctx, { ...input, candidates }, undefined, undefined, 1000)).toMatchObject({
+		decision: "continue",
+		workId,
+	})
 })
 
 it.each([
@@ -346,23 +466,21 @@ it.each([
 })
 
 it.each(["match", "unknown"])("does not adopt when another candidate is %s", async (decision) => {
-	const server = await provider([
-		JSON.stringify({ decision: "specific" }),
-		JSON.stringify({ decision: "match" }),
-		JSON.stringify({ decision }),
-	])
-	expect(
-		await classifyWorkIntent(server.ctx, { ...input, candidates: [...input.candidates, otherCandidate] }),
-	).toMatchObject({ decision: "unknown" })
+	const server = await provider(
+		byCheck({
+			[workId]: JSON.stringify({ decision: "match" }),
+			[otherCandidate.workId]: JSON.stringify({ decision }),
+		}),
+	)
+	const result = await classifyWorkIntent(server.ctx, { ...input, candidates: [...input.candidates, otherCandidate] })
+	// Ambiguity is the model's verdict, not a failure that falls back to session attribution.
+	expect(result).toEqual({ decision: "unknown", model: "selected/chat" })
 	expect(server.requests).toHaveLength(3)
 })
 
 it("returns new only when every candidate is different", async () => {
-	const server = await provider([
-		JSON.stringify({ decision: "specific" }),
-		JSON.stringify({ decision: "different" }),
-		JSON.stringify({ decision: "different" }),
-	])
+	const different = JSON.stringify({ decision: "different" })
+	const server = await provider(byCheck({ [workId]: different, [otherCandidate.workId]: different }))
 	expect(
 		await classifyWorkIntent(server.ctx, { ...input, candidates: [...input.candidates, otherCandidate] }),
 	).toMatchObject({ decision: "new" })
@@ -396,23 +514,32 @@ it("preserves the original context after ruling out the current task", async () 
 	expect(checked).toEqual({ ...input, current, selectedWorkId: workId })
 })
 
-it("shares one deadline across all candidate checks", async () => {
-	const server = await provider([
-		JSON.stringify({ decision: "specific" }),
-		JSON.stringify({ decision: "match" }),
-		JSON.stringify({ decision: "different" }),
-	])
-	server.delays.push(0, 1700, 1700)
+it("reports a timeout when one candidate check outlasts the shared deadline", async () => {
+	const server = await provider(
+		byCheck({
+			[workId]: JSON.stringify({ decision: "match" }),
+			[otherCandidate.workId]: { content: JSON.stringify({ decision: "different" }), delay: 1500 },
+		}),
+	)
 	expect(
-		await classifyWorkIntent(server.ctx, { ...input, candidates: [...input.candidates, otherCandidate] }),
-	).toMatchObject({ decision: "unknown" })
+		await classifyWorkIntent(
+			server.ctx,
+			{ ...input, candidates: [...input.candidates, otherCandidate] },
+			undefined,
+			undefined,
+			500,
+		),
+	).toEqual({ decision: "unknown", model: "selected/chat", cause: "timeout" })
 	expect(server.requests).toHaveLength(3)
 })
 
 it("shares one deadline between the message precheck and candidate matching", async () => {
 	const server = await provider([JSON.stringify({ decision: "specific" }), JSON.stringify({ decision: "match" })])
-	server.delays.push(1700, 1700)
-	expect(await classifyWorkIntent(server.ctx, input)).toMatchObject({ decision: "unknown" })
+	server.delays.push(400, 400)
+	expect(await classifyWorkIntent(server.ctx, input, undefined, undefined, 600)).toMatchObject({
+		decision: "unknown",
+		cause: "timeout",
+	})
 	expect(server.requests).toHaveLength(2)
 })
 
@@ -481,7 +608,11 @@ it("requests JSON from a selected Kimchi model without loosening decision parsin
 
 it("does not persist or return malformed provider content", async () => {
 	const server = await provider("x".repeat(70000))
-	expect(await classifyWorkIntent(server.ctx, input)).toEqual({ decision: "unknown", model: "selected/chat" })
+	expect(await classifyWorkIntent(server.ctx, input)).toEqual({
+		decision: "unknown",
+		model: "selected/chat",
+		cause: "failed",
+	})
 })
 
 function repositoryFixture() {
@@ -618,18 +749,35 @@ it("compares saved tasks beyond 256 work directories without saved task text", a
 	expect(loaded.input.candidates).toEqual([{ workId, summary: "CSV export" }])
 })
 
-it("refuses an incomplete scan of more than 256 saved tasks", async () => {
+it("compares the repository's most recently active saved tasks, newest first", async () => {
 	const { root, cwd } = repositoryFixture()
-	for (let index = 0; index < 257; index++) {
+	const ids = Array.from({ length: 10 }, (_, index) => `30000000-0000-4000-8000-${String(index).padStart(12, "0")}`)
+	for (const [index, id] of ids.entries()) {
+		await rememberWorkIntent(cwd, id, `Task ${index}`)
+		// A work's summary is rewritten whenever it records something; its age orders the history.
+		const summary = join(root, "agent", "work", id, "work.json")
+		writeFileSync(summary, "{}")
+		utimesSync(summary, 1_700_000_000 + index, 1_700_000_000 + index)
+	}
+	const loaded = await loadWorkIntents(cwd, currentId, input.message, true)
+	expect(loaded.input.candidates.map((candidate) => candidate.summary)).toEqual(
+		[9, 8, 7, 6, 5, 4, 3, 2].map((index) => `Task ${index}`),
+	)
+})
+
+it("leaves older history out instead of refusing to match", async () => {
+	const { root, cwd } = repositoryFixture()
+	await rememberWorkIntent(cwd, workId, "CSV export")
+	for (let index = 0; index < 520; index++) {
 		const id = `30000000-0000-4000-8000-${String(index).padStart(12, "0")}`
 		mkdirSync(join(root, "agent", "work", id), { recursive: true })
-		// Saved task text from any repository counts: each one is read to find this repository's tasks.
 		writeFileSync(
 			workIntentPath(id),
 			JSON.stringify({ version: 2, workId: id, repository: "/elsewhere/.git", summary: "Other repository task" }),
 		)
 	}
-	await expect(loadWorkIntents(cwd, currentId, input.message, true)).rejects.toThrow(
-		"more than 256 saved tasks to compare",
-	)
+	utimesSync(workIntentPath(workId), 1_700_000_000, 1_700_000_000)
+	const loaded = await loadWorkIntents(cwd, currentId, input.message, true)
+	// 520 newer tasks from other repositories exceed the scan, so the old CSV task is not compared.
+	expect(loaded.input.candidates).toEqual([])
 })
