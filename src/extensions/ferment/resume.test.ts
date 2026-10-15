@@ -18,15 +18,19 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { fetchOrgPolicy } from "../../api/org-settings.js"
 import { FermentEventStore } from "../../ferment/event-store.js"
 import { clearFermentCache } from "../../ferment/store.js"
+import { resetOrgPolicyForTests } from "../../org-policy.js"
 import { createCommandContext, createContext } from "../__mocks__/context.js"
 import { createMiniEventBus } from "../__mocks__/mini-event-bus.js"
+import { seedOrgPolicy } from "../__mocks__/org-policy.js"
 import * as diagnostics from "../work-attribution/diagnostics.js"
 import { flushWorkSummaries } from "../work-attribution/summary.js"
 import { getWorkId, recordProviderRequest, setWorkId } from "../work-attribution.js"
 import { FermentCommandController } from "./commands.js"
 import { FERMENT_EVENTS } from "./domain-events.js"
+import { FERMENT_PLAN_ONLY_MESSAGE } from "./elevation-gate.js"
 import { maybeInjectScopingStopNudge, resetAllScopingStopNudgeCounts } from "./nudge.js"
 import {
 	deletePendingProposal,
@@ -43,6 +47,10 @@ import { clearAllPendingScopes, setPendingScope } from "./scoping.js"
 import { confirmPendingScope } from "./scoping-confirmation.js"
 import { clearAllScopingGates, clearAllStepStarts, setActive, setRuntimeStatePersistRoot } from "./state.js"
 import { createApplyAndPersist } from "./tool-helpers.js"
+
+vi.mock("../../api/org-settings.js", () => ({
+	fetchOrgPolicy: vi.fn(),
+}))
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
 
@@ -127,6 +135,8 @@ beforeEach(() => {
 
 afterEach(async () => {
 	await flushWorkSummaries()
+	resetOrgPolicyForTests()
+	vi.mocked(fetchOrgPolicy).mockReset()
 	clearFermentCache()
 	clearAllStepStarts()
 	clearAllScopingGates()
@@ -142,6 +152,42 @@ afterEach(async () => {
 	} else {
 		process.env.KIMCHI_FERMENTS_DIR = prevFermentsDir
 	}
+})
+
+describe("resumeFerment org-policy gate", () => {
+	it("headless resume refuses a paused ferment under a plan-only policy instead of activating it", async () => {
+		const draft = h.eventStorage.create("Plan Only Headless", undefined, process.cwd())
+		const apply = createApplyAndPersist(h.runtime)
+		const scoped = apply(draft.id, {
+			type: "scope",
+			title: "Plan Only Headless",
+			goal: "g",
+			successCriteria: ["c"],
+			constraints: [],
+			assumptions: "a",
+			phases: SAMPLE_PHASES,
+		})
+		expect(scoped.ok).toBe(true)
+		if (!scoped.ok) throw new Error(scoped.error.message)
+		const activated = apply(draft.id, { type: "activate_phase", phaseId: scoped.ferment.phases[0].id })
+		expect(activated.ok).toBe(true)
+		const paused = apply(draft.id, { type: "pause" })
+		expect(paused.ok).toBe(true)
+
+		await seedOrgPolicy({ plan: true, default: false, auto: false, yolo: false })
+		const notify = vi.fn()
+		await resumeFerment(
+			h.pi,
+			draft.id,
+			{ hasUI: false, cwd: process.cwd(), ui: { notify } } as unknown as ExtensionCommandContext,
+			h.runtime,
+		)
+
+		// Refused: still paused, no wake-up, no actionable hidden message.
+		expect(h.eventStorage.get(draft.id)?.status).toBe("paused")
+		expect(actionableHidden(h.sentMessages)).toHaveLength(0)
+		expect(notify).toHaveBeenCalledWith(FERMENT_PLAN_ONLY_MESSAGE, "warning")
+	})
 })
 
 const hasUIContext = (): ExtensionCommandContext =>
@@ -338,7 +384,7 @@ describe("resumeFerment planned state", () => {
 })
 
 describe("resumeFerment running state", () => {
-	it("paused ferment that resumes to running sends one continuation nudge with the resume imperative and next action", () => {
+	it("paused ferment that resumes to running sends one continuation nudge with the resume imperative and next action", async () => {
 		const draft = h.eventStorage.create("Paused Then Running", undefined, process.cwd())
 		h.runtime.setActive(draft)
 
@@ -368,7 +414,7 @@ describe("resumeFerment running state", () => {
 		if (!paused.ok) throw new Error(paused.error.message)
 		expect(paused.ferment.status).toBe("paused")
 
-		resumeFerment(h.pi, draft.id, hasUIContext(), h.runtime)
+		await resumeFerment(h.pi, draft.id, hasUIContext(), h.runtime)
 
 		// After resume, status should be running.
 		const running = h.eventStorage.get(draft.id)
@@ -394,7 +440,7 @@ describe("resumeFerment running state", () => {
 })
 
 describe("resumeFerment still-paused state", () => {
-	it("a failed resume attempt sends the paused notice and no actionable hidden message", () => {
+	it("a failed resume attempt sends the paused notice and no actionable hidden message", async () => {
 		const draft = h.eventStorage.create("Stays Paused", undefined, process.cwd())
 		h.runtime.setActive(draft)
 
@@ -436,7 +482,7 @@ describe("resumeFerment still-paused state", () => {
 			reason: "exhausted",
 		})
 
-		resumeFerment(h.pi, draft.id, hasUIContext(), h.runtime)
+		await resumeFerment(h.pi, draft.id, hasUIContext(), h.runtime)
 
 		// Resume contract: no actionable hidden message is sent.
 		expect(actionableHidden(h.sentMessages)).toHaveLength(0)

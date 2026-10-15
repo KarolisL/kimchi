@@ -112,8 +112,12 @@ import { createSessionModeOnboardingForStartup } from "./extensions/onboarding/s
 import { applyRoleAugmentation } from "./extensions/orchestration/model-roles.js"
 import orphanToolResultSanitizerExtension from "./extensions/orphan-tool-result-sanitizer.js"
 import packageInstallGuardExtension from "./extensions/package-install-guard.js"
+import { loadConfig as loadPermissionsConfig } from "./extensions/permissions/config.js"
+import { PERMISSIONS_ENV_KEY } from "./extensions/permissions/constants.js"
 import permissionsExtension from "./extensions/permissions/index.js"
 import { writeKimchiKeybindingDefaults } from "./extensions/permissions/keybindings.js"
+import { flagModeFromOptions, resolveMode } from "./extensions/permissions/mode.js"
+import { clampMode } from "./extensions/permissions/policy.js"
 import { installPiNativeCompatibilityShim } from "./extensions/pi-package-lookup/native-compat.js"
 import piiRedactionExtension from "./extensions/pii-redaction/index.js"
 import plannotatorExtension from "./extensions/plannotator/index.js"
@@ -390,6 +394,32 @@ try {
 		// --print sessions. The ferment-oneshot argv scan is the load-bearing
 		// composition: a headless one-shot planner still needs the suite.
 		setPrintGate(hasPrintFlag(originalArgs), hasFermentOneshotArg(originalArgs))
+
+		// Org policy: a headless one-shot ferment needs an execution mode
+		// (auto/yolo). Refuse — falling back to a plain print session — unless the
+		// EFFECTIVE (post-clamp) permission mode is an allowed high mode, whatever
+		// its origin: an argv flag, the KIMCHI_PERMISSIONS env default, or the
+		// merged permissions config default (same resolution the session applies,
+		// through the shared flag→mode mapping).
+		if (hasFermentOneshotArg(originalArgs)) {
+			const cliOptions = getParsedCliArgs().options
+			const configPath =
+				typeof cliOptions["permissions-config"] === "string" ? cliOptions["permissions-config"] : undefined
+			const requested = resolveMode({
+				flag: flagModeFromOptions(cliOptions),
+				env: process.env[PERMISSIONS_ENV_KEY],
+				// Trust-aware: project/local config files only count once the
+				// pre-main trust priming above has run.
+				config: loadPermissionsConfig({ cwd: process.cwd(), cliConfigPath: configPath }).loaded.config.defaultMode,
+			}).mode
+			const effective = clampMode(requested)
+			if (effective !== "auto" && effective !== "yolo") {
+				setPrintGate(hasPrintFlag(originalArgs), false)
+				console.error(
+					"ferment-oneshot: refused — your organization's policy does not allow an execution mode for ferment. Pass --auto or --yolo (when allowed) to run a headless one-shot ferment.",
+				)
+			}
+		}
 
 		// Pre-main trust was primed above, before subcommand dispatch; re-prime
 		// is unnecessary (idempotent) but loadConfig below depends on it.

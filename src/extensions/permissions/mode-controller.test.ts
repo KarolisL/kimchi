@@ -1,15 +1,51 @@
-import { describe, expect, it } from "vitest"
+import type { CustomEntry } from "@earendil-works/pi-coding-agent"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { type AllowedPermissionModes, fetchOrgPolicy } from "../../api/org-settings.js"
+import { resetOrgPolicyForTests } from "../../org-policy.js"
+import { seedOrgPolicy } from "../__mocks__/org-policy.js"
+import { PARENT_SESSION_ID_ENV_KEY } from "../agents/manager/constants.js"
+import type { LoadedConfig } from "./config.js"
 import { PERMISSION_MODE_SESSION_ENTRY_TYPE } from "./mode.js"
-import { getPersistedPermissionMode, persistPermissionModeIfChanged } from "./mode-controller.js"
+import {
+	clearPermissionModeEnv,
+	createSessionPermissionFlagController,
+	getPermissionMode,
+	getPersistedPermissionMode,
+	persistPermissionModeIfChanged,
+	resolveInitialPermissionMode,
+	setPermissionMode,
+} from "./mode-controller.js"
 import type { PermissionMode, PermissionModeState } from "./types.js"
 
-function makeEntries(modes: PermissionMode[]): Array<{
-	type: "custom"
-	customType: string
-	data: PermissionModeState
-}> {
-	return modes.map((mode) => ({
+vi.mock("../../api/org-settings.js", () => ({
+	fetchOrgPolicy: vi.fn(),
+}))
+
+const mockedFetchOrgPolicy = vi.mocked(fetchOrgPolicy)
+
+const TEST_CONFIG: LoadedConfig = {
+	config: { defaultMode: "default", allow: [], deny: [], classifierTimeoutMs: 8000, classifierMaxTotalMs: 25_000 },
+	allowBySource: { user: [], project: [], local: [], cli: [] },
+	denyBySource: { user: [], project: [], local: [], cli: [] },
+	paths: {},
+}
+
+/** Install a policy in the holder through the public API (mocked fetch, throwaway cache file — never the real ~/.config one). */
+async function allowModes(modes: AllowedPermissionModes) {
+	await seedOrgPolicy(modes)
+}
+
+afterEach(() => {
+	resetOrgPolicyForTests()
+	mockedFetchOrgPolicy.mockReset()
+})
+
+function makeEntries(modes: PermissionMode[]): CustomEntry[] {
+	return modes.map((mode, i) => ({
 		type: "custom",
+		id: `mode-entry-${i}`,
+		parentId: null,
+		timestamp: "2026-01-01T00:00:00.000Z",
 		customType: PERMISSION_MODE_SESSION_ENTRY_TYPE,
 		data: { mode, source: "runtime", initiatedBy: "user" },
 	}))
@@ -17,8 +53,7 @@ function makeEntries(modes: PermissionMode[]): Array<{
 
 function makeSessionManager(modes: PermissionMode[]) {
 	return {
-		getEntries: () =>
-			makeEntries(modes) as unknown as ReturnType<Parameters<typeof getPersistedPermissionMode>[0]["getEntries"]>,
+		getEntries: () => makeEntries(modes),
 	}
 }
 
@@ -259,5 +294,76 @@ describe("persistPermissionModeIfChanged", () => {
 
 		expect(written).toBe(true)
 		expect(appended).toEqual([{ mode: "yolo", source: "runtime", initiatedBy: "user" }])
+	})
+})
+
+describe("org-policy mode clamping", () => {
+	// Hermetic: the harness may leak its own KIMCHI_PARENT_SESSION_ID +
+	// KIMCHI_PERMISSIONS_<parent> into the process env, which the resolution
+	// chain would otherwise treat as an inherited runtime mode.
+	const savedParentSessionId = process.env[PARENT_SESSION_ID_ENV_KEY]
+	beforeEach(() => {
+		delete process.env[PARENT_SESSION_ID_ENV_KEY]
+		clearPermissionModeEnv("sess-clamp")
+	})
+	afterEach(() => {
+		if (savedParentSessionId !== undefined) process.env[PARENT_SESSION_ID_ENV_KEY] = savedParentSessionId
+	})
+
+	function sessionManagerWith(modes: PermissionMode[]) {
+		return {
+			getSessionId: () => "sess-clamp",
+			getEntries: () => makeEntries(modes),
+		}
+	}
+
+	it("clamps a disallowed CLI flag to the nearest allowed mode, keeping its source", async () => {
+		await allowModes({ plan: true, default: true, auto: false, yolo: false })
+		const resolved = resolveInitialPermissionMode(sessionManagerWith([]), undefined, "yolo", TEST_CONFIG)
+		expect(resolved.mode).toBe("default")
+		expect(resolved.source).toBe("flag")
+	})
+
+	it("keeps an allowed CLI flag untouched", async () => {
+		await allowModes({ plan: true, default: false, auto: true, yolo: false })
+		const resolved = resolveInitialPermissionMode(sessionManagerWith([]), undefined, "auto", TEST_CONFIG)
+		expect(resolved.mode).toBe("auto")
+	})
+
+	it("clamps a disallowed persisted mode on resume", async () => {
+		await allowModes({ plan: true, default: false, auto: false, yolo: false })
+		const resolved = resolveInitialPermissionMode(sessionManagerWith(["yolo"]), undefined, undefined, TEST_CONFIG)
+		expect(resolved.mode).toBe("plan")
+	})
+
+	it("falls back to the most restrictive allowed mode for low-mode-less policies", async () => {
+		await allowModes({ plan: false, default: false, auto: true, yolo: false })
+		const resolved = resolveInitialPermissionMode(sessionManagerWith([]), undefined, "default", TEST_CONFIG)
+		expect(resolved.mode).toBe("auto")
+	})
+
+	it("never applies a disallowed mode through the session controller", async () => {
+		await allowModes({ plan: true, default: true, auto: false, yolo: false })
+		const controller = createSessionPermissionFlagController({
+			mode: { mode: "default", source: "runtime", initiatedBy: "user" },
+		})
+		controller.setMode({ mode: "yolo", source: "runtime", initiatedBy: "user" })
+		expect(controller.getMode().mode).toBe("default")
+		controller.setMode({ mode: "plan", source: "runtime", initiatedBy: "user" })
+		expect(controller.getMode().mode).toBe("plan")
+	})
+
+	it("clamps the env record written by setPermissionMode", async () => {
+		await allowModes({ plan: true, default: true, auto: false, yolo: false })
+		const sessionId = "sess-env-clamp"
+		setPermissionMode(sessionId, { mode: "yolo", source: "runtime", initiatedBy: "user" })
+		expect(getPermissionMode(sessionId)?.mode).toBe("default")
+		clearPermissionModeEnv(sessionId)
+	})
+
+	it("leaves everything allowed when no policy is set (fail open)", async () => {
+		await seedOrgPolicy(undefined)
+		const resolved = resolveInitialPermissionMode(sessionManagerWith([]), undefined, "yolo", TEST_CONFIG)
+		expect(resolved.mode).toBe("yolo")
 	})
 })
