@@ -81,7 +81,6 @@ function command(cwd: string, args: string) {
 describe("Jira issue keys", () => {
 	it.each([
 		["ABC-123", "ABC-123"],
-		["A-1", "A-1"],
 		["MY_PROJ2-10", "MY_PROJ2-10"],
 		// Lowercase letters are uppercased; the saved and shown key is the uppercase one.
 		["abc-123", "ABC-123"],
@@ -94,6 +93,8 @@ describe("Jira issue keys", () => {
 
 	it.each([
 		"",
+		// Jira project keys have at least two characters.
+		"A-1",
 		"ABC",
 		"ABC-",
 		"-1",

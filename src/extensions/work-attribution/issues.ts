@@ -13,10 +13,10 @@ import { appendJournalLine, object, truncated } from "./summary.js"
  * reporting stops on journal record types it does not know. Request rows copy the selection their input began with.
  */
 
-/** An uppercase project key, a dash and an issue number, within the lengths the backend accepts in titles. */
-const ISSUE_KEY = /^[A-Z][A-Z0-9_]{0,254}-[1-9][0-9]{0,15}$/
+/** An uppercase project key of at least two characters, a dash and an issue number, within the lengths the backend accepts in titles. */
+const ISSUE_KEY = /^[A-Z][A-Z0-9_]{1,254}-[1-9][0-9]{0,15}$/
 /** Key-shaped tokens; a letter, digit or underscore on either side makes one part of a longer word. */
-const BRANCH_ISSUE_KEYS = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{0,254}-[1-9][0-9]{0,15}(?![A-Za-z0-9_])/g
+const BRANCH_ISSUE_KEYS = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{1,254}-[1-9][0-9]{0,15}(?![A-Za-z0-9_])/g
 /** The lock timing of work summaries; a writer holds this lock only to read the file and append one line. */
 const LOCK_STALE_MS = 5000
 const LOCK_RETRIES = { retries: 60, factor: 1.5, minTimeout: 25, maxTimeout: 100 }
