@@ -157,7 +157,7 @@ export function appendJournalLine(path: string, record: unknown): void {
 	}
 }
 /** An interrupted append leaves a record cut off mid-value; any other unparseable line is damage. */
-function truncated(line: string): boolean {
+export function truncated(line: string): boolean {
 	const closing: string[] = []
 	let inString = false
 	// Where an escape sequence such as \n or \u001b began, and how many \u hex digits it still needs.
