@@ -52,7 +52,6 @@ export type FermentV2EvaluatorFailureType =
 	| "invalid_output"
 	| "agent_unavailable"
 	| "guard_violation"
-	| "integrity_unavailable"
 	| "uncited_verdict"
 	| "budget_exhausted"
 	| "rate_limit"

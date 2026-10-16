@@ -1,94 +1,32 @@
-import { execFile as execFileCallback } from "node:child_process"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { promisify } from "node:util"
-import { afterAll, describe, expect, it } from "vitest"
+import { describe, expect, it } from "vitest"
 import type { TodoItem } from "../todos/types.js"
-import { buildVerifierTaskPrompt, type FermentV2VerifierFacts, gatherVerifierFacts } from "./verifier-prompt.js"
-
-const execFile = promisify(execFileCallback)
-const tempDirs: string[] = []
-
-afterAll(() => {
-	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
-})
-
-async function git(cwd: string, args: readonly string[]): Promise<void> {
-	await execFile("git", args, { cwd, encoding: "utf-8" })
-}
+import { buildVerifierTaskPrompt, type FermentV2VerifierFacts } from "./verifier-prompt.js"
+import type { WorkspaceFacts } from "./workspace.js"
 
 const todos: TodoItem[] = [
 	{ id: 1, status: "in_progress", content: "Implement feature A", activeForm: "Implementing feature A" },
 	{ id: 2, status: "completed", content: "Write tests", note: "Evidence: ran vitest" },
 ]
 
-describe("gatherVerifierFacts", () => {
-	it("reports unavailable outside a git repository", async () => {
-		const facts = await gatherVerifierFacts("/nonexistent-definitely-not-a-repo")
-		expect(facts.available).toBe(false)
-		expect(facts.changedFiles).toEqual([])
-	})
-
-	it("gathers branch, head, and changed files inside this repository", async () => {
-		const facts = await gatherVerifierFacts(process.cwd())
-		expect(facts.available).toBe(true)
-		expect(facts.git.branch).toBeTruthy()
-		expect(facts.git.head).toMatch(/^[0-9a-f]{40}$/)
-		// This test file itself is untracked or modified in the working tree, so at
-		// least one changed file must be reported — robust regardless of git state.
-		expect(facts.git.uncommittedFiles).toBe(facts.changedFiles.length)
-		for (const file of facts.changedFiles) {
-			expect(["A", "M", "D", "R"]).toContain(file.status)
-			expect(file.path.length).toBeGreaterThan(0)
-		}
-	})
-
-	it("reports unstaged, staged, renamed, and untracked files with blank status columns", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "kimchi-verifier-facts-"))
-		tempDirs.push(dir)
-		await git(dir, ["init", "-q"])
-		await git(dir, ["config", "user.email", "test@example.com"])
-		await git(dir, ["config", "user.name", "Test"])
-		writeFileSync(join(dir, "unstaged.txt"), "original\n")
-		writeFileSync(join(dir, "staged.txt"), "original\n")
-		writeFileSync(join(dir, "renamed.txt"), "rename me\n")
-		await git(dir, ["add", "-A"])
-		await git(dir, ["commit", "-q", "-m", "initial"])
-		// An unstaged modification (" M"), a staged modification ("M "), a staged
-		// rename ("R " followed by the bare source field), and an untracked file ("??").
-		writeFileSync(join(dir, "unstaged.txt"), "modified\n")
-		writeFileSync(join(dir, "staged.txt"), "modified\n")
-		await git(dir, ["add", "staged.txt"])
-		await git(dir, ["mv", "renamed.txt", "moved.txt"])
-		writeFileSync(join(dir, "untracked.txt"), "fresh\n")
-
-		const facts = await gatherVerifierFacts(dir)
-
-		expect(facts.available).toBe(true)
-		expect(facts.changedFiles).toEqual(
-			expect.arrayContaining([
-				{ status: "M", path: "unstaged.txt" },
-				{ status: "M", path: "staged.txt" },
-				{ status: "R", path: "moved.txt", from: "renamed.txt" },
-				{ status: "A", path: "untracked.txt" },
-			]),
-		)
-		// The rename source field must be consumed, never reported as its own entry.
-		expect(facts.changedFiles.map((file) => file.path)).not.toContain("renamed.txt")
-	})
-})
-
-describe("buildVerifierTaskPrompt", () => {
-	const facts: FermentV2VerifierFacts = {
-		available: true,
+function workspace(overrides: Partial<WorkspaceFacts> = {}): WorkspaceFacts {
+	return {
+		baseline: "baseline-1234567890",
 		changedFiles: [
 			{ status: "M", path: "src/a.ts" },
 			{ status: "A", path: "src/new.test.ts" },
 		],
-		git: { branch: "main", head: "abc123def456", uncommittedFiles: 2 },
+		diffStat: "",
+		testInventoryFlags: [],
+		testInventoryIncomplete: false,
+		git: { branch: "main", head: "abc123def456", commitsSinceBaseline: 0, uncommittedFiles: 2 },
+		truncated: false,
+		...overrides,
 	}
+}
 
+const facts: FermentV2VerifierFacts = { basis: "baseline", workspace: workspace() }
+
+describe("buildVerifierTaskPrompt", () => {
 	it("carries the objective, facts, and todos", () => {
 		const prompt = buildVerifierTaskPrompt({
 			objective: "Implement the login flow",
@@ -110,11 +48,25 @@ describe("buildVerifierTaskPrompt", () => {
 		const prompt = buildVerifierTaskPrompt({
 			objective: "Research the API",
 			cwd: "/tmp",
-			facts: { available: false, changedFiles: [], git: { uncommittedFiles: 0 } },
+			facts: { basis: "outside_git" },
 			todos: [],
 		})
 		expect(prompt).toContain("not a git repository")
 		expect(prompt).toContain("(no Todos)")
+		expect(prompt).not.toContain("Baseline worktree")
+	})
+
+	it("tells the verifier to inspect git itself when the facts could not be gathered", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Do it",
+			cwd: "/workspace",
+			facts: { basis: "unavailable" },
+			todos: [],
+		})
+		expect(prompt).toContain("unavailable for this run — git failed while gathering them")
+		expect(prompt).toContain("there is no test-inventory flag list")
+		expect(prompt).toContain("git status and git diff")
+		expect(prompt).not.toContain("Test-inventory flags")
 	})
 
 	it("includes the proposed answer, confidence and previous gap when present", () => {
@@ -139,10 +91,17 @@ describe("buildVerifierTaskPrompt", () => {
 	})
 
 	it("omits optional sections when absent", () => {
-		const prompt = buildVerifierTaskPrompt({ objective: "Do it", cwd: "/workspace", facts, todos: [] })
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Do it",
+			cwd: "/workspace",
+			facts: { basis: "head", workspace: workspace() },
+			todos: [],
+		})
 		expect(prompt).not.toContain("completion confidence")
 		expect(prompt).not.toContain("Proposed final answer")
 		expect(prompt).not.toContain("Previous verifier gap")
+		expect(prompt).not.toContain("Integrity guard")
+		expect(prompt).not.toContain("Baseline worktree")
 	})
 
 	it("renders baseline facts: changed files, diff stat, git state, and flagged test changes with IDs", () => {
@@ -150,29 +109,21 @@ describe("buildVerifierTaskPrompt", () => {
 			objective: "Fix the bug",
 			cwd: "/workspace",
 			facts: {
-				...facts,
-				baselineCommit: "baseline-123",
-				workspace: {
-					baseline: "baseline-1234567890",
-					changedFiles: facts.changedFiles,
+				basis: "baseline",
+				workspace: workspace({
 					diffStat: " src/a.ts | 2 +-\n 2 files changed",
 					testInventoryFlags: [
 						{ id: "f1", kind: "test_file_deleted", path: "src/old.test.ts" },
-						{
-							id: "f2",
-							kind: "skip_marker_added",
-							path: "src/a.test.ts",
-							detail: "it.skip('works')",
-						},
+						{ id: "f2", kind: "skip_marker_added", path: "src/a.test.ts", detail: "it.skip('works')" },
 					],
-					testInventoryIncomplete: false,
 					git: { branch: "main", head: "abc123", commitsSinceBaseline: 2, uncommittedFiles: 2 },
 					truncated: true,
-				},
+				}),
 			},
 			todos: [],
 		})
 		expect(prompt).toContain("compared against the baseline baseline-123")
+		expect(prompt).toContain("captured when the objective started")
 		expect(prompt).toContain("modified: src/a.ts")
 		expect(prompt).toContain("Diff stat vs baseline")
 		expect(prompt).toContain("2 commit(s) since baseline")
@@ -182,22 +133,41 @@ describe("buildVerifierTaskPrompt", () => {
 		expect(prompt).toContain("must be addressed by some check's flags array")
 	})
 
+	it("renders HEAD-based facts when the ferment has no baseline, without baseline-only details", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Fix the bug",
+			cwd: "/workspace",
+			facts: {
+				basis: "head",
+				workspace: workspace({
+					baseline: "head-abcdef123456789",
+					diffStat: " src/a.ts | 2 +-",
+					testInventoryFlags: [{ id: "f1", kind: "test_file_modified", path: "src/a.test.ts" }],
+					git: { branch: "main", head: "head-abcdef", commitsSinceBaseline: 0, uncommittedFiles: 2 },
+				}),
+			},
+			todos: [],
+		})
+		expect(prompt).toContain("compared against HEAD head-abcdef1")
+		expect(prompt).toContain("no baseline snapshot was captured for this objective")
+		expect(prompt).toContain("uncommitted changes from before it started are included")
+		expect(prompt).toContain("Diff stat vs HEAD")
+		expect(prompt).toContain("- f1: test file modified — src/a.test.ts")
+		expect(prompt).not.toContain("commit(s) since baseline")
+		// Without a ferment baseline there is no baseline worktree to miss.
+		expect(prompt).not.toContain("Baseline worktree")
+	})
+
 	it("tells the verifier when the test inventory could not be collected completely", () => {
 		const prompt = buildVerifierTaskPrompt({
 			objective: "Fix the bug",
 			cwd: "/workspace",
 			facts: {
-				...facts,
-				baselineCommit: "baseline-123",
-				workspace: {
-					baseline: "baseline-1234567890",
-					changedFiles: facts.changedFiles,
-					diffStat: "",
+				basis: "baseline",
+				workspace: workspace({
 					testInventoryFlags: [{ id: "f1", kind: "test_file_modified", path: "src/a.test.ts" }],
 					testInventoryIncomplete: true,
-					git: { branch: "main", head: "abc123", commitsSinceBaseline: 0, uncommittedFiles: 2 },
-					truncated: false,
-				},
+				}),
 			},
 			todos: [],
 		})
@@ -209,10 +179,12 @@ describe("buildVerifierTaskPrompt", () => {
 		const prompt = buildVerifierTaskPrompt({
 			objective: "Fix the bug",
 			cwd: "/workspace",
-			facts: { ...facts, baselineCommit: "base123", baselineWorktree: "/tmp/kimchi-ferment-v2-baseline-x" },
+			facts,
+			baselineWorktree: "/tmp/kimchi-ferment-v2-baseline-x",
 			todos: [],
 		})
 		expect(prompt).toContain("Baseline worktree (host-provided, disposable): /tmp/kimchi-ferment-v2-baseline-x")
+		expect(prompt).toContain("checked out on first use")
 		expect(prompt).toContain("pre-existing, not caused by the implementer's changes")
 		expect(prompt).toContain("they must FAIL there")
 		expect(prompt).toContain("does not verify the change")
@@ -228,32 +200,21 @@ describe("buildVerifierTaskPrompt", () => {
 		expect(prompt).toContain("nested node_modules")
 	})
 
-	it("explains a missing baseline (comparison basis and worktree) instead of staying silent", () => {
-		const noBaseline = buildVerifierTaskPrompt({ objective: "Do it", cwd: "/workspace", facts, todos: [] })
-		expect(noBaseline).toContain("no baseline snapshot was captured")
-		expect(noBaseline).toContain("listed against HEAD")
-		const failedDiff = buildVerifierTaskPrompt({
-			objective: "Do it",
-			cwd: "/workspace",
-			facts: { ...facts, baselineCommit: "base123" },
-			todos: [],
-		})
-		expect(failedDiff).toContain("baseline diff could not be computed")
-		expect(failedDiff).toContain("Baseline worktree: unavailable")
+	it("explains a missing baseline worktree when a ferment baseline exists", () => {
+		const prompt = buildVerifierTaskPrompt({ objective: "Do it", cwd: "/workspace", facts, todos: [] })
+		expect(prompt).toContain("Baseline worktree: unavailable")
 	})
 
-	it("tells the verifier when the baseline comparison failed so no inventory was collected", () => {
+	it("warns the verifier not to write when integrity is unenforced", () => {
 		const prompt = buildVerifierTaskPrompt({
 			objective: "Do it",
 			cwd: "/workspace",
-			facts: { ...facts, baselineCommit: "base123", testInventoryUnavailable: true },
+			facts: { basis: "unavailable" },
+			integrityUnenforced: true,
 			todos: [],
 		})
-		expect(prompt).toContain("baseline diff could not be computed")
-		expect(prompt).toContain("the test inventory could not be collected at all")
-		expect(prompt).toContain("inspect the changed test files yourself")
-		// No flags were collected on this path — the flag section must stay
-		// absent rather than imply a clean inventory.
-		expect(prompt).not.toContain("Test-inventory flags")
+		expect(prompt).toContain("Integrity guard: unavailable for this run")
+		expect(prompt).toContain("will NOT be reverted")
+		expect(prompt).toContain("Do not write to the working tree at all")
 	})
 })

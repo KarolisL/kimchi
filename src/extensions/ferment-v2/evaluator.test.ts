@@ -8,6 +8,7 @@ import { resetProjectScopeTrustForTests } from "../../project-scope-trust.js"
 import { createContext } from "../__mocks__/context.js"
 import { createExtensionApi } from "../__mocks__/extension-api.js"
 import type { FermentV2VerifierAgentRun } from "../agents/index.js"
+import permissionsExtension from "../permissions/index.js"
 import { resetRedactionConfigCache } from "../pii-redaction/config.js"
 import piiRedactionExtension from "../pii-redaction/index.js"
 import * as redactor from "../pii-redaction/redactor.js"
@@ -19,12 +20,16 @@ import {
 } from "./evaluator.js"
 import { DEFAULT_FERMENT_V2_SETTINGS, getFermentV2Settings } from "./settings.js"
 import type { FermentV2Baseline, FermentV2EvaluatorUsage } from "./types.js"
-import { enforceWorkspaceIntegrity, type IntegrityResult, type VerifierGuard } from "./verifier-guard.js"
-import type { FermentV2VerifierFacts } from "./verifier-prompt.js"
 import {
-	createBaselineWorktree,
+	enforceWorkspaceIntegrity,
+	type IntegrityResult,
+	type VerifierGuard,
+	type VerifierGuardOptions,
+} from "./verifier-guard.js"
+import {
 	detectGitWorkspace,
 	gatherWorkspaceFacts,
+	reserveBaselineWorktree,
 	snapshotWorkspace,
 	type TestInventoryFlag,
 	type WorkspaceFacts,
@@ -50,7 +55,7 @@ vi.mock("./workspace.js", async (importOriginal) => {
 		snapshotWorkspace: vi.fn(),
 		workspaceHead: vi.fn(),
 		detectGitWorkspace: vi.fn(),
-		createBaselineWorktree: vi.fn(),
+		reserveBaselineWorktree: vi.fn(),
 		gatherWorkspaceFacts: vi.fn(),
 	}
 })
@@ -61,7 +66,7 @@ const headMock = vi.mocked(workspaceHead)
 const enforceIntegrityMock = vi.mocked(enforceWorkspaceIntegrity)
 const gitProbeMock = vi.mocked(detectGitWorkspace)
 const gatherWorkspaceFactsMock = vi.mocked(gatherWorkspaceFacts)
-const createWorktreeMock = vi.mocked(createBaselineWorktree)
+const reserveWorktreeMock = vi.mocked(reserveBaselineWorktree)
 
 const CITED_CONTINUE =
 	'{"verdict":"continue","reason":"more work","checks":[{"kind":"work","requirement":"ship it","status":"fail","evidence":["e1"]}]}'
@@ -134,13 +139,13 @@ function noViolation(): IntegrityResult {
 	return { violated: false, restored: [], removed: [], headMoved: false, postRunSnapshot: "after" }
 }
 
-function factsWith(path = "src/a.ts"): FermentV2VerifierFacts {
-	return {
-		available: true,
-		changedFiles: [{ status: "M", path }],
-		git: { branch: "main", head: "head-1", uncommittedFiles: 1 },
-	}
+/** A reserved baseline worktree whose checkout and disposal are observable. */
+function reservedWorktree(path = "/tmp/baseline-wt") {
+	return { path, ensure: vi.fn(async () => true), dispose: vi.fn(async () => {}) }
 }
+
+const MET_ALL_GOOD =
+	'{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}'
 
 function workspaceFactsWithFlags(
 	flags: readonly TestInventoryFlag[],
@@ -262,7 +267,7 @@ describe("Ferment V2 executing verifier", () => {
 		headMock.mockReset().mockResolvedValue({ kind: "commit", sha: "head-1" })
 		enforceIntegrityMock.mockReset().mockResolvedValue(noViolation())
 		gatherWorkspaceFactsMock.mockReset().mockResolvedValue(undefined)
-		createWorktreeMock.mockReset().mockResolvedValue(undefined)
+		reserveWorktreeMock.mockReset().mockReturnValue(undefined)
 	})
 
 	afterEach(() => {
@@ -309,18 +314,13 @@ describe("Ferment V2 executing verifier", () => {
 	})
 
 	it("downgrades a met verdict that leaves a test-inventory flag unaddressed", async () => {
-		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
-			deps: {
-				facts: async () => ({
-					...factsWith(),
-					workspace: workspaceFactsWithFlags([
-						{ id: "f1", kind: "test_file_deleted", path: "src/a.test.ts" },
-						{ id: "f2", kind: "skip_marker_added", path: "src/b.test.ts", detail: "it.skip('works')" },
-					]),
-				}),
-			},
-		})
+		gatherWorkspaceFactsMock.mockResolvedValue(
+			workspaceFactsWithFlags([
+				{ id: "f1", kind: "test_file_deleted", path: "src/a.test.ts" },
+				{ id: "f2", kind: "skip_marker_added", path: "src/b.test.ts", detail: "it.skip('works')" },
+			]),
+		)
+		const result = await evaluate({ text: MET_ALL_GOOD })
 		expect(result.verdict).toBe("continue")
 		if (result.verdict === "continue") {
 			expect(result.reason).toContain("f1")
@@ -329,58 +329,55 @@ describe("Ferment V2 executing verifier", () => {
 		}
 	})
 
-	it("downgrades a met verdict while the test inventory is incomplete", async () => {
-		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
-			deps: {
-				facts: async () => ({
-					...factsWith(),
-					workspace: workspaceFactsWithFlags(
-						[{ id: "f1", kind: "skip_marker_added", path: "src/b.test.ts", detail: "it.skip('works')" }],
-						{ testInventoryIncomplete: true },
-					),
-				}),
-			},
-		})
-		expect(result.verdict).toBe("continue")
-		if (result.verdict === "continue") {
-			expect(result.reason).toContain("test inventory")
-			expect(result.reason).toContain("could not be collected completely")
-		}
+	it("accepts a met verdict on an incomplete test inventory and tells the verifier to inspect test files", async () => {
+		const spawn = spawnFn(async () => makeRun({ text: MET_ALL_GOOD }))
+		gatherWorkspaceFactsMock.mockResolvedValue(workspaceFactsWithFlags([], { testInventoryIncomplete: true }))
+		const result = await evaluate({ deps: { spawn } })
+		expect(result).toMatchObject({ verdict: "met", reason: "all good" })
+		expect(spawn.mock.calls[0]?.[0].prompt).toContain("could not collect the test inventory completely")
 	})
 
-	it("downgrades a met verdict when the baseline comparison failed so no inventory was collected", async () => {
+	it("accepts a met verdict when the baseline comparison fails and reports the facts as unavailable", async () => {
+		const spawn = spawnFn(async () => makeRun({ text: MET_ALL_GOOD }))
+		// The default workspace mock resolves undefined: the baseline diff failed.
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
 			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
+			deps: { spawn },
 		})
-		// The default workspace mock resolves undefined — the initial baseline
-		// diff failed — so the facts degrade to vs-HEAD with no workspace
-		// section: zero flags there mean "not collected", never "clean", and a
-		// `met` verdict is rejected until a run collects the inventory.
 		expect(gatherWorkspaceFactsMock).toHaveBeenCalledOnce()
-		expect(result.verdict).toBe("continue")
-		if (result.verdict === "continue") {
-			expect(result.reason).toContain("test inventory")
-			expect(result.reason).toContain("could not be collected completely")
-			expect(result.reason).toContain("claim completion again")
-		}
+		expect(result).toMatchObject({ verdict: "met" })
+		expect(spawn.mock.calls[0]?.[0].prompt).toContain("unavailable for this run — git failed")
 	})
 
 	it("accepts a met verdict that addresses every test-inventory flag", async () => {
+		gatherWorkspaceFactsMock.mockResolvedValue(
+			workspaceFactsWithFlags([
+				{ id: "f1", kind: "test_file_deleted", path: "src/a.test.ts" },
+				{ id: "f2", kind: "skip_marker_added", path: "src/b.test.ts" },
+			]),
+		)
 		const result = await evaluate({
 			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"],"flags":["f1","f2"]}]}',
-			deps: {
-				facts: async () => ({
-					...factsWith(),
-					workspace: workspaceFactsWithFlags([
-						{ id: "f1", kind: "test_file_deleted", path: "src/a.test.ts" },
-						{ id: "f2", kind: "skip_marker_added", path: "src/b.test.ts" },
-					]),
-				}),
-			},
 		})
 		expect(result).toMatchObject({ verdict: "met", reason: "all good" })
+	})
+
+	it("gathers facts against HEAD when the ferment has no baseline", async () => {
+		const spawn = spawnFn()
+		gatherWorkspaceFactsMock.mockResolvedValue(workspaceFactsWithFlags([], { baseline: "head-1" }))
+		await evaluate({ deps: { spawn } })
+		expect(gatherWorkspaceFactsMock).toHaveBeenCalledWith(
+			"/workspace",
+			"head-1",
+			{ commit: "snap", tree: "tree" },
+			[],
+			undefined,
+		)
+		const prompt = spawn.mock.calls[0]?.[0].prompt ?? ""
+		expect(prompt).toContain("compared against HEAD head-1")
+		expect(prompt).toContain("no baseline snapshot was captured")
+		// The baseline worktree belongs to a ferment baseline only.
+		expect(reserveWorktreeMock).not.toHaveBeenCalled()
 	})
 
 	it("gathers facts against the ferment baseline and renders the flags in the prompt", async () => {
@@ -406,49 +403,71 @@ describe("Ferment V2 executing verifier", () => {
 		expect(prompt).toContain("must be addressed by some check's flags array")
 	})
 
-	it("hands the baseline worktree path to the verifier prompt and disposes it after the run", async () => {
-		const dispose = vi.fn(async () => {})
+	it("reserves the baseline worktree lazily, hands its path to the prompt, and disposes it after the run", async () => {
+		const worktree = reservedWorktree()
 		const spawn = spawnFn()
-		const createWorktree = vi.fn(async () => ({ path: "/tmp/baseline-wt", dispose }))
+		const reserveWorktree = vi.fn(() => worktree)
 		await evaluate({
 			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
-			deps: { spawn, createWorktree },
+			deps: { spawn, reserveWorktree },
 		})
-		expect(createWorktree).toHaveBeenCalledWith("/workspace", "base-1", undefined)
+		expect(reserveWorktree).toHaveBeenCalledWith("/workspace", "base-1")
 		const prompt = spawn.mock.calls[0]?.[0].prompt ?? ""
 		expect(prompt).toContain("Baseline worktree (host-provided, disposable): /tmp/baseline-wt")
+		expect(prompt).toContain("checked out on first use")
 		expect(prompt).toContain("they must FAIL there")
 		expect(prompt).toContain("editable install")
-		expect(dispose).toHaveBeenCalledOnce()
+		// Nothing referenced the worktree, so it was never checked out.
+		expect(worktree.ensure).not.toHaveBeenCalled()
+		expect(worktree.dispose).toHaveBeenCalledOnce()
 	})
 
-	it("tells the verifier when the baseline worktree cannot be created", async () => {
-		const spawn = spawnFn()
+	it("hands the reserved worktree to the guard, which checks it out on demand", async () => {
+		const worktree = reservedWorktree()
+		let guardOptions: VerifierGuardOptions | undefined
 		await evaluate({
 			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
-			deps: { spawn, facts: async () => ({ ...factsWith(), baselineCommit: "base-1" }) },
+			deps: {
+				reserveWorktree: () => worktree,
+				createGuard: (options) => {
+					guardOptions = options
+					return guardWithEvidence(["e1"])
+				},
+			},
+		})
+		expect(guardOptions?.baselineWorktree?.path).toBe("/tmp/baseline-wt")
+		await expect(guardOptions?.baselineWorktree?.ensure()).resolves.toBe(true)
+		expect(worktree.ensure).toHaveBeenCalledOnce()
+	})
+
+	it("tells the verifier when the baseline worktree cannot be reserved", async () => {
+		const spawn = spawnFn()
+		gatherWorkspaceFactsMock.mockResolvedValue(workspaceFactsWithFlags([]))
+		await evaluate({
+			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
+			deps: { spawn },
 		})
 		const prompt = spawn.mock.calls[0]?.[0].prompt ?? ""
 		expect(prompt).toContain("Baseline worktree: unavailable")
 	})
 
 	it("disposes the baseline worktree after an error", async () => {
-		const dispose = vi.fn(async () => {})
+		const worktree = reservedWorktree()
 		const result = await evaluate({
 			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
 			deps: {
 				spawn: vi.fn(async () => {
 					throw new Error("boom")
 				}),
-				createWorktree: vi.fn(async () => ({ path: "/tmp/baseline-wt", dispose })),
+				reserveWorktree: () => worktree,
 			},
 		})
 		expect(result.verdict).toBe("unavailable")
-		expect(dispose).toHaveBeenCalledOnce()
+		expect(worktree.dispose).toHaveBeenCalledOnce()
 	})
 
 	it("disposes the baseline worktree when the run is cancelled mid-flight", async () => {
-		const dispose = vi.fn(async () => {})
+		const worktree = reservedWorktree()
 		const controller = new AbortController()
 		await evaluate({
 			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
@@ -458,10 +477,10 @@ describe("Ferment V2 executing verifier", () => {
 					controller.abort()
 					return makeRun()
 				}),
-				createWorktree: vi.fn(async () => ({ path: "/tmp/baseline-wt", dispose })),
+				reserveWorktree: () => worktree,
 			},
 		})
-		expect(dispose).toHaveBeenCalledOnce()
+		expect(worktree.dispose).toHaveBeenCalledOnce()
 	})
 
 	it("runs without a baseline outside git and says so in the prompt", async () => {
@@ -989,41 +1008,40 @@ describe("Ferment V2 executing verifier", () => {
 		if (result.verdict === "met") expect(result.integrity).toBeUndefined()
 	})
 
-	it("fails closed when the workspace git state cannot be determined", async () => {
-		gitProbeMock.mockResolvedValue("unknown")
-		const spawn = vi.fn(async () => makeRun())
-		const result = await evaluate({ deps: { spawn } })
-		expect(spawn).not.toHaveBeenCalled()
-		expect(result.verdict).toBe("unavailable")
-		if (result.verdict === "unavailable") {
-			expect(result.diagnostics.failureType).toBe("integrity_unavailable")
-			expect(result.reason).toContain("could not be determined")
-		}
-	})
-
-	it("fails closed when a git workspace cannot be snapshotted before the run", async () => {
-		gitProbeMock.mockResolvedValue("git")
+	it.each([
+		{ name: "the workspace git state cannot be determined", probe: "unknown" as const },
+		{ name: "a git workspace cannot be snapshotted before the run", probe: "git" as const },
+	])("runs the verifier with integrity unenforced when $name", async ({ probe }) => {
+		gitProbeMock.mockResolvedValue(probe)
 		snapshotMock.mockResolvedValue(undefined)
-		const spawn = vi.fn(async () => makeRun())
-		const result = await evaluate({ deps: { spawn } })
-		expect(spawn).not.toHaveBeenCalled()
-		expect(result.verdict).toBe("unavailable")
-		if (result.verdict === "unavailable") {
-			expect(result.diagnostics.failureType).toBe("integrity_unavailable")
-			expect(result.reason).toContain("could not be snapshotted")
-		}
+		const spawn = spawnFn(async () => makeRun({ text: MET_ALL_GOOD }))
+		const result = await evaluate({
+			baseline: { commit: "base-1", capturedAt: "2026-01-01T00:00:00.000Z" },
+			deps: { spawn },
+		})
+		expect(spawn).toHaveBeenCalledOnce()
+		expect(result).toMatchObject({ verdict: "met", integrity: { unenforced: true, violated: false } })
+		expect(enforceIntegrityMock).not.toHaveBeenCalled()
+		// Without a snapshot there are no facts to diff and no worktree to reserve.
+		expect(gatherWorkspaceFactsMock).not.toHaveBeenCalled()
+		expect(reserveWorktreeMock).not.toHaveBeenCalled()
+		const prompt = spawn.mock.calls[0]?.[0].prompt ?? ""
+		expect(prompt).toContain("Integrity guard: unavailable for this run")
+		expect(prompt).toContain("Working tree facts (host-gathered):\n(unavailable for this run")
 	})
 
-	it("fails closed when HEAD cannot be resolved before the run", async () => {
+	it("runs the verifier without HEAD-move detection when HEAD cannot be resolved", async () => {
 		headMock.mockResolvedValue(undefined)
-		const spawn = vi.fn(async () => makeRun())
+		const spawn = spawnFn()
 		const result = await evaluate({ deps: { spawn } })
-		expect(spawn).not.toHaveBeenCalled()
-		expect(result.verdict).toBe("unavailable")
-		if (result.verdict === "unavailable") {
-			expect(result.diagnostics.failureType).toBe("integrity_unavailable")
-			expect(result.reason).toContain("HEAD could not be resolved")
-		}
+		expect(spawn).toHaveBeenCalledOnce()
+		expect(result).toMatchObject({ verdict: "continue" })
+		expect(enforceIntegrityMock).toHaveBeenCalledWith(
+			"/workspace",
+			{ commit: "snap", tree: "tree" },
+			undefined,
+			undefined,
+		)
 	})
 
 	it("reports the guard's accumulated usage even when compaction discarded the session messages", async () => {
@@ -1107,18 +1125,20 @@ describe("Ferment V2 executing verifier", () => {
 	})
 
 	it("passes the objective, facts, guard extension and unlimited limits to the verifier prompt", async () => {
-		const facts = vi.fn(async () => factsWith("src/feature.ts"))
+		gatherWorkspaceFactsMock.mockResolvedValue(
+			workspaceFactsWithFlags([], { changedFiles: [{ status: "M", path: "src/feature.ts" }] }),
+		)
 		const spawn = spawnFn()
-		await evaluate({ deps: { facts, spawn } })
+		await evaluate({ deps: { spawn } })
 		const input = spawn.mock.calls[0]?.[0]
 		expect(input?.prompt).toContain("ship it")
 		expect(input?.prompt).toContain("src/feature.ts")
 		expect(input?.cwd).toBe("/workspace")
-		expect(input?.extensionFactories).toHaveLength(2)
+		expect(input?.extensionFactories).toHaveLength(3)
 		expect(input?.maxDuration).toBe(0)
 	})
 
-	it("spawns the verifier with PII redaction injected before the guard", async () => {
+	it("spawns the verifier with PII redaction and permissions injected before the guard", async () => {
 		const spawn = spawnFn()
 		const guardExtension = () => {}
 		const guard: VerifierGuard = {
@@ -1128,10 +1148,11 @@ describe("Ferment V2 executing verifier", () => {
 		}
 		await evaluate({ deps: { spawn, createGuard: () => guard } })
 		const input = spawn.mock.calls[0]?.[0]
-		// The persona disables extensions, so redaction rides along as an inline
-		// factory — before the guard, so the stamped content and the evidence
-		// excerpts recorded for verdict reasons are already redacted.
-		expect(input?.extensionFactories).toEqual([piiRedactionExtension, guardExtension])
+		// The persona disables extensions, so redaction and permissions ride
+		// along as inline factories — redaction before the guard, so the stamped
+		// content and the evidence excerpts recorded for verdict reasons are
+		// already redacted; permissions gate verifier bash by the session mode.
+		expect(input?.extensionFactories).toEqual([piiRedactionExtension, permissionsExtension, guardExtension])
 	})
 
 	it("reports the timeout cap as the wall-clock limit when configured", async () => {

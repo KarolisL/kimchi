@@ -11,6 +11,9 @@
  *   per `session_compact` (the compaction completion produces no assistant
  *   message), both including cost — so upstream compaction, which rewrites
  *   the session's messages, cannot erase the usage of discarded messages;
+ * - the baseline worktree, when one is reserved, is checked out on the first
+ *   tool call that references its path (a run that never uses it costs no
+ *   checkout); a failed checkout blocks that call with a reason;
  * - `enforceWorkspaceIntegrity` runs after the verifier (including on abort):
  *   modified/deleted pre-existing files are restored, files the verifier added
  *   are removed, and HEAD moves — branch switches and detachments, even at the
@@ -20,6 +23,7 @@
  * The snapshot/diff/restore primitives it builds on live in `workspace.ts`.
  */
 
+import { realpathSync } from "node:fs"
 import type { Usage } from "@earendil-works/pi-ai"
 import type { InlineExtension } from "@earendil-works/pi-coding-agent"
 import { isRecord } from "./reducer.js"
@@ -46,6 +50,16 @@ export interface VerifierEvidence {
 	excerpt: string
 }
 
+/** The baseline worktree the guard materialises on first reference. */
+export interface LazyBaselineWorktree {
+	path: string
+	ensure(): Promise<boolean>
+}
+
+export interface VerifierGuardOptions {
+	baselineWorktree?: LazyBaselineWorktree
+}
+
 export interface VerifierGuard {
 	extension: InlineExtension
 	evidence: ReadonlyMap<string, VerifierEvidence>
@@ -67,12 +81,34 @@ function textExcerpt(content: readonly unknown[]): string {
 	return text.length > EVIDENCE_EXCERPT_CHARS ? `${text.slice(0, EVIDENCE_EXCERPT_CHARS)}…` : text
 }
 
+/** Whether any string in a tool input (nested objects and arrays included) mentions one of the paths. */
+function inputMentions(value: unknown, paths: readonly string[]): boolean {
+	if (typeof value === "string") return paths.some((path) => value.includes(path))
+	if (Array.isArray(value)) return value.some((item) => inputMentions(item, paths))
+	if (isRecord(value)) return Object.values(value).some((item) => inputMentions(item, paths))
+	return false
+}
+
+/** The reserved path and its symlink-resolved form (macOS keeps the temp dir under /private). */
+function worktreePathForms(path: string): string[] {
+	try {
+		const resolved = realpathSync(path)
+		return resolved === path ? [path] : [path, resolved]
+	} catch {
+		return [path]
+	}
+}
+
 /**
  * The verifier's in-session guard: every tool result is stamped with a
- * sequential evidence ID, and usage is accumulated as assistant messages
- * complete and as compactions run, so it can be counted even after compaction.
+ * sequential evidence ID, usage is accumulated as assistant messages
+ * complete and as compactions run (so it can be counted even after
+ * compaction), and the reserved baseline worktree is checked out on the
+ * first tool call that references it.
  */
-export function createVerifierGuard(): VerifierGuard {
+export function createVerifierGuard(options: VerifierGuardOptions = {}): VerifierGuard {
+	const worktree = options.baselineWorktree
+	const worktreePaths = worktree ? worktreePathForms(worktree.path) : []
 	const evidence = new Map<string, VerifierEvidence>()
 	const usage: FermentV2EvaluatorUsage = {
 		input: 0,
@@ -94,6 +130,16 @@ export function createVerifierGuard(): VerifierGuard {
 	}
 
 	const extension: InlineExtension = (pi) => {
+		if (worktree) {
+			pi.on("tool_call", async (event) => {
+				if (!inputMentions(event.input, worktreePaths)) return undefined
+				if (await worktree.ensure()) return undefined
+				return {
+					block: true,
+					reason: `The baseline worktree ${worktree.path} could not be created. Attribute failures without it and treat attribution as uncertain.`,
+				}
+			})
+		}
 		pi.on("tool_result", (event) => {
 			const id = `e${nextEvidenceId++}`
 			evidence.set(id, {
@@ -141,7 +187,11 @@ export interface IntegrityResult {
 	headMoved: boolean
 	/** Snapshot commit of the working tree right after the run — recovery point for the user. */
 	postRunSnapshot?: string
-	/** True when the workspace is not a git repo and integrity could not be enforced. */
+	/**
+	 * True when the host could not protect the working tree for this run: the
+	 * before-run snapshot failed (the verifier ran without the guard), or the
+	 * post-run snapshot failed (verifier changes could not be detected).
+	 */
 	unenforced?: boolean
 }
 
@@ -150,7 +200,8 @@ export interface IntegrityResult {
  * the current tree, restore modified/deleted pre-existing files from the
  * before-run snapshot, remove files the verifier added, and detect HEAD moves
  * — including transitions between resolved and unborn HEAD — without
- * attempting git surgery.
+ * attempting git surgery. HEAD-move detection is skipped when the before-run
+ * HEAD could not be resolved.
  */
 export async function enforceWorkspaceIntegrity(
 	cwd: string,
@@ -168,16 +219,18 @@ export async function enforceWorkspaceIntegrity(
 		headMoved: false,
 		postRunSnapshot: after.commit,
 	}
-	// HEAD must resolve after the run: a resolution failure is an enforcement
-	// failure (it throws) rather than a clean tree. Any HEAD move is a
-	// violation: a different commit or symbolic ref, a branch switch or
-	// detachment at the same commit, or a transition between resolved and
-	// unborn HEAD (e.g. `git checkout --orphan`).
-	const afterHead = await readHeadState(git, signal)
-	if (afterHead === undefined) throw new Error("git HEAD could not be resolved after the verifier run")
-	if (beforeHead !== undefined && !sameHeadState(beforeHead, afterHead)) {
-		result.headMoved = true
-		result.violated = true
+	// With a known before-run HEAD, HEAD must resolve after the run: a
+	// resolution failure is an enforcement failure (it throws) rather than a
+	// clean tree. Any HEAD move is a violation: a different commit or symbolic
+	// ref, a branch switch or detachment at the same commit, or a transition
+	// between resolved and unborn HEAD (e.g. `git checkout --orphan`).
+	if (beforeHead !== undefined) {
+		const afterHead = await readHeadState(git, signal)
+		if (afterHead === undefined) throw new Error("git HEAD could not be resolved after the verifier run")
+		if (!sameHeadState(beforeHead, afterHead)) {
+			result.headMoved = true
+			result.violated = true
+		}
 	}
 	// A failed diff is an enforcement failure, not a clean tree: it propagates
 	// so the host can discard an untrusted `met` verdict.

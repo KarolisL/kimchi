@@ -15,9 +15,10 @@ import { promisify } from "node:util"
 import { afterEach, describe, expect, it } from "vitest"
 import {
 	BASELINE_WORKTREE_PREFIX,
-	createBaselineWorktree,
+	type BaselineWorktree,
 	gatherWorkspaceFacts,
 	pruneStaleBaselineWorktrees,
+	reserveBaselineWorktree,
 	snapshotWorkspace,
 } from "./workspace.js"
 
@@ -26,6 +27,15 @@ const execFile = promisify(execFileCallback)
 async function git(cwd: string, args: readonly string[]): Promise<string> {
 	const { stdout } = await execFile("git", args, { cwd, encoding: "utf-8" })
 	return stdout
+}
+
+/** Reserve and check out a baseline worktree; undefined (reservation disposed) when the checkout fails. */
+async function checkedOutWorktree(repo: string, baseline: string): Promise<BaselineWorktree | undefined> {
+	const worktree = reserveBaselineWorktree(repo, baseline)
+	if (!worktree) return undefined
+	if (await worktree.ensure()) return worktree
+	await worktree.dispose()
+	return undefined
 }
 
 const tempDirs: string[] = []
@@ -649,7 +659,40 @@ describe("gatherWorkspaceFacts", () => {
 	})
 })
 
-describe("createBaselineWorktree", () => {
+describe("reserveBaselineWorktree", () => {
+	it("reserves a path without checking anything out, and disposes an unused reservation", async () => {
+		const repo = await makeRepo()
+		writeFileSync(join(repo, "a.txt"), "a\n")
+		await commitAll(repo, "initial")
+		const baseline = await snapshotWorkspace(repo)
+
+		const worktree = reserveBaselineWorktree(repo, baseline?.commit ?? "")
+
+		expect(worktree?.path).toContain(BASELINE_WORKTREE_PREFIX)
+		expect(existsSync(join(worktree?.path ?? "", "a.txt"))).toBe(false)
+		expect(await git(repo, ["worktree", "list", "--porcelain"])).not.toContain(BASELINE_WORKTREE_PREFIX)
+		await worktree?.dispose()
+		expect(existsSync(worktree?.path ?? "")).toBe(false)
+	})
+
+	it("checks the worktree out once, however often ensure is called", async () => {
+		const repo = await makeRepo()
+		writeFileSync(join(repo, "a.txt"), "a\n")
+		await commitAll(repo, "initial")
+		const baseline = await snapshotWorkspace(repo)
+		const worktree = reserveBaselineWorktree(repo, baseline?.commit ?? "")
+
+		const [first, second] = await Promise.all([worktree?.ensure(), worktree?.ensure()])
+
+		expect(first).toBe(true)
+		expect(second).toBe(true)
+		expect(await worktree?.ensure()).toBe(true)
+		const list = await git(repo, ["worktree", "list", "--porcelain"])
+		expect(list.split(BASELINE_WORKTREE_PREFIX).length - 1).toBe(1)
+		await worktree?.dispose()
+		expect(await git(repo, ["worktree", "list", "--porcelain"])).not.toContain(BASELINE_WORKTREE_PREFIX)
+	})
+
 	it("checks the baseline out with untracked-at-start files and disposes it", async () => {
 		const repo = await makeRepo()
 		writeFileSync(join(repo, "tracked.txt"), "tracked\n")
@@ -661,7 +704,7 @@ describe("createBaselineWorktree", () => {
 		rmSync(join(repo, "untracked-start.txt"))
 		writeFileSync(join(repo, "tracked.txt"), "changed\n")
 
-		const worktree = await createBaselineWorktree(repo, baseline?.commit ?? "")
+		const worktree = await checkedOutWorktree(repo, baseline?.commit ?? "")
 
 		expect(worktree).toBeDefined()
 		expect(existsSync(join(worktree?.path ?? "", "untracked-start.txt"))).toBe(true)
@@ -682,7 +725,7 @@ describe("createBaselineWorktree", () => {
 		writeFileSync(join(repo, "node_modules", "marker.txt"), "dep\n")
 		const baseline = await snapshotWorkspace(repo)
 
-		const worktree = await createBaselineWorktree(repo, baseline?.commit ?? "")
+		const worktree = await checkedOutWorktree(repo, baseline?.commit ?? "")
 
 		const modules = join(worktree?.path ?? "", "node_modules")
 		expect(existsSync(modules)).toBe(true)
@@ -692,16 +735,23 @@ describe("createBaselineWorktree", () => {
 		expect(existsSync(join(repo, "node_modules", "marker.txt"))).toBe(true)
 	})
 
-	it("returns undefined outside a git repository or for a missing baseline", async () => {
+	it("fails the checkout outside a git repository or for a missing baseline, and disposal still cleans up", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "kimchi-v2-workspace-nongit-"))
 		tempDirs.push(dir)
 		writeFileSync(join(dir, "file.txt"), "no git\n")
-		expect(await createBaselineWorktree(dir, "HEAD")).toBeUndefined()
+		const outside = reserveBaselineWorktree(dir, "HEAD")
+		expect(await outside?.ensure()).toBe(false)
+		await outside?.dispose()
+		expect(existsSync(outside?.path ?? "")).toBe(false)
 		const repo = await makeRepo()
 		writeFileSync(join(repo, "a.txt"), "a\n")
 		await commitAll(repo, "initial")
-		expect(await createBaselineWorktree(repo, "0000000")).toBeUndefined()
+		const missing = reserveBaselineWorktree(repo, "0000000")
+		expect(await missing?.ensure()).toBe(false)
+		expect(await missing?.ensure()).toBe(false)
 		expect(await git(repo, ["worktree", "list", "--porcelain"])).not.toContain(BASELINE_WORKTREE_PREFIX)
+		await missing?.dispose()
+		expect(existsSync(missing?.path ?? "")).toBe(false)
 	})
 })
 
@@ -740,7 +790,7 @@ describe("pruneStaleBaselineWorktrees", () => {
 		const baseline = await snapshotWorkspace(repo)
 
 		// This process's live worktree: a verifier run is still using it.
-		const live = await createBaselineWorktree(repo, baseline?.commit ?? "")
+		const live = await checkedOutWorktree(repo, baseline?.commit ?? "")
 		// Another live process's worktree (a second session in the same repo).
 		const foreign = spawn("sleep", ["30"], { stdio: "ignore" })
 		if (!foreign.pid) throw new Error("expected a child pid")
@@ -786,7 +836,8 @@ describe("pruneStaleBaselineWorktrees", () => {
 	exit $status
 fi`,
 			async () => {
-				const creation = createBaselineWorktree(repo, baseline?.commit ?? "")
+				const reserved = reserveBaselineWorktree(repo, baseline?.commit ?? "")
+				const creation = reserved?.ensure()
 				// Wait until git has registered the in-flight worktree, so the
 				// prune observably sees it rather than racing past it.
 				let registered = false
@@ -802,11 +853,10 @@ fi`,
 
 				await pruneStaleBaselineWorktrees(repo)
 
-				const worktree = await creation
-				expect(worktree).toBeDefined()
-				expect(existsSync(join(worktree?.path ?? "", "a.txt"))).toBe(true)
-				expect(await git(repo, ["worktree", "list", "--porcelain"])).toContain(worktree?.path ?? "")
-				await worktree?.dispose()
+				expect(await creation).toBe(true)
+				expect(existsSync(join(reserved?.path ?? "", "a.txt"))).toBe(true)
+				expect(await git(repo, ["worktree", "list", "--porcelain"])).toContain(reserved?.path ?? "")
+				await reserved?.dispose()
 			},
 		)
 	})

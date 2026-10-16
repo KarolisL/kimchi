@@ -551,6 +551,9 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 	let verifyingStatusTimer: ReturnType<typeof setInterval> | undefined
 	let verifyingStartedAtMs = 0
 	let verifyingModelRef: string | undefined
+	// Ferments already told that a verifier ran without the integrity guard
+	// (the working tree could not be snapshotted); the notice is shown once.
+	const integrityUnenforcedNotified = new Set<string>()
 
 	function updateVerifyingStatus(): void {
 		currentContext?.ui.setStatus(
@@ -2241,6 +2244,13 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			// settled — before the validity gates above — so they survive even when a
 			// verdict is abandoned; the budget transition was handled there as well.
 			notifyVerifierVerdict(ctx, result)
+			if (result.integrity?.unenforced && !integrityUnenforcedNotified.has(fermentV2.id)) {
+				integrityUnenforcedNotified.add(fermentV2.id)
+				ctx.ui.notify(
+					"Ferment V2 could not snapshot the working tree, so the verifier ran without the integrity guard: files it changes are not reverted.",
+					"warning",
+				)
+			}
 			// One-time-per-ferment warning when the evaluator runs on the implementer's own model.
 			if ((result.sameModelAsImplementer || result.modelFallback) && !fermentV2.evaluatorModelWarned) {
 				ctx.ui.notify(

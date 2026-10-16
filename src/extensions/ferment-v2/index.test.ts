@@ -1098,6 +1098,29 @@ describe("Ferment V2 extension", () => {
 		expect(modelWarnings).toHaveLength(1)
 	})
 
+	it("notifies once per ferment when the verifier ran without the integrity guard", async () => {
+		const unenforced = { violated: false, restored: [], removed: [], headMoved: false, unenforced: true }
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		for (const reason of ["More work is required.", "Still more work."]) {
+			const run = await holdEvaluation(harness)
+			run.release({
+				verdict: "continue",
+				reason,
+				model: "test/evaluator",
+				usage: EVALUATOR_USAGE,
+				diagnostics: EVALUATOR_DIAGNOSTICS,
+				integrity: unenforced,
+			})
+			await run.settled
+		}
+
+		const notices = harness.ui.notify.mock.calls.filter(([message]) =>
+			String(message).includes("ran without the integrity guard"),
+		)
+		expect(notices).toEqual([[expect.stringContaining("files it changes are not reverted"), "warning"]])
+	})
+
 	it("warns with the no-usable-independent-model cause when configured independent refs are unusable", async () => {
 		fermentV2SettingsMock.mockReturnValue({
 			...DEFAULT_FERMENT_V2_SETTINGS,

@@ -14,15 +14,15 @@
  *   carrying an `f1, f2, …` ID the verifier must address in its checks. The
  *   marker scan forces textual, untransformed, uncolored diffs with literal
  *   pathspecs so repository diff configuration cannot conceal a marker, and a
- *   git failure
- *   mid-collection marks the inventory incomplete (a `met` verdict on
- *   incomplete facts is rejected);
- * - `createBaselineWorktree` checks the baseline out into a temporary
- *   `git worktree` (sharing the repository root's `node_modules` when present)
- *   so the verifier can attribute failures and check new tests against the
- *   pre-change tree; ownership is reserved before the asynchronous add, so a
- *   concurrent `pruneStaleBaselineWorktrees` (crashed-run cleanup at session
- *   start) never mistakes an in-flight creation for a leftover.
+ *   git failure mid-collection marks the inventory incomplete (the verifier
+ *   is told to inspect changed test files itself);
+ * - `reserveBaselineWorktree` reserves a temporary directory for the baseline
+ *   and checks it out as a `git worktree` (sharing the repository root's
+ *   `node_modules` when present) only on first use, so the verifier can
+ *   attribute failures and check new tests against the pre-change tree;
+ *   ownership is reserved before the asynchronous add, so a concurrent
+ *   `pruneStaleBaselineWorktrees` (crashed-run cleanup at session start)
+ *   never mistakes an in-flight creation for a leftover.
  *
  * All git access goes through `execFile` (no shell) with a bounded timeout;
  * every operation is read-only with respect to the real index, refs, and —
@@ -46,8 +46,15 @@ import { promisify } from "node:util"
 
 const execFile = promisify(execFileCallback)
 
-/** Per-git-command timeout. 15s bounds a snapshot on large repos; past it the fact is unavailable. */
+/** Per-git-command timeout for facts, HEAD, and worktree commands; past it the fact is unavailable. */
 const GIT_COMMAND_TIMEOUT_MS = 15_000
+
+/**
+ * Per-git-command timeout for snapshots. `git add -A` into a temporary index
+ * hashes every changed and untracked file, which can take well past 15s on
+ * large trees; a failed snapshot leaves the verifier without integrity.
+ */
+const SNAPSHOT_GIT_TIMEOUT_MS = 60_000
 
 export interface WorkspaceSnapshot {
 	commit: string
@@ -64,12 +71,12 @@ interface GitRunner {
 	run(args: readonly string[], options?: { env?: Record<string, string>; signal?: AbortSignal }): Promise<string>
 }
 
-export function createGitRunner(cwd: string): GitRunner {
+export function createGitRunner(cwd: string, timeoutMs = GIT_COMMAND_TIMEOUT_MS): GitRunner {
 	return {
 		async run(args, options) {
 			const { stdout } = await execFile("git", args, {
 				cwd,
-				timeout: GIT_COMMAND_TIMEOUT_MS,
+				timeout: timeoutMs,
 				maxBuffer: 64 * 1024 * 1024,
 				encoding: "utf-8",
 				...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
@@ -127,8 +134,7 @@ export type GitWorkspaceProbe = "git" | "outside_git" | "unknown"
 /**
  * Probe whether cwd is inside a git work tree. "outside_git" is a confirmed
  * non-repo; "unknown" means git could not answer (missing binary, timeout,
- * broken repository). "unknown" must fail closed — an undeterminable
- * workspace cannot be protected by the integrity guard.
+ * broken repository) — the integrity guard cannot protect such a workspace.
  */
 export async function detectGitWorkspace(cwd: string, signal?: AbortSignal): Promise<GitWorkspaceProbe> {
 	try {
@@ -154,7 +160,7 @@ function isNotARepositoryError(error: unknown): boolean {
  * undefined as failure.
  */
 export async function snapshotWorkspace(cwd: string, signal?: AbortSignal): Promise<WorkspaceSnapshot | undefined> {
-	const git = createGitRunner(cwd)
+	const git = createGitRunner(cwd, SNAPSHOT_GIT_TIMEOUT_MS)
 	let indexFile: string | undefined
 	let tempDir: string | undefined
 	try {
@@ -406,8 +412,8 @@ export interface WorkspaceFacts {
 	/**
 	 * True when any part of the inventory collection failed — the baseline
 	 * test-file enumeration or a marker diff — so the flag list may be
-	 * missing entries. The host rejects a `met` verdict while it is set: an
-	 * apparently complete inventory must never stand in for a complete one.
+	 * missing entries. The verifier is told to inspect changed test files
+	 * itself; the flags that were collected must still be addressed.
 	 */
 	testInventoryIncomplete: boolean
 	git: { branch?: string; head?: string; commitsSinceBaseline?: number; uncommittedFiles: number }
@@ -539,8 +545,10 @@ interface PendingTestInventoryFlag {
  * the verifier must address every ID in a check before a `met` verdict is
  * accepted.
  *
- * Returns undefined when the baseline diff cannot be computed (git failure,
- * baseline object garbage-collected) — callers degrade to vs-HEAD facts.
+ * `baseline` is the ferment baseline commit, or HEAD when the ferment has
+ * none. Returns undefined when the baseline diff cannot be computed (git
+ * failure, baseline object garbage-collected) — callers report the facts as
+ * unavailable.
  */
 export async function gatherWorkspaceFacts(
 	cwd: string,
@@ -595,7 +603,7 @@ export async function gatherWorkspaceFacts(
 	const keptProbeByPath = new Map(keptProbes.map((probe) => [probe.path, probe]))
 	// A failed baseline enumeration silently empties the pre-existing test
 	// inventory (no deleted/renamed/modified flag would fire), so it marks the
-	// facts incomplete — the host then rejects a `met` verdict on them.
+	// facts incomplete — the verifier is then told to inspect test files itself.
 	let inventoryIncomplete = baselineTreeRaw === undefined
 	const baselineTestFiles = new Set(
 		(baselineTreeRaw === undefined ? [] : baselineTreeRaw.split("\0").filter((path) => path.length > 0)).filter(
@@ -665,8 +673,7 @@ export async function gatherWorkspaceFacts(
 	// verdict against these IDs — a cap here would silently exempt the changes
 	// beyond it. A diff that *fails* (git error, output beyond the runner's
 	// buffer) never silently drops its flag either: it marks the inventory
-	// incomplete, so a `met` verdict is rejected until a run collects the
-	// inventory successfully.
+	// incomplete, which the verifier prompt reports.
 	for (const path of markerScanFiles) {
 		// Repository diff configuration must not conceal markers: `--text`
 		// overrides a `-diff` (binary) attribute, `--no-ext-diff` and
@@ -777,73 +784,90 @@ function baselineWorktreeOwnerPid(path: string): number | undefined {
 }
 
 export interface BaselineWorktree {
-	/** Absolute path of the worktree, checked out at the baseline commit. */
+	/** Absolute path reserved for the worktree; checked out at the baseline commit by `ensure`. */
 	path: string
-	/** Remove the worktree and prune git's administrative state; always safe to call. */
+	/**
+	 * Check the baseline out into the reserved path on first call; later calls
+	 * return the same outcome. False when the worktree could not be created.
+	 */
+	ensure(signal?: AbortSignal): Promise<boolean>
+	/** Remove the worktree (if created), prune git's administrative state, and delete the reservation; always safe to call. */
 	dispose(): Promise<void>
 }
 
 /**
- * Check the baseline snapshot out into a temporary `git worktree` so the
- * verifier can run code at the pre-change tree: attribute pre-existing
- * failures and check that the implementer's new tests fail without the
- * change. The repository root's `node_modules`, when present, is symlinked
- * into the worktree so project commands work without a fresh install.
+ * Reserve a temporary directory for the baseline worktree. Nothing is checked
+ * out until `ensure` runs, so a verifier run that never touches the baseline
+ * costs no checkout. `ensure` runs `git worktree add --detach` at the
+ * baseline commit so the verifier can run code at the pre-change tree
+ * (attribute pre-existing failures, check that new tests fail without the
+ * change); the repository root's `node_modules`, when present, is symlinked
+ * into it so project commands work without a fresh install.
  *
- * Returns undefined when the worktree cannot be created (non-git
- * repository, baseline object missing, git failure) — the caller tells the
- * verifier and continues without one.
+ * Returns undefined when the directory cannot be reserved.
  */
-export async function createBaselineWorktree(
-	cwd: string,
-	baseline: string,
-	signal?: AbortSignal,
-): Promise<BaselineWorktree | undefined> {
+export function reserveBaselineWorktree(cwd: string, baseline: string): BaselineWorktree | undefined {
 	const git = createGitRunner(cwd)
-	// The directory name carries this process's pid, so another session's
-	// pruning never removes a worktree this process is still using.
-	const dir = mkdtempSync(join(tmpdir(), `${BASELINE_WORKTREE_PREFIX}${process.pid}-`))
+	let dir: string
+	try {
+		// The directory name carries this process's pid, so another session's
+		// pruning never removes a worktree this process is still using.
+		dir = mkdtempSync(join(tmpdir(), `${BASELINE_WORKTREE_PREFIX}${process.pid}-`))
+	} catch {
+		return undefined
+	}
 	// Ownership is reserved before the asynchronous add begins: a concurrent
 	// session-start prune in this same process lists the worktree as soon as
 	// git registers it — before the add's await resolves — and would classify
 	// a not-yet-registered, same-pid worktree as a dead session's leftover.
-	// Released on failure and on disposal.
+	// Released on disposal.
 	const canonical = realPath(dir)
 	liveBaselineWorktrees.add(canonical)
-	try {
-		await git.run(["worktree", "add", "--detach", dir, baseline], { signal })
-	} catch {
-		liveBaselineWorktrees.delete(canonical)
-		rmSync(dir, { recursive: true, force: true })
+	let creation: Promise<boolean> | undefined
+
+	const create = async (signal?: AbortSignal): Promise<boolean> => {
 		try {
-			await git.run(["worktree", "prune"])
-		} catch {}
-		return undefined
-	}
-	// Share the root node_modules when present: without it, project commands
-	// inside the worktree would need a fresh install.
-	try {
-		const root = (await git.run(["rev-parse", "--show-toplevel"], { signal })).trim()
-		const modules = join(root, "node_modules")
-		if (root && existsSync(modules) && !existsSync(join(dir, "node_modules"))) {
-			symlinkSync(modules, join(dir, "node_modules"))
-		}
-	} catch {
-		// Best-effort: the verifier is told the worktree may lack dependencies.
-	}
-	return {
-		path: dir,
-		dispose: async () => {
-			liveBaselineWorktrees.delete(canonical)
-			try {
-				await git.run(["worktree", "remove", "--force", dir])
-			} catch {
-				// A dirty or locked worktree may refuse removal; the directory
-				// cleanup below and the prune still leave git consistent.
-			}
+			await git.run(["worktree", "add", "--detach", dir, baseline], { signal })
+		} catch {
 			try {
 				await git.run(["worktree", "prune"])
 			} catch {}
+			return false
+		}
+		// Share the root node_modules when present: without it, project commands
+		// inside the worktree would need a fresh install.
+		try {
+			const root = (await git.run(["rev-parse", "--show-toplevel"], { signal })).trim()
+			const modules = join(root, "node_modules")
+			if (root && existsSync(modules) && !existsSync(join(dir, "node_modules"))) {
+				symlinkSync(modules, join(dir, "node_modules"))
+			}
+		} catch {
+			// Best-effort: the verifier is told the worktree may lack dependencies.
+		}
+		return true
+	}
+
+	return {
+		path: dir,
+		ensure: (signal) => {
+			creation ??= create(signal)
+			return creation
+		},
+		dispose: async () => {
+			const created = creation ? await creation : false
+			liveBaselineWorktrees.delete(canonical)
+			if (created) {
+				try {
+					await git.run(["worktree", "remove", "--force", dir])
+				} catch {
+					// A dirty or locked worktree may refuse removal; the directory
+					// cleanup below and the prune still leave git consistent.
+				}
+				try {
+					await git.run(["worktree", "prune"])
+				} catch {}
+			}
 			rmSync(dir, { recursive: true, force: true })
 		},
 	}

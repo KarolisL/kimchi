@@ -9,9 +9,11 @@
  * checks in the real working tree; the host validates its JSON verdict
  * (citations must exist in the guard's evidence), keeps final-answer checks
  * as literal host comparisons, enforces workspace integrity after the run
- * (also on abort), and returns a `FermentV2EvaluationResult`. The verifier
- * only runs when the workspace's integrity can be protected: a git workspace
- * that cannot be snapshotted fails closed before spawning.
+ * (also on abort), and returns a `FermentV2EvaluationResult`. When a git
+ * workspace cannot be snapshotted, the verifier still runs with integrity
+ * unenforced (the prompt and the result say so), so completion never
+ * depends on the snapshot succeeding. Verifier bash goes through the
+ * session's permission mode (the permissions extension rides along).
  *
  * The previous single-shot `completeSimple` call over a transcript digest is
  * gone; `evaluateFermentV2` and the result shape remain the seam used by
@@ -26,6 +28,7 @@ import {
 	resumeFermentV2VerifierAgent,
 	spawnFermentV2VerifierAgent,
 } from "../agents/index.js"
+import permissionsExtension from "../permissions/index.js"
 import { getRedactionConfig } from "../pii-redaction/config.js"
 import piiRedactionExtension from "../pii-redaction/index.js"
 import { redactTextOrThrow } from "../pii-redaction/redactor.js"
@@ -42,16 +45,17 @@ import {
 	type IntegrityResult,
 	type VerifierEvidence,
 	type VerifierGuard,
+	type VerifierGuardOptions,
 } from "./verifier-guard.js"
 import { resolveFermentV2VerifierModel } from "./verifier-model.js"
-import { buildVerifierTaskPrompt, type FermentV2VerifierFacts, gatherVerifierFacts } from "./verifier-prompt.js"
+import { buildVerifierTaskPrompt, type FermentV2VerifierFacts } from "./verifier-prompt.js"
 import {
 	type BaselineWorktree,
-	createBaselineWorktree,
 	detectGitWorkspace,
 	type GitWorkspaceProbe,
 	gatherWorkspaceFacts,
 	type HeadState,
+	reserveBaselineWorktree,
 	snapshotWorkspace,
 	type TestInventoryFlag,
 	type WorkspaceSnapshot,
@@ -151,20 +155,11 @@ export interface FermentV2VerifierDeps {
 	resume?: (id: string, prompt: string, signal: AbortSignal) => Promise<FermentV2VerifierAgentRun | undefined>
 	/** Probes whether the workspace is a git work tree; defaults to detectGitWorkspace. */
 	gitProbe?: (cwd: string, signal?: AbortSignal) => Promise<GitWorkspaceProbe>
-	createGuard?: () => VerifierGuard
+	createGuard?: (options: VerifierGuardOptions) => VerifierGuard
 	snapshot?: (cwd: string, signal?: AbortSignal) => Promise<WorkspaceSnapshot | undefined>
 	head?: (cwd: string, signal?: AbortSignal) => Promise<HeadState | undefined>
-	facts?: (request: {
-		cwd: string
-		/** The ferment baseline commit; absent when no baseline was captured. */
-		baseline?: string
-		/** The before-run snapshot the baseline is diffed against (absent outside git). */
-		current?: WorkspaceSnapshot
-		keptProbes: readonly { path: string; requirementId: string }[]
-		signal?: AbortSignal
-	}) => Promise<FermentV2VerifierFacts>
-	/** Creates the baseline worktree for the run; defaults to createBaselineWorktree. */
-	createWorktree?: (cwd: string, baseline: string, signal?: AbortSignal) => Promise<BaselineWorktree | undefined>
+	/** Reserves the run's lazy baseline worktree; defaults to reserveBaselineWorktree. */
+	reserveWorktree?: (cwd: string, baseline: string) => BaselineWorktree | undefined
 	enforceIntegrity?: typeof enforceWorkspaceIntegrity
 	redact?: (text: string) => Promise<string>
 	/** Backoff sleep; the default ends early when the signal aborts. */
@@ -457,7 +452,6 @@ function validateParsedVerdict(
 	evidence: ReadonlyMap<string, VerifierEvidence>,
 	proposedAnswer: string | undefined,
 	testInventoryFlags: readonly TestInventoryFlag[],
-	testInventoryIncomplete: boolean,
 ): ValidatedVerdict {
 	// Every cited ID must match a stamped tool result before any verdict is
 	// accepted — a hallucinated [eN] citation rejects the verdict.
@@ -478,19 +472,9 @@ function validateParsedVerdict(
 		}
 	}
 	if (parsed.verdict === "met") {
-		// An incomplete inventory is never a clean one: when git failed while
-		// computing the baseline comparison — the whole diff, the baseline
-		// test-file enumeration, or a changed-file marker diff — the flag list
-		// may be missing entries or was not collected at all, so a `met`
-		// verdict cannot be accepted on it.
-		if (testInventoryIncomplete) {
-			return {
-				kind: "ok",
-				verdict: "continue",
-				reason:
-					"The test inventory could not be collected completely (git failed while diffing the workspace against the baseline, enumerating baseline test files, or diffing changed ones), so this completion claim cannot be accepted yet — the flag list may be missing deleted, renamed, or modified test files or added skip/only markers, or was not collected at all; claim completion again so the host re-collects the inventory.",
-			}
-		}
+		// An incomplete or missing inventory does not block `met`: the prompt
+		// tells the verifier to inspect changed test files itself, so a
+		// persistent git failure never makes completion impossible.
 		// A met verdict must address every host-detected test-inventory flag:
 		// deleted, renamed, or modified pre-existing tests, added skip/only
 		// markers, and kept-probe changes are the classic ways an implementer
@@ -542,49 +526,36 @@ function validateParsedVerdict(
 	return { kind: "ok", verdict: parsed.verdict, reason: failingCheckReason(parsed.checks, evidence) ?? parsed.reason }
 }
 
+/** Integrity outcome attached when the before-run snapshot failed: the verifier ran without the guard. */
+const UNENFORCED_INTEGRITY: IntegrityResult = {
+	violated: false,
+	restored: [],
+	removed: [],
+	headMoved: false,
+	unenforced: true,
+}
+
 /**
- * The default facts gatherer: workspace facts against the ferment baseline
- * when one exists and its diff can be computed — changed files including the
- * ones that were untracked at start, diff stat, git state, and the
- * test-inventory flags — and vs-HEAD facts otherwise (outside git, or when
- * the baseline diff failed; the prompt says which basis the verifier sees).
+ * Workspace facts for the run, through the one facts path: the before-run
+ * snapshot compared against the ferment baseline, or against the before-run
+ * HEAD commit when the ferment has none. Facts are `unavailable` when there
+ * is no snapshot, nothing to compare against, or the diff fails.
  */
-async function defaultGatherVerifierFacts(request: {
+async function gatherVerifierFacts(request: {
 	cwd: string
+	gitProbe: GitWorkspaceProbe
+	before?: WorkspaceSnapshot
+	beforeHead?: HeadState
 	baseline?: string
-	current?: WorkspaceSnapshot
 	keptProbes: readonly { path: string; requirementId: string }[]
 	signal?: AbortSignal
 }): Promise<FermentV2VerifierFacts> {
-	if (!request.baseline || !request.current) return gatherVerifierFacts(request.cwd, request.signal)
-	const workspace = await gatherWorkspaceFacts(
-		request.cwd,
-		request.baseline,
-		request.current,
-		request.keptProbes,
-		request.signal,
-	)
-	if (!workspace) {
-		return {
-			...(await gatherVerifierFacts(request.cwd, request.signal)),
-			baselineCommit: request.baseline,
-			// The whole baseline comparison failed, so the inventory was never
-			// collected — an absent flag list must never read as a clean one.
-			// Validation rejects a `met` verdict until a run collects it.
-			testInventoryUnavailable: true,
-		}
-	}
-	return {
-		available: true,
-		changedFiles: workspace.changedFiles,
-		git: {
-			branch: workspace.git.branch,
-			head: workspace.git.head,
-			uncommittedFiles: workspace.git.uncommittedFiles,
-		},
-		baselineCommit: request.baseline,
-		workspace,
-	}
+	if (request.gitProbe === "outside_git") return { basis: "outside_git" }
+	const against = request.baseline ?? (request.beforeHead?.kind === "commit" ? request.beforeHead.sha : undefined)
+	if (!request.before || !against) return { basis: "unavailable" }
+	const workspace = await gatherWorkspaceFacts(request.cwd, against, request.before, request.keptProbes, request.signal)
+	if (!workspace) return { basis: "unavailable" }
+	return { basis: request.baseline ? "baseline" : "head", workspace }
 }
 
 export async function evaluateFermentV2(
@@ -651,34 +622,19 @@ export async function evaluateFermentV2(
 		}
 	}
 
-	// Fail closed: the verifier runs only when the workspace's integrity can
-	// be protected. A confirmed non-git workspace ("outside_git") runs without
-	// integrity; a git workspace whose tree cannot be snapshotted — or whose
-	// HEAD cannot be resolved — never spawns the verifier, so its verdicts
-	// cannot certify a tree the host could not restore. An undeterminable
-	// workspace ("unknown") fails closed the same way.
+	// Integrity protection: the working tree is snapshotted before the run so
+	// verifier changes can be reverted afterwards. Outside git there is nothing
+	// to snapshot. When git cannot answer or the snapshot fails, the verifier
+	// still runs with integrity unenforced — the prompt tells it not to write
+	// and the result carries `integrity.unenforced` for a one-time notice — so
+	// a large or unusual repository never makes completion impossible. An
+	// unresolvable HEAD only disables HEAD-move detection.
 	if (input.signal?.aborted) return unavailable(`Verifier ${modelRef ?? "session model"} was cancelled.`, "cancelled")
 	const gitProbe = await (deps?.gitProbe ?? detectGitWorkspace)(input.cwd, input.signal)
-	if (gitProbe === "unknown") {
-		return unavailable(
-			"Workspace git state could not be determined, so the verifier did not run: the working tree could not be protected.",
-			"integrity_unavailable",
-		)
-	}
-	const before = gitProbe === "git" ? await (deps?.snapshot ?? snapshotWorkspace)(input.cwd, input.signal) : undefined
-	if (gitProbe === "git" && !before) {
-		return unavailable(
-			"The working tree could not be snapshotted before the verifier run, so the verifier did not run: the working tree could not be protected.",
-			"integrity_unavailable",
-		)
-	}
+	const before =
+		gitProbe === "outside_git" ? undefined : await (deps?.snapshot ?? snapshotWorkspace)(input.cwd, input.signal)
+	const integrityUnenforced = gitProbe !== "outside_git" && !before
 	const beforeHead = before ? await (deps?.head ?? workspaceHead)(input.cwd, input.signal) : undefined
-	if (before && !beforeHead) {
-		return unavailable(
-			"Workspace HEAD could not be resolved before the verifier run, so the verifier did not run: HEAD moves could not be detected.",
-			"integrity_unavailable",
-		)
-	}
 
 	let result: FermentV2EvaluationResult
 	try {
@@ -719,6 +675,8 @@ export async function evaluateFermentV2(
 				baseResultFields,
 			)
 		}
+	} else if (integrityUnenforced) {
+		result = { ...result, integrity: UNENFORCED_INTEGRITY }
 	}
 	// The baseline worktree is disposed after every run — verdict, error, and
 	// abort alike — once integrity has been enforced. Disposal is best-effort:
@@ -745,18 +703,24 @@ export async function evaluateFermentV2(
 		modelFallback = modelChoice.fallback
 		unusableEvaluatorRefs = modelChoice.unusableRefs
 
-		guard = (deps?.createGuard ?? createVerifierGuard)()
-		// Before every run: the host-provided baseline worktree the verifier
-		// attributes failures and checks new tests in. A baseline implies a git
-		// workspace (capture returns undefined outside git); `before` is the
-		// fresh snapshot the facts are diffed against.
-		if (input.baseline && before) {
-			worktree = await (deps?.createWorktree ?? createBaselineWorktree)(input.cwd, input.baseline.commit, input.signal)
-		}
-		const facts = await (deps?.facts ?? defaultGatherVerifierFacts)({
+		// The baseline worktree the verifier attributes failures and checks new
+		// tests in is only reserved here; the guard checks it out on the first
+		// tool call that references its path. A baseline implies a git
+		// workspace; `before` is the fresh snapshot the facts are diffed against.
+		const reserved =
+			input.baseline && before
+				? (deps?.reserveWorktree ?? reserveBaselineWorktree)(input.cwd, input.baseline.commit)
+				: undefined
+		worktree = reserved
+		guard = (deps?.createGuard ?? createVerifierGuard)(
+			reserved ? { baselineWorktree: { path: reserved.path, ensure: () => reserved.ensure(input.signal) } } : {},
+		)
+		const facts = await gatherVerifierFacts({
 			cwd: input.cwd,
+			gitProbe,
+			...(before ? { before } : {}),
+			...(beforeHead ? { beforeHead } : {}),
 			...(input.baseline ? { baseline: input.baseline.commit } : {}),
-			...(before ? { current: before } : {}),
 			keptProbes: input.keptProbes ?? [],
 			signal: input.signal,
 		})
@@ -765,7 +729,9 @@ export async function evaluateFermentV2(
 		let prompt = buildVerifierTaskPrompt({
 			objective: objectiveText(input.objective, ctx.cwd),
 			cwd: input.cwd,
-			facts: { ...facts, ...(worktree ? { baselineWorktree: worktree.path } : {}) },
+			facts,
+			...(reserved ? { baselineWorktree: reserved.path } : {}),
+			...(integrityUnenforced ? { integrityUnenforced } : {}),
 			todos: input.todos,
 			...(input.completionConfidence ? { completionConfidence: input.completionConfidence } : {}),
 			...(proposedAnswer !== undefined ? { proposedAnswer } : {}),
@@ -804,15 +770,17 @@ export async function evaluateFermentV2(
 				)
 			}
 			providerRequestCount++
-			// The Verifier persona disables extensions, so PII redaction rides
-			// along as an inline factory (no-op when redaction is disabled). It
-			// runs before the guard so the guard stamps — and records as evidence
-			// excerpts for verdict reasons — already-redacted content.
+			// The Verifier persona disables extensions, so PII redaction and the
+			// permission system ride along as inline factories. Redaction (a no-op
+			// when disabled) runs before the guard so the guard stamps — and
+			// records as evidence excerpts for verdict reasons — already-redacted
+			// content; permissions gate verifier bash by the session's mode (the
+			// child cannot prompt, so non-read-only commands go to the classifier).
 			run = await spawn({
 				model,
 				prompt,
 				cwd: input.cwd,
-				extensionFactories: [piiRedactionExtension, guard.extension],
+				extensionFactories: [piiRedactionExtension, permissionsExtension, guard.extension],
 				signal: runSignal,
 				maxDuration,
 			})
@@ -852,18 +820,13 @@ export async function evaluateFermentV2(
 		}
 		const verifierRun = run
 
-		// The flag list that validation runs against is never treated as clean
-		// when it could not be collected — partially (a workspace comparison
-		// marked it incomplete) or not at all (the baseline diff failed and the
-		// facts degraded to vs-HEAD with no workspace section; zero flags there
-		// mean "not collected", never "no flags").
-		const testInventoryFlags = facts.workspace?.testInventoryFlags ?? []
-		const testInventoryIncomplete =
-			facts.workspace?.testInventoryIncomplete === true || facts.testInventoryUnavailable === true
+		// Collected flags must be addressed; missing or incomplete inventories
+		// are reported in the prompt and do not block `met`.
+		const testInventoryFlags = "workspace" in facts ? facts.workspace.testInventoryFlags : []
 
 		const parsed = parseFermentV2EvaluatorOutput(verifierRun.text)
 		let validated = parsed
-			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags, testInventoryIncomplete)
+			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags)
 			: ({ kind: "correct", reason: "no valid JSON verdict was returned.", failureType: "invalid_output" } as const)
 		if (validated.kind === "correct") {
 			correctionCount++
@@ -893,7 +856,7 @@ export async function evaluateFermentV2(
 			}
 			const reparsed = parseFermentV2EvaluatorOutput(corrected.text)
 			validated = reparsed
-				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags, testInventoryIncomplete)
+				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags)
 				: ({
 						kind: "correct",
 						reason: "no valid JSON verdict was returned after the correction.",

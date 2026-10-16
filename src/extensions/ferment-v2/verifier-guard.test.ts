@@ -6,6 +6,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -13,7 +14,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { createExtensionApi } from "../__mocks__/extension-api.js"
 import { createVerifierGuard, enforceWorkspaceIntegrity, type VerifierGuard } from "./verifier-guard.js"
 import {
@@ -109,6 +110,42 @@ describe("createVerifierGuard evidence stamping", () => {
 			excerpt: "hi",
 		})
 		expect(guard.evidence.get("e2")?.isError).toBe(true)
+	})
+})
+
+describe("createVerifierGuard baseline worktree", () => {
+	function toolCall(input: Record<string, unknown>, toolName = "bash") {
+		return { type: "tool_call", toolCallId: "c1", toolName, input }
+	}
+
+	it("checks the worktree out only when a tool call references its path", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "kimchi-verifier-lazy-wt-"))
+		try {
+			const ensure = vi.fn(async () => true)
+			const ext = bindGuard(createVerifierGuard({ baselineWorktree: { path: dir, ensure } }))
+			expect(await ext.emit("tool_call", toolCall({ command: "pnpm test" }))).toEqual([undefined])
+			expect(ensure).not.toHaveBeenCalled()
+			expect(await ext.emit("tool_call", toolCall({ command: `cd ${dir} && pnpm test` }))).toEqual([undefined])
+			expect(await ext.emit("tool_call", toolCall({ path: join(dir, "src", "a.ts") }, "read"))).toEqual([undefined])
+			// The symlink-resolved form (macOS keeps the temp dir under /private) counts too.
+			expect(await ext.emit("tool_call", toolCall({ command: `ls ${realpathSync(dir)}` }))).toEqual([undefined])
+			expect(ensure).toHaveBeenCalledTimes(3)
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	it("blocks a call that references the worktree when it cannot be created", async () => {
+		const path = "/tmp/kimchi-ferment-v2-baseline-missing"
+		const ext = bindGuard(createVerifierGuard({ baselineWorktree: { path, ensure: async () => false } }))
+		const [result] = await ext.emit("tool_call", toolCall({ command: `cd ${path} && pnpm test` }))
+		expect(result).toMatchObject({ block: true })
+		expect((result as { reason: string }).reason).toContain("could not be created")
+	})
+
+	it("does not intercept tool calls without a reserved worktree", async () => {
+		const ext = bindGuard(createVerifierGuard())
+		expect(await ext.emit("tool_call", toolCall({ command: "ls /tmp" }))).toEqual([])
 	})
 })
 
@@ -565,6 +602,18 @@ describe("enforceWorkspaceIntegrity", () => {
 			const tags = await git(dir, ["ls-files", "-v", "--", "tracked.txt", "src/nested.txt"])
 			expect(tags).toContain("S tracked.txt")
 			expect(tags).toContain("h src/nested.txt")
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	it("skips HEAD-move detection when the before-run HEAD is unknown", async () => {
+		const dir = await initRepo()
+		try {
+			const before = await snapshotWorkspace(dir)
+			await git(dir, ["checkout", "-q", "-b", "verifier-scratch"])
+			const result = await enforceWorkspaceIntegrity(dir, before as never, undefined)
+			expect(result).toMatchObject({ violated: false, headMoved: false, restored: [], removed: [] })
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
