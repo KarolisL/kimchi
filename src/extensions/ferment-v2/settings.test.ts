@@ -39,6 +39,10 @@ describe("parseFermentV2Settings", () => {
 		expect(parseFermentV2Settings(undefined).evaluationTimeoutMs).toBe(600_000)
 	})
 
+	it("defaults the evaluator model list to the ordered Ferment V2 pair", () => {
+		expect(parseFermentV2Settings(undefined).evaluatorModels).toEqual(["kimchi-dev/glm-5.3", "kimchi-dev/kimi-k3"])
+	})
+
 	it("returns all defaults when the Ferment V2 value is not a plain object", () => {
 		for (const value of [undefined, null, "fermentV2", ["not", "an", "object"]]) {
 			expect(parseFermentV2Settings(value)).toEqual(DEFAULT_FERMENT_V2_SETTINGS)
@@ -53,6 +57,7 @@ describe("parseFermentV2Settings", () => {
 				maxConsecutiveErrors: 7,
 				defaultTokenBudget: 250_000,
 				evaluationTimeoutMs: 45_000,
+				evaluatorModels: ["other/evaluator", "another/reviewer"],
 			}),
 		).toEqual({
 			autoResume: false,
@@ -60,7 +65,14 @@ describe("parseFermentV2Settings", () => {
 			maxConsecutiveErrors: 7,
 			defaultTokenBudget: 250_000,
 			evaluationTimeoutMs: 45_000,
+			evaluatorModels: ["other/evaluator", "another/reviewer"],
 		})
+	})
+
+	it("trims accepted evaluator model refs", () => {
+		expect(
+			parseFermentV2Settings({ evaluatorModels: [" other/evaluator ", "another/reviewer"] }).evaluatorModels,
+		).toEqual(["other/evaluator", "another/reviewer"])
 	})
 
 	it.each([
@@ -81,6 +93,11 @@ describe("parseFermentV2Settings", () => {
 			invalid: [0, 30_000.5, "30000"],
 			fallback: DEFAULT_FERMENT_V2_SETTINGS.evaluationTimeoutMs,
 		},
+		{
+			field: "evaluatorModels",
+			invalid: ["glm-5.3", [], [""], ["  "], ["other/evaluator", ""], ["other/evaluator", 3], {}],
+			fallback: DEFAULT_FERMENT_V2_SETTINGS.evaluatorModels,
+		},
 	] as const)("falls back for invalid $field values", ({ field, invalid, fallback }) => {
 		for (const value of invalid) {
 			expect(parseFermentV2Settings({ [field]: value })[field], `invalid ${field}: ${String(value)}`).toBe(fallback)
@@ -94,6 +111,7 @@ describe("parseFermentV2Settings", () => {
 			maxConsecutiveErrors: -1,
 			defaultTokenBudget: 500_000,
 			evaluationTimeoutMs: "not a number",
+			evaluatorModels: "not a list",
 		})
 		expect(result).toEqual({
 			autoResume: DEFAULT_FERMENT_V2_SETTINGS.autoResume,
@@ -101,6 +119,7 @@ describe("parseFermentV2Settings", () => {
 			maxConsecutiveErrors: DEFAULT_FERMENT_V2_SETTINGS.maxConsecutiveErrors,
 			defaultTokenBudget: 500_000,
 			evaluationTimeoutMs: DEFAULT_FERMENT_V2_SETTINGS.evaluationTimeoutMs,
+			evaluatorModels: DEFAULT_FERMENT_V2_SETTINGS.evaluatorModels,
 		})
 	})
 })
@@ -118,6 +137,11 @@ describe("getFermentV2Settings", () => {
 			maxConsecutiveErrors: 9,
 			autoResume: false,
 		})
+	})
+
+	it("reads the evaluator model list from settings.json", () => {
+		seed({ fermentV2: { evaluatorModels: ["other/evaluator"] } })
+		expect(getFermentV2Settings().evaluatorModels).toEqual(["other/evaluator"])
 	})
 
 	it("falls back to defaults when Ferment V2 is not an object", () => {

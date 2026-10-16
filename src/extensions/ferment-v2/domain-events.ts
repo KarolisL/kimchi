@@ -71,6 +71,10 @@ export interface FermentV2EvaluatedPayload {
 	verdict: "continue" | "met" | "impossible" | "unavailable"
 	count: number
 	model?: string
+	/** True when the evaluator ran on the implementer's own session model. */
+	sameModelAsImplementer?: boolean
+	/** Set when the configured evaluator models were all unusable and the session model was used instead. */
+	modelFallback?: "session"
 	usage?: FermentV2EvaluatorUsage
 	durationMs: number
 	timeoutMs: number

@@ -129,6 +129,22 @@ export function recordFermentV2Evaluation(
 	}
 }
 
+/**
+ * Persist that the user has been warned about the evaluator running on the
+ * implementer's model. Idempotent: the flag is never cleared once set, so the
+ * warning fires at most once per ferment (also across resume/replay).
+ */
+export function markFermentV2EvaluatorModelWarned(
+	state: FermentV2State,
+	expectedId: string,
+	expectedRevision: number,
+	now: string,
+): SessionFermentV2 {
+	const current = requireCurrentFermentV2(state, expectedId, expectedRevision)
+	if (current.evaluatorModelWarned) return current
+	return { ...current, evaluatorModelWarned: true, updatedAt: now }
+}
+
 export function setFermentV2ConsecutiveErrorTurns(
 	state: FermentV2State,
 	expectedId: string,
@@ -286,6 +302,7 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 		(value.presentation !== undefined && presentation === undefined) ||
 		(value.completionConfidence !== undefined && completionConfidence === undefined) ||
 		(value.evaluationCount !== undefined && !isNonNegativeInteger(value.evaluationCount)) ||
+		(value.evaluatorModelWarned !== undefined && value.evaluatorModelWarned !== true) ||
 		(value.consecutiveErrorTurns !== undefined && !isNonNegativeInteger(value.consecutiveErrorTurns)) ||
 		(value.unchangedContinuationTurns !== undefined && !isNonNegativeInteger(value.unchangedContinuationTurns)) ||
 		(value.tokensUsed !== undefined && !isNonNegativeInteger(value.tokensUsed)) ||
@@ -310,6 +327,7 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 		...(completionConfidence && status === "complete" ? { completionConfidence } : {}),
 		...(value.evaluationCount === undefined ? {} : { evaluationCount: value.evaluationCount }),
 		...(lastEvaluation ? { lastEvaluation } : {}),
+		...(value.evaluatorModelWarned === true ? { evaluatorModelWarned: true } : {}),
 		...(value.consecutiveErrorTurns === undefined ? {} : { consecutiveErrorTurns: value.consecutiveErrorTurns }),
 		...(value.unchangedContinuationTurns === undefined
 			? {}
@@ -345,10 +363,12 @@ function parseFermentV2Evaluation(value: unknown): FermentV2Evaluation | undefin
 	const verdict = FERMENT_V2_EVALUATION_VERDICTS.find((candidate) => candidate === value.verdict)
 	if (!verdict || !isNonEmptyString(value.reason) || !isNonEmptyString(value.evaluatedAt)) return undefined
 	if (value.model !== undefined && !isNonEmptyString(value.model)) return undefined
+	if (value.sameModelAsImplementer !== undefined && value.sameModelAsImplementer !== true) return undefined
 	return {
 		verdict,
 		reason: value.reason,
 		...(typeof value.model === "string" ? { model: value.model } : {}),
+		...(value.sameModelAsImplementer === true ? { sameModelAsImplementer: true } : {}),
 		evaluatedAt: value.evaluatedAt,
 	}
 }

@@ -76,6 +76,7 @@ import {
 	editFermentV2,
 	type FermentV2State,
 	isRecord,
+	markFermentV2EvaluatorModelWarned,
 	putFermentV2Entry,
 	recordFermentV2Evaluation,
 	replaceFermentV2,
@@ -105,6 +106,7 @@ import {
 	type PendingFermentV2Continuation,
 	type SessionFermentV2,
 } from "./types.js"
+import { formatFermentV2EvaluatorModelWarning } from "./verifier-model.js"
 
 type FermentV2MutationContext = ExtensionContext & Partial<Pick<ExtensionCommandContext, "waitForIdle">>
 
@@ -282,6 +284,8 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			verdict: override?.verdict ?? result.verdict,
 			count,
 			model: result.model,
+			...(result.sameModelAsImplementer ? { sameModelAsImplementer: true } : {}),
+			...(result.modelFallback ? { modelFallback: result.modelFallback } : {}),
 			usage: result.usage,
 			durationMs: diagnostics.durationMs,
 			timeoutMs: diagnostics.timeoutMs,
@@ -2082,9 +2086,24 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 				verdict: result.verdict,
 				reason: result.reason,
 				...(result.model ? { model: result.model } : {}),
+				...(result.sameModelAsImplementer ? { sameModelAsImplementer: true } : {}),
 				evaluatedAt: now,
 			}
-			const evaluated = recordFermentV2Evaluation(fermentV2, fermentV2.id, fermentV2.revision, evaluation, now)
+			let evaluated = recordFermentV2Evaluation(fermentV2, fermentV2.id, fermentV2.revision, evaluation, now)
+			// One-time-per-ferment warning when the evaluator runs on the implementer's own model.
+			if ((result.sameModelAsImplementer || result.modelFallback) && !fermentV2.evaluatorModelWarned) {
+				ctx.ui.notify(
+					formatFermentV2EvaluatorModelWarning({
+						ref: result.model,
+						sameAsImplementer: result.sameModelAsImplementer,
+						modelFallback: result.modelFallback,
+						configuredRefs: getFermentV2Settings().evaluatorModels,
+						unusableRefs: result.unusableEvaluatorRefs,
+					}),
+					"warning",
+				)
+				evaluated = markFermentV2EvaluatorModelWarned(evaluated, evaluated.id, evaluated.revision, now)
+			}
 			const evaluatedDraft = result.verdict === "met" ? result.acceptedFinalAnswer : undefined
 			capturedConversation = undefined
 			substantiveToolUseSinceEvaluation = false

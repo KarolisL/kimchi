@@ -17,6 +17,8 @@ export interface FermentV2Evaluation {
 	verdict: FermentV2EvaluationVerdict
 	reason: string
 	model?: string
+	/** True when the evaluator ran on the implementer's own session model. */
+	sameModelAsImplementer?: boolean
 	evaluatedAt: string
 }
 
@@ -48,6 +50,8 @@ export interface SessionFermentV2 {
 	completionConfidence?: FermentV2CompletionConfidence
 	evaluationCount?: number
 	lastEvaluation?: FermentV2Evaluation
+	/** Set once the user has been warned that the evaluator runs on the implementer's model, so the warning fires once per ferment even across resume. */
+	evaluatorModelWarned?: boolean
 	consecutiveErrorTurns?: number
 	unchangedContinuationTurns?: number
 	tokensUsed: number

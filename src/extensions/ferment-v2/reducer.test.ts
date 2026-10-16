@@ -5,6 +5,7 @@ import {
 	clearFermentV2Entry,
 	createFermentV2,
 	editFermentV2,
+	markFermentV2EvaluatorModelWarned,
 	putFermentV2Entry,
 	recordFermentV2Evaluation,
 	replaceFermentV2,
@@ -16,6 +17,7 @@ import {
 
 const T1 = "2026-07-16T10:00:00.000Z"
 const T2 = "2026-07-16T10:01:00.000Z"
+const T3 = "2026-07-16T10:02:00.000Z"
 
 describe("Ferment V2 reducer", () => {
 	it("assigns a short plan name without shortening the execution objective", () => {
@@ -279,6 +281,43 @@ describe("Ferment V2 reducer", () => {
 				T2,
 			),
 		).toThrow(/current Ferment V2 is ferment-v2-a revision 1/)
+	})
+
+	it("persists the same-model-as-implementer evaluation flag through replay", () => {
+		const fermentV2 = createFermentV2(undefined, "ship", "ferment-v2-a", T1)
+		const evaluated = recordFermentV2Evaluation(
+			fermentV2,
+			"ferment-v2-a",
+			1,
+			{
+				verdict: "met",
+				reason: "all checks pass",
+				model: "test/session",
+				sameModelAsImplementer: true,
+				evaluatedAt: T2,
+			},
+			T2,
+		)
+
+		expect(restoreFermentV2([putFermentV2Entry(evaluated)])).toEqual(evaluated)
+		expect(evaluated.lastEvaluation).toMatchObject({ model: "test/session", sameModelAsImplementer: true })
+	})
+
+	it("marks the evaluator-model warning once and keeps it across replay and edits", () => {
+		const fermentV2 = createFermentV2(undefined, "ship", "ferment-v2-a", T1)
+		const warned = markFermentV2EvaluatorModelWarned(fermentV2, "ferment-v2-a", 1, T2)
+		const warnedAgain = markFermentV2EvaluatorModelWarned(warned, "ferment-v2-a", 1, T3)
+
+		expect(warned).toMatchObject({ evaluatorModelWarned: true, updatedAt: T2 })
+		expect(warnedAgain).toBe(warned)
+		expect(restoreFermentV2([putFermentV2Entry(warned)])).toEqual(warned)
+
+		const edited = editFermentV2(warned, "ferment-v2-a", 1, "revised", T3)
+		expect(edited.evaluatorModelWarned).toBe(true)
+
+		expect(() => markFermentV2EvaluatorModelWarned(warned, "ferment-v2-a", 2, T3)).toThrow(
+			/current Ferment V2 is ferment-v2-a revision 1/,
+		)
 	})
 
 	it.each([

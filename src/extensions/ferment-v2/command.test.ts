@@ -116,9 +116,26 @@ describe("Ferment V2 command", () => {
 			},
 		}
 		expect(formatFermentV2Summary(evaluated)).toContain(
-			"Evaluations: 2\nLast evaluation: continue — missing smoke test",
+			"Evaluations: 2\nLast evaluation: continue — missing smoke test (evaluator: test/judge)",
 		)
+		expect(formatFermentV2Summary(evaluated)).not.toContain("same as implementer")
 		expect(formatFermentV2Accounting(evaluated)).toBe("<1m · 1.5k tokens")
+	})
+
+	it("marks the evaluator model as the implementer's in the summary", () => {
+		const evaluated = {
+			...fermentV2("active"),
+			lastEvaluation: {
+				verdict: "met" as const,
+				reason: "all checks pass",
+				model: "test/session",
+				sameModelAsImplementer: true,
+				evaluatedAt: "2026-07-16T10:02:00.000Z",
+			},
+		}
+		expect(formatFermentV2Summary(evaluated)).toContain(
+			"Last evaluation: met — all checks pass (evaluator: test/session, same as implementer)",
+		)
 	})
 
 	it("shows a bounded name in the footer and the complete objective in the summary", () => {

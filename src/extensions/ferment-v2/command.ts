@@ -1,7 +1,7 @@
 import { formatCount } from "../format.js"
 import { FERMENT_V2_COMMAND_NAME } from "./constants.js"
 import { deriveFermentV2Name } from "./name.js"
-import type { SessionFermentV2 } from "./types.js"
+import type { FermentV2Evaluation, SessionFermentV2 } from "./types.js"
 
 export type FermentV2Command =
 	| { action: "show" }
@@ -57,10 +57,17 @@ export function formatFermentV2Summary(fermentV2: SessionFermentV2 | undefined, 
 		approvedPlan ? `Plan: ${approvedPlan.planPath ?? "no saved file"}` : `Objective: ${fermentV2.objective}`,
 		`${approvedPlan ? "Run time" : "Fermenting time"}: ${formatFermentV2Accounting(fermentV2, liveElapsedMs)}`,
 		...(fermentV2.evaluationCount === undefined ? [] : [`Evaluations: ${fermentV2.evaluationCount}`]),
-		...(evaluation ? [`Last evaluation: ${evaluation.verdict} — ${evaluation.reason}`] : []),
+		...(evaluation
+			? [`Last evaluation: ${evaluation.verdict} — ${evaluation.reason}${formatFermentV2EvaluatorModel(evaluation)}`]
+			: []),
 		"",
 		`Commands: ${fermentV2Commands(fermentV2)}`,
 	].join("\n")
+}
+
+function formatFermentV2EvaluatorModel(evaluation: FermentV2Evaluation): string {
+	if (!evaluation.model) return ""
+	return ` (evaluator: ${evaluation.model}${evaluation.sameModelAsImplementer ? ", same as implementer" : ""})`
 }
 
 export function formatFermentV2Accounting(fermentV2: SessionFermentV2, liveElapsedMs = 0): string {

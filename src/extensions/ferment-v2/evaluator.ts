@@ -1,11 +1,8 @@
-import type { Api, Context, Model, Usage } from "@earendil-works/pi-ai"
+import type { Context, Usage } from "@earendil-works/pi-ai"
 import { completeSimple } from "@earendil-works/pi-ai/compat"
 import { type AgentEndEvent, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent"
 import { classifyLLMGatewayError } from "../../llm-gateway-error.js"
 import { INTERNAL_SESSION_ENTRY } from "../../session-visibility.js"
-import { findModelByRef } from "../model-catalog/ref-utils.js"
-import { getMultiModelEnabled } from "../multi-model.js"
-import { getModelRoles, normalizeRoleModels } from "../orchestration/model-roles.js"
 import { getRedactionConfig } from "../pii-redaction/config.js"
 import { redactTextOrThrow } from "../pii-redaction/redactor.js"
 import type { TodoItem } from "../todos/types.js"
@@ -17,6 +14,7 @@ import { objectiveText } from "./objective-file.js"
 import { isRecord } from "./reducer.js"
 import { getFermentV2Settings } from "./settings.js"
 import type { FermentV2EvaluatorUsage } from "./types.js"
+import { resolveFermentV2VerifierModel } from "./verifier-model.js"
 
 export const MAX_TRANSCRIPT_CHARS = 16_000
 export const MAX_TODO_STATE_CHARS = 8_000
@@ -93,6 +91,9 @@ export type FermentV2EvaluationResult =
 			usage: FermentV2EvaluatorUsage
 			diagnostics: FermentV2EvaluatorDiagnostics
 			acceptedFinalAnswer?: string
+			sameModelAsImplementer?: boolean
+			modelFallback?: "session"
+			unusableEvaluatorRefs?: readonly string[]
 	  }
 	| {
 			verdict: "unavailable"
@@ -100,6 +101,9 @@ export type FermentV2EvaluationResult =
 			model?: string
 			usage?: FermentV2EvaluatorUsage
 			diagnostics: FermentV2EvaluatorDiagnostics
+			sameModelAsImplementer?: boolean
+			modelFallback?: "session"
+			unusableEvaluatorRefs?: readonly string[]
 	  }
 
 interface FermentV2EvaluatorCheck {
@@ -145,13 +149,6 @@ type RenderedTranscriptEntry = {
 	prefix: string
 	content: string
 	evidence: boolean
-}
-
-export function resolveFermentV2EvaluatorModel(ctx: ExtensionContext): Model<Api> | undefined {
-	const sessionModel = ctx.model
-	if (!getMultiModelEnabled(ctx.sessionManager)) return sessionModel
-	const assignment = normalizeRoleModels(getModelRoles().judge)[0]
-	return (assignment ? findModelByRef(ctx.modelRegistry, assignment) : undefined) ?? sessionModel
 }
 
 export function parseFermentV2EvaluatorOutput(raw: string): ParsedFermentV2EvaluatorOutput | undefined {
@@ -268,8 +265,12 @@ export async function evaluateFermentV2(
 	const startedAt = Date.now()
 	const sessionModelRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined
 	let modelRef = sessionModelRef
+	let sameModelAsImplementer: boolean | undefined
+	let modelFallback: "session" | undefined
+	let unusableEvaluatorRefs: readonly string[] | undefined
 	let deadline: AbortSignal | undefined
-	const evaluationTimeoutMs = getFermentV2Settings().evaluationTimeoutMs
+	const settings = getFermentV2Settings()
+	const evaluationTimeoutMs = settings.evaluationTimeoutMs
 	let providerRequestCount = 0
 	let timeoutCount = 0
 	let correctionCount = 0
@@ -296,14 +297,21 @@ export async function evaluateFermentV2(
 		reason,
 		...(model ? { model } : {}),
 		...(usage ? { usage } : {}),
+		...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
+		...(modelFallback ? { modelFallback } : {}),
+		...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
 		diagnostics: diagnostics(failureType, httpStatusCode),
 	})
 	try {
 		const inheritedWorkId = tryWorkAttribution(() => getWorkId(ctx))
 		const objective = objectiveText(input.objective, ctx.cwd)
-		const model = resolveFermentV2EvaluatorModel(ctx)
-		if (!model) return unavailable("No evaluator model is available.", "no_model")
-		modelRef = `${model.provider}/${model.id}`
+		const modelChoice = await resolveFermentV2VerifierModel(ctx, settings.evaluatorModels)
+		if (!modelChoice) return unavailable("No evaluator model is available.", "no_model")
+		const model = modelChoice.model
+		modelRef = modelChoice.ref
+		sameModelAsImplementer = modelChoice.sameAsImplementer || undefined
+		modelFallback = modelChoice.fallback
+		unusableEvaluatorRefs = modelChoice.unusableRefs
 		const todoState = renderTodoState(input.todos)
 		if (!todoState) {
 			return unavailable("Current Todo state is too large for a bounded evaluation.", "todo_state_too_large", modelRef)
@@ -428,6 +436,9 @@ export async function evaluateFermentV2(
 					model: modelRef,
 					usage,
 					diagnostics: diagnostics(),
+					...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
+					...(modelFallback ? { modelFallback } : {}),
+					...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
 				}
 			}
 			const acceptedFinalAnswer = parsed.checks?.some((check) => check.kind === "final_answer")
@@ -439,6 +450,9 @@ export async function evaluateFermentV2(
 				usage,
 				diagnostics: diagnostics(),
 				...(acceptedFinalAnswer ? { acceptedFinalAnswer } : {}),
+				...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
+				...(modelFallback ? { modelFallback } : {}),
+				...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
 			}
 		}
 		const reason =
@@ -464,6 +478,9 @@ export async function evaluateFermentV2(
 			reason: `Evaluator ${modelRef ?? "session model"} call failed: ${errorMessage(error)}`,
 			...(modelRef ? { model: modelRef } : {}),
 			...(usage ? { usage } : {}),
+			...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
+			...(modelFallback ? { modelFallback } : {}),
+			...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
 			diagnostics: diagnostics(classified?.reason ?? "call_failed", classified?.httpStatusCode),
 		}
 	}

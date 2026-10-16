@@ -995,6 +995,127 @@ describe("Ferment V2 extension", () => {
 		expect(harness.currentFermentV2()?.evaluationCount).toBeUndefined()
 	})
 
+	it("warns once per ferment when the evaluator model is the implementer's own", async () => {
+		fermentV2SettingsMock.mockReturnValue({ ...DEFAULT_FERMENT_V2_SETTINGS, evaluatorModels: ["test/session"] })
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		const first = await holdEvaluation(harness)
+		first.release({
+			verdict: "continue",
+			reason: "More work is required.",
+			model: "test/session",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+			sameModelAsImplementer: true,
+		})
+		await first.settled
+
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringContaining("only one model configured"), "warning")
+		expect(harness.currentFermentV2()).toMatchObject({
+			evaluationCount: 1,
+			evaluatorModelWarned: true,
+			lastEvaluation: { model: "test/session", sameModelAsImplementer: true },
+		})
+
+		const second = await holdEvaluation(harness)
+		second.release({
+			verdict: "continue",
+			reason: "Still more work.",
+			model: "test/session",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+			sameModelAsImplementer: true,
+		})
+		await second.settled
+
+		const modelWarnings = harness.ui.notify.mock.calls.filter(([message]) =>
+			String(message).includes("only one model configured"),
+		)
+		expect(modelWarnings).toHaveLength(1)
+	})
+
+	it("warns with the no-usable-independent-model cause when configured independent refs are unusable", async () => {
+		fermentV2SettingsMock.mockReturnValue({
+			...DEFAULT_FERMENT_V2_SETTINGS,
+			evaluatorModels: ["test/session", "test/judge"],
+		})
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		const { release, settled } = await holdEvaluation(harness)
+		release({
+			verdict: "continue",
+			reason: "More work is required.",
+			model: "test/session",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+			sameModelAsImplementer: true,
+			unusableEvaluatorRefs: ["test/judge"],
+		})
+		await settled
+
+		expect(harness.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("no usable independent model is available"),
+			"warning",
+		)
+		expect(
+			harness.ui.notify.mock.calls.filter(([message]) =>
+				String(message).includes("no usable independent model is available"),
+			),
+		).toHaveLength(1)
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringContaining("test/judge"), "warning")
+	})
+
+	it("warns once with the fallback cause and reports model-diversity telemetry", async () => {
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		const { release, settled } = await holdEvaluation(harness)
+		release({
+			verdict: "continue",
+			reason: "More work is required.",
+			model: "test/session",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+			sameModelAsImplementer: true,
+			modelFallback: "session",
+		})
+		await settled
+
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringContaining("no configured model available"), "warning")
+		expect(
+			harness.ui.notify.mock.calls.filter(([message]) => String(message).includes("no configured model available")),
+		).toHaveLength(1)
+		const events = harness.events.emit.mock.calls.filter(([name]) => name === FERMENT_V2_EVENTS.EVALUATED)
+		expect(events).toHaveLength(1)
+		expect(events[0]?.[1]).toMatchObject({
+			verdict: "continue",
+			model: "test/session",
+			sameModelAsImplementer: true,
+			modelFallback: "session",
+		})
+	})
+
+	it("omits model-diversity telemetry and warning when the evaluator model differs from the implementer", async () => {
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		const { release, settled } = await holdEvaluation(harness)
+		release({
+			verdict: "continue",
+			reason: "More work is required.",
+			model: "test/evaluator",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+		})
+		await settled
+
+		const events = harness.events.emit.mock.calls.filter(([name]) => name === FERMENT_V2_EVENTS.EVALUATED)
+		expect(events).toHaveLength(1)
+		expect(events[0]?.[1]).not.toHaveProperty("sameModelAsImplementer")
+		expect(events[0]?.[1]).not.toHaveProperty("modelFallback")
+		expect(
+			harness.ui.notify.mock.calls.filter(([message]) => String(message).includes("Ferment V2 evaluator")),
+		).toHaveLength(0)
+	})
+
 	it("records a completion-candidate evaluation once across agent_end and agent_settled", async () => {
 		await harness.command("ship feature A")
 		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
