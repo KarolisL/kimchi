@@ -58,6 +58,7 @@ describe("parseFermentV2Settings", () => {
 				defaultTokenBudget: 250_000,
 				evaluationTimeoutMs: 45_000,
 				evaluatorModels: ["other/evaluator", "another/reviewer"],
+				verifierThinking: "max",
 			}),
 		).toEqual({
 			autoResume: false,
@@ -66,7 +67,15 @@ describe("parseFermentV2Settings", () => {
 			defaultTokenBudget: 250_000,
 			evaluationTimeoutMs: 45_000,
 			evaluatorModels: ["other/evaluator", "another/reviewer"],
+			verifierThinking: "max",
 		})
+	})
+
+	it("defaults the verifier thinking level to low and accepts only known levels, case-insensitively", () => {
+		expect(parseFermentV2Settings(undefined).verifierThinking).toBe("low")
+		expect(parseFermentV2Settings({ verifierThinking: " High " }).verifierThinking).toBe("high")
+		expect(parseFermentV2Settings({ verifierThinking: "turbo" }).verifierThinking).toBe("low")
+		expect(parseFermentV2Settings({ verifierThinking: 3 }).verifierThinking).toBe("low")
 	})
 
 	it("trims accepted evaluator model refs", () => {
@@ -116,6 +125,7 @@ describe("parseFermentV2Settings", () => {
 			defaultTokenBudget: 500_000,
 			evaluationTimeoutMs: "not a number",
 			evaluatorModels: "not a list",
+			verifierThinking: "max",
 		})
 		expect(result).toEqual({
 			autoResume: DEFAULT_FERMENT_V2_SETTINGS.autoResume,
@@ -124,6 +134,7 @@ describe("parseFermentV2Settings", () => {
 			defaultTokenBudget: 500_000,
 			evaluationTimeoutMs: DEFAULT_FERMENT_V2_SETTINGS.evaluationTimeoutMs,
 			evaluatorModels: DEFAULT_FERMENT_V2_SETTINGS.evaluatorModels,
+			verifierThinking: "max",
 		})
 	})
 })

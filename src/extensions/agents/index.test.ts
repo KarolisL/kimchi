@@ -984,6 +984,16 @@ describe("spawnFermentV2VerifierAgent", () => {
 			thinkingLevel: "low",
 			extensionFactories,
 		})
+		// A configured thinking level replaces the low default.
+		await spawnFermentV2VerifierAgent(makeMockPi(), ctx, "verify the work", {
+			model: verifierModel,
+			cwd: ctx.cwd,
+			extensionFactories,
+			signal: new AbortController().signal,
+			thinkingLevel: "max",
+		})
+		const [, , , , maxOptions] = spawnAndWait.mock.calls[1] as unknown[]
+		expect(maxOptions).toMatchObject({ thinkingLevel: "max" })
 		expect(run).toMatchObject({
 			id: "verifier-1",
 			text: '{"verdict":"met"}',

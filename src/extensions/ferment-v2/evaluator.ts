@@ -30,6 +30,7 @@ import {
 	resumeFermentV2VerifierAgent,
 	spawnFermentV2VerifierAgent,
 } from "../agents/index.js"
+import type { ThinkingLevel } from "../agents/personas/types.js"
 import { createPermissionsExtension } from "../permissions/index.js"
 import { getRedactionConfig } from "../pii-redaction/config.js"
 import piiRedactionExtension from "../pii-redaction/index.js"
@@ -190,6 +191,8 @@ export interface FermentV2VerifierSpawnInput {
 	signal: AbortSignal
 	/** Wall-clock cap in seconds; 0 = unlimited. */
 	maxDuration: number
+	/** The verifier session's thinking level (`fermentV2.verifierThinking`). */
+	thinkingLevel: ThinkingLevel
 }
 
 /** Injection seams so every validation branch is unit-testable without a real subagent. */
@@ -978,6 +981,7 @@ export async function evaluateFermentV2(
 				extensionFactories: [piiRedactionExtension, permissions, guard.extension],
 				signal: runSignal,
 				maxDuration,
+				thinkingLevel: settings.verifierThinking,
 			})
 			if (!run) return unavailable("The verifier subagent system is not available.", "agent_unavailable")
 			toolCalls += run.toolCalls
@@ -1096,6 +1100,7 @@ export async function evaluateFermentV2(
 			extensionFactories: spawnInput.extensionFactories,
 			signal: spawnInput.signal,
 			maxDuration: spawnInput.maxDuration,
+			thinkingLevel: spawnInput.thinkingLevel,
 		})
 	}
 

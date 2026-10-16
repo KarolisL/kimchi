@@ -1310,6 +1310,15 @@ describe("Ferment V2 executing verifier", () => {
 		expect(input?.extensionFactories?.[2]).toBe(guardExtension)
 	})
 
+	it("spawns the verifier at the configured thinking level, low by default", async () => {
+		const spawn = spawnFn()
+		await evaluate({ deps: { spawn } })
+		expect(spawn.mock.calls[0]?.[0].thinkingLevel).toBe("low")
+		const maxSpawn = spawnFn()
+		await evaluate({ deps: { spawn: maxSpawn }, settings: { verifierThinking: "max" } })
+		expect(maxSpawn.mock.calls[0]?.[0].thinkingLevel).toBe("max")
+	})
+
 	it("reports the timeout cap as the wall-clock limit when configured", async () => {
 		const spawn = spawnFn()
 		await evaluate({ deps: { spawn }, settings: { evaluationTimeoutMs: 45_000 } })

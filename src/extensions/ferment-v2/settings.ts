@@ -1,4 +1,5 @@
 import { readConfigSetting } from "../../config/settings.js"
+import type { ThinkingLevel } from "../agents/personas/types.js"
 
 export interface FermentV2Settings {
 	autoResume: boolean
@@ -8,7 +9,11 @@ export interface FermentV2Settings {
 	/** Optional wall-clock cap on one verifier run in milliseconds. Default: no cap. */
 	evaluationTimeoutMs: number | undefined
 	evaluatorModels: readonly string[]
+	/** Thinking level of the verifier subagent. Default: `low`. */
+	verifierThinking: ThinkingLevel
 }
+
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 /**
  * Ordered default evaluator models: the first usable entry that is not the
@@ -24,6 +29,7 @@ export const DEFAULT_FERMENT_V2_SETTINGS: Readonly<FermentV2Settings> = {
 	defaultTokenBudget: undefined,
 	evaluationTimeoutMs: undefined,
 	evaluatorModels: DEFAULT_FERMENT_V2_EVALUATOR_MODELS,
+	verifierThinking: "low",
 }
 
 function isBoolean(value: unknown): value is boolean {
@@ -59,6 +65,11 @@ export function parseFermentV2Settings(raw: unknown): FermentV2Settings {
 	else if (raw.evaluationTimeoutMs === null) settings.evaluationTimeoutMs = undefined
 	if (isNonEmptyTrimmedStringArray(raw.evaluatorModels))
 		settings.evaluatorModels = raw.evaluatorModels.map((entry) => entry.trim())
+	if (typeof raw.verifierThinking === "string") {
+		const requested = raw.verifierThinking.trim().toLowerCase()
+		const level = THINKING_LEVELS.find((candidate) => candidate === requested)
+		if (level) settings.verifierThinking = level
+	}
 
 	return settings
 }

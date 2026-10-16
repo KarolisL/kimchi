@@ -92,6 +92,7 @@ import {
 	type JoinMode,
 	type NotificationDetails,
 	type SubagentType,
+	type ThinkingLevel,
 } from "./personas/types.js"
 import { findResumableRemoteRuns, persistRemoteRunState } from "./remote-run-persistence.js"
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./resolution/invocation-config.js"
@@ -868,6 +869,8 @@ export async function spawnFermentV2VerifierAgent(
 		signal: AbortSignal
 		/** Wall-clock cap in seconds; 0 (default) = unlimited. */
 		maxDuration?: number
+		/** Thinking level of the verifier session; default `low`. */
+		thinkingLevel?: ThinkingLevel
 	},
 ): Promise<FermentV2VerifierAgentRun | undefined> {
 	if (!activeManager) return undefined
@@ -900,7 +903,7 @@ export async function spawnFermentV2VerifierAgent(
 		maxTurns: 0,
 		maxDuration: opts.maxDuration ?? 0,
 		inactivityMode: "model_only",
-		thinkingLevel: "low",
+		thinkingLevel: opts.thinkingLevel ?? "low",
 		extensionFactories: opts.extensionFactories,
 	})
 	return verifierRunFromRecord(record)

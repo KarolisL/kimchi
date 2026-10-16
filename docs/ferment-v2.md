@@ -53,7 +53,7 @@ The existing optional Plannotator adapter feeds the same approval path, so brows
 
 ## Settings
 
-Under the `fermentV2` key in `~/.config/kimchi/harness/settings.json`, the defaults are `autoResume: true`, `maxUnchangedContinuations: 3`, `maxConsecutiveErrors: 3`, `defaultTokenBudget: unset`, `evaluationTimeoutMs: unset`, and `evaluatorModels: ["kimchi-dev/glm-5.3", "kimchi-dev/kimi-k3"]`. `autoResume` affects only the interactive session-start kick; invalid or missing values fall back to these defaults. An explicit command-line `--tokens` value overrides `defaultTokenBudget`.
+Under the `fermentV2` key in `~/.config/kimchi/harness/settings.json`, the defaults are `autoResume: true`, `maxUnchangedContinuations: 3`, `maxConsecutiveErrors: 3`, `defaultTokenBudget: unset`, `evaluationTimeoutMs: unset`, `evaluatorModels: ["kimchi-dev/glm-5.3", "kimchi-dev/kimi-k3"]`, and `verifierThinking: "low"` (the verifier subagent's thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). `autoResume` affects only the interactive session-start kick; invalid or missing values fall back to these defaults. An explicit command-line `--tokens` value overrides `defaultTokenBudget`.
 
 `evaluationTimeoutMs` is an optional wall-clock cap on one executing-verifier run. The default is **no cap**: the verifier runs until it returns a verdict, with no turn or duration limit, because a thorough verification (build, tests, inspections) legitimately takes a long time. Set a positive value to bound each run in milliseconds; a timed-out verifier run is **not** retried and pauses the ferment as `unavailable` with failure type `timeout`.
 
