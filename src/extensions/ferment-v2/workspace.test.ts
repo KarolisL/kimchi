@@ -17,6 +17,7 @@ import {
 	BASELINE_WORKTREE_PREFIX,
 	type BaselineWorktree,
 	gatherWorkspaceFacts,
+	listSnapshotPaths,
 	pruneStaleBaselineWorktrees,
 	reserveBaselineWorktree,
 	snapshotWorkspace,
@@ -690,6 +691,29 @@ describe("gatherWorkspaceFacts", () => {
 		writeFileSync(join(repo, "a.txt"), "a\n")
 		await commitAll(repo, "initial")
 		expect(await gatherWorkspaceFacts(repo, "0000000", { commit: "x", tree: "y" }, [])).toBeUndefined()
+	})
+})
+
+describe("listSnapshotPaths", () => {
+	it("lists every snapshot file root-relative, untracked ones included, from a subdirectory too", async () => {
+		const repo = await makeRepo()
+		mkdirSync(join(repo, "src"))
+		writeFileSync(join(repo, "src", "a.ts"), "a\n")
+		await commitAll(repo, "initial")
+		writeFileSync(join(repo, "untracked.test.ts"), "new\n")
+		const snapshot = await snapshotWorkspace(repo)
+		if (!snapshot) throw new Error("expected a snapshot")
+
+		const listed = await listSnapshotPaths(join(repo, "src"), snapshot)
+
+		expect(listed?.root).toBe(realpathSync(repo))
+		expect([...(listed?.paths ?? [])].sort()).toEqual(["src/a.ts", "untracked.test.ts"])
+	})
+
+	it("returns undefined outside a git repository", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "kimchi-v2-workspace-nongit-"))
+		tempDirs.push(dir)
+		expect(await listSnapshotPaths(dir, { commit: "x", tree: "y" })).toBeUndefined()
 	})
 })
 

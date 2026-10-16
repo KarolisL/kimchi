@@ -20,7 +20,8 @@
  * `index.ts`.
  */
 
-import { basename } from "node:path"
+import { realpathSync } from "node:fs"
+import { isAbsolute, relative, resolve } from "node:path"
 import type { Api, Model } from "@earendil-works/pi-ai"
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-works/pi-coding-agent"
 import { classifyLLMGatewayError } from "../../llm-gateway-error.js"
@@ -57,7 +58,9 @@ import {
 	type GitWorkspaceProbe,
 	gatherWorkspaceFacts,
 	type HeadState,
+	listSnapshotPaths,
 	reserveBaselineWorktree,
+	type SnapshotPaths,
 	snapshotWorkspace,
 	type TestInventoryFlag,
 	type WorkspaceSnapshot,
@@ -437,6 +440,48 @@ function unsupportedMetReason(
 	return undefined
 }
 
+/** Source and test file names inside a shell command (`test/grid-probe.tsx`, `probe_case.py`, …). */
+const SOURCE_PATH_TOKEN = /[\w@.+/-]*[\w-]\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|swift|scala|exs?)\b/g
+
+/** What the verifier created during this run: write-tool files, and anything absent from the before-run snapshot. */
+export interface VerifierCreatedFiles {
+	/** The verifier's cwd (relative tokens resolve against it). */
+	cwd: string
+	/** Absolute paths created with the write tool. */
+	written: ReadonlySet<string>
+	/** The before-run snapshot's files; absent outside git or when listing failed. */
+	beforeRun?: SnapshotPaths
+}
+
+function realCwd(cwd: string): string {
+	try {
+		return realpathSync(cwd)
+	} catch {
+		return cwd
+	}
+}
+
+/**
+ * Whether a command runs a file the verifier created in this run: one written
+ * with the write tool, or — for probes created with shell commands — a
+ * repository file that did not exist before the run. The before-run snapshot
+ * already carries the implementer's new tests, so they never qualify.
+ */
+function runsVerifierCreatedFile(command: string, created: VerifierCreatedFiles): boolean {
+	const bases = [created.cwd, realCwd(created.cwd)]
+	for (const token of command.match(SOURCE_PATH_TOKEN) ?? []) {
+		for (const base of bases) {
+			const absolute = resolve(base, token)
+			if (created.written.has(absolute)) return true
+			const before = created.beforeRun
+			if (!before) continue
+			const rel = relative(before.root, absolute)
+			if (rel && !rel.startsWith("..") && !isAbsolute(rel) && !before.paths.has(rel)) return true
+		}
+	}
+	return false
+}
+
 /** Shell commands the check cites (bash evidence only). */
 function citedCommands(check: FermentV2VerifierCheck, evidence: ReadonlyMap<string, VerifierEvidence>): string[] {
 	const commands: string[] = []
@@ -464,7 +509,7 @@ function incompleteProcedureReason(
 	checks: readonly FermentV2VerifierCheck[],
 	testInventoryFlags: readonly TestInventoryFlag[],
 	evidence: ReadonlyMap<string, VerifierEvidence>,
-	createdFiles: ReadonlySet<string>,
+	created: VerifierCreatedFiles,
 ): string | undefined {
 	// Every gap is reported at once: the verifier gets a single correction round.
 	const gaps: string[] = []
@@ -480,7 +525,6 @@ function incompleteProcedureReason(
 			)
 		}
 	}
-	const createdNames = [...createdFiles].map((path) => basename(path))
 	for (const check of checks) {
 		if (check.kind === "final_answer" || check.status !== "pass") continue
 		if ((check.category ?? "behavior") !== "behavior") continue
@@ -498,7 +542,7 @@ function incompleteProcedureReason(
 			)
 			continue
 		}
-		if (check.method === "probe" && !commands.some((command) => createdNames.some((name) => command.includes(name)))) {
+		if (check.method === "probe" && !commands.some((command) => runsVerifierCreatedFile(command, created))) {
 			gaps.push(
 				`Behaviour check ${requirement} is labelled "probe" but cites no run of a probe file you created in this run; write the probe with the write tool and run it.`,
 			)
@@ -584,7 +628,7 @@ function validateParsedVerdict(
 	evidence: ReadonlyMap<string, VerifierEvidence>,
 	proposedAnswer: string | undefined,
 	testInventoryFlags: readonly TestInventoryFlag[],
-	createdFiles: ReadonlySet<string>,
+	created: VerifierCreatedFiles,
 ): ValidatedVerdict {
 	// Every cited ID must match a stamped tool result before any verdict is
 	// accepted — a hallucinated [eN] citation rejects the verdict.
@@ -630,7 +674,7 @@ function validateParsedVerdict(
 		}
 		// A `met` whose procedure skipped independent verification goes back to
 		// the verifier — the gap is in the verification, not the implementation.
-		const incomplete = incompleteProcedureReason(parsed.checks ?? [], testInventoryFlags, evidence, createdFiles)
+		const incomplete = incompleteProcedureReason(parsed.checks ?? [], testInventoryFlags, evidence, created)
 		if (incomplete) {
 			return { kind: "correct", reason: incomplete, failureType: "procedure_incomplete", procedure: true }
 		}
@@ -975,10 +1019,20 @@ export async function evaluateFermentV2(
 		// are reported in the prompt and do not block `met`.
 		const testInventoryFlags = "workspace" in facts ? facts.workspace.testInventoryFlags : []
 
+		// Which files the verifier itself created — probes must run one of them.
+		// The write set is live (a correction may add probes); the before-run
+		// listing is taken once.
+		const beforeRun = before ? await listSnapshotPaths(input.cwd, before, input.signal) : undefined
+		const created: VerifierCreatedFiles = {
+			cwd: input.cwd,
+			written: guard.createdFiles,
+			...(beforeRun ? { beforeRun } : {}),
+		}
+
 		const parsed = parseFermentV2EvaluatorOutput(verifierRun.text)
 		let checks = parsed?.checks
 		let validated: ValidatedVerdict = parsed
-			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags, guard.createdFiles)
+			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags, created)
 			: { kind: "correct", reason: "no valid JSON verdict was returned.", failureType: "invalid_output" }
 		if (validated.kind === "correct") {
 			correctionCount++
@@ -1012,7 +1066,7 @@ export async function evaluateFermentV2(
 			const reparsed = parseFermentV2EvaluatorOutput(corrected.text)
 			checks = reparsed?.checks
 			validated = reparsed
-				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags, guard.createdFiles)
+				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags, created)
 				: {
 						kind: "correct",
 						reason: "no valid JSON verdict was returned after the correction.",

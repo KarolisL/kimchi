@@ -338,6 +338,36 @@ async function workspaceRoot(cwd: string, signal?: AbortSignal): Promise<string>
 	return root
 }
 
+/** The files of a snapshot: the work tree root and root-relative paths. */
+export interface SnapshotPaths {
+	root: string
+	paths: ReadonlySet<string>
+}
+
+/**
+ * List every file of a snapshot (untracked, non-ignored files included — the
+ * snapshot carries them), for "did this exist before the verifier run?"
+ * checks. Undefined when git fails.
+ */
+export async function listSnapshotPaths(
+	cwd: string,
+	snapshot: WorkspaceSnapshot,
+	signal?: AbortSignal,
+): Promise<SnapshotPaths | undefined> {
+	try {
+		const root = await workspaceRoot(cwd, signal)
+		const raw = await createGitRunner(root).run(
+			["ls-tree", "-r", "--name-only", "-z", "--full-tree", snapshot.commit],
+			{
+				signal,
+			},
+		)
+		return { root, paths: new Set(raw.split("\0").filter((path) => path.length > 0)) }
+	} catch {
+		return undefined
+	}
+}
+
 function isInside(path: string, root: string): boolean {
 	const rel = relative(root, path)
 	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)

@@ -30,6 +30,7 @@ import {
 import {
 	detectGitWorkspace,
 	gatherWorkspaceFacts,
+	listSnapshotPaths,
 	reserveBaselineWorktree,
 	snapshotWorkspace,
 	type TestInventoryFlag,
@@ -58,6 +59,7 @@ vi.mock("./workspace.js", async (importOriginal) => {
 		detectGitWorkspace: vi.fn(),
 		reserveBaselineWorktree: vi.fn(),
 		gatherWorkspaceFacts: vi.fn(),
+		listSnapshotPaths: vi.fn(),
 	}
 })
 
@@ -68,6 +70,7 @@ const enforceIntegrityMock = vi.mocked(enforceWorkspaceIntegrity)
 const gitProbeMock = vi.mocked(detectGitWorkspace)
 const gatherWorkspaceFactsMock = vi.mocked(gatherWorkspaceFacts)
 const reserveWorktreeMock = vi.mocked(reserveBaselineWorktree)
+const listSnapshotPathsMock = vi.mocked(listSnapshotPaths)
 
 const CITED_CONTINUE =
 	'{"verdict":"continue","reason":"more work","checks":[{"kind":"work","requirement":"ship it","status":"fail","evidence":["e1"]}]}'
@@ -272,6 +275,7 @@ describe("Ferment V2 executing verifier", () => {
 		enforceIntegrityMock.mockReset().mockResolvedValue(noViolation())
 		gatherWorkspaceFactsMock.mockReset().mockResolvedValue(undefined)
 		reserveWorktreeMock.mockReset().mockReturnValue(undefined)
+		listSnapshotPathsMock.mockReset().mockResolvedValue(undefined)
 	})
 
 	afterEach(() => {
@@ -413,6 +417,39 @@ describe("Ferment V2 executing verifier", () => {
 		it("requires a probe check to cite a run of a file the verifier created", async () => {
 			const resume = vi.fn(async (_id: string, _prompt: string) => makeRun({ text: met({ method: "probe" }) }))
 			const result = await evaluate({ text: met({ method: "probe" }), deps: { resume } })
+			expect(resume.mock.calls[0]?.[1]).toContain('labelled "probe" but cites no run of a probe file you created')
+			expect(result.verdict).toBe("unavailable")
+		})
+
+		it("accepts a probe created with shell commands: a cited run of a repository file absent before the run", async () => {
+			listSnapshotPathsMock.mockResolvedValue({
+				root: "/workspace",
+				paths: new Set(["src/ship.ts", "test/ship.test.ts"]),
+			})
+			const guard = guardWithEvidence(["e1"])
+			const evidence = guard.evidence as Map<string, VerifierEvidence>
+			evidence.set("e1", {
+				...evidence.get("e1"),
+				input: { command: "timeout 300 npx vitest run test/ship.verifier-probe.test.ts" },
+			} as VerifierEvidence)
+			const result = await evaluate({ text: met({ method: "probe" }), deps: { createGuard: () => guard } })
+			expect(listSnapshotPathsMock).toHaveBeenCalledWith("/workspace", { commit: "snap", tree: "tree" }, undefined)
+			expect(result).toMatchObject({ verdict: "met" })
+		})
+
+		it("rejects a probe label on a run of the implementer's own test, which existed before the run", async () => {
+			listSnapshotPathsMock.mockResolvedValue({
+				root: "/workspace",
+				paths: new Set(["src/ship.ts", "test/ship.test.ts"]),
+			})
+			const guard = guardWithEvidence(["e1"])
+			const evidence = guard.evidence as Map<string, VerifierEvidence>
+			evidence.set("e1", {
+				...evidence.get("e1"),
+				input: { command: "npx vitest run test/ship.test.ts" },
+			} as VerifierEvidence)
+			const resume = vi.fn(async (_id: string, _prompt: string) => makeRun({ text: met({ method: "probe" }) }))
+			const result = await evaluate({ text: met({ method: "probe" }), deps: { createGuard: () => guard, resume } })
 			expect(resume.mock.calls[0]?.[1]).toContain('labelled "probe" but cites no run of a probe file you created')
 			expect(result.verdict).toBe("unavailable")
 		})
