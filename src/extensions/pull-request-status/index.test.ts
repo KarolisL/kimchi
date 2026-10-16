@@ -106,6 +106,37 @@ afterEach(async () => {
 })
 
 describe("PR status extension", () => {
+	it("shows no branch PR on the default branch without tracking or work records", async () => {
+		vi.mocked(branches.currentBranch).mockResolvedValue("master")
+		vi.mocked(branches.lookupBranchPullRequest).mockResolvedValue({ branch: "master", pullRequest: undefined })
+		await startStandalone()
+		await vi.waitFor(() => expect(branches.lookupBranchPullRequest).toHaveBeenCalledOnce())
+		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("work-pr", undefined)
+		expect(supervisor.subscribePullRequestReconciliation).not.toHaveBeenCalled()
+		expect(existsSync(join(directory, "work-attribution"))).toBe(false)
+	})
+	it("clears the previous branch PR when switching to the default branch", async () => {
+		await startStandalone()
+		await vi.waitFor(() => expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("work-pr", "PR #7 open"))
+		vi.mocked(branches.currentBranch).mockResolvedValue("master")
+		vi.mocked(branches.lookupBranchPullRequest).mockResolvedValue({ branch: "master", pullRequest: undefined })
+		afterBranchRefresh()
+		await vi.advanceTimersByTimeAsync(30_000)
+		await vi.waitFor(() => expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("work-pr", undefined))
+	})
+	it("keeps the default branch quiet while tracked work has no commits yet", async () => {
+		vi.mocked(branches.currentBranch).mockResolvedValue("master")
+		vi.mocked(branches.lookupBranchPullRequest).mockResolvedValue({ branch: "master", pullRequest: undefined })
+		const work = createExtensionApi()
+		const status = createExtensionApi()
+		createWorkAttributionExtension()(work.api)
+		pullRequestStatusExtension({ ...status.api, events: work.api.events })
+		await start(work)
+		await start(status)
+		await vi.waitFor(() => expect(branches.lookupBranchPullRequest).toHaveBeenCalledOnce())
+		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("work-pr", undefined)
+		expect(supervisor.subscribePullRequestReconciliation).toHaveBeenCalled()
+	})
 	it("shows one renamed PR when contributors saved different repository names", async () => {
 		const api = createExtensionApi()
 		createWorkAttributionExtension()(api.api)

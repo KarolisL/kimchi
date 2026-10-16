@@ -32,48 +32,52 @@ export async function lookupBranchPullRequest(
 	let failure: unknown
 	try {
 		const remote = await repositoryIdentity(cwd, signal, deadline, new Map(), branch)
-		const url = api(remote, remote.provider === "github" ? "pulls" : "merge_requests")
-		url.search = new URLSearchParams(
-			remote.provider === "github"
-				? {
-						state: "all",
-						head: `${remote.name.split("/")[0]}:${branch}`,
-						sort: "updated",
-						direction: "desc",
-						per_page: "1",
-					}
-				: {
-						scope: "all",
-						state: "all",
-						source_branch: branch,
-						// Forks often reuse branch names such as main; older GitLab ignores this filter, so results are checked below.
-						source_project_id: String(remote.id),
-						order_by: "updated_at",
-						sort: "desc",
-						per_page: "100",
-					},
-		).toString()
-		const values =
-			remote.provider === "gitlab"
-				? await pages(remote, url, signal, deadline)
-				: (await requestJSON(remote, url, signal, deadline)).value
-		if (!Array.isArray(values)) throw new LookupError(`${label(remote)} returned invalid pull requests.`)
-		const value =
-			remote.provider === "gitlab"
-				? values.find(
-						(value) => object(value) && value.source_project_id === remote.id && value.source_branch === branch,
-					)
-				: values[0]
-		if (value !== undefined) {
-			const head = object(value)
-				? remote.provider === "gitlab"
-					? value.source_branch
-					: object(value.head)
-						? value.head.ref
-						: undefined
-				: undefined
-			if (head !== branch) throw new LookupError(`${label(remote)} returned a pull request for a different branch.`)
-			pull = pullRequest(value, remote, new Date().toISOString())
+		// A branch-derived PR/MR on the repository's default branch only ever belongs to another
+		// author, so the footer stays clear there; identity metadata already names the default branch.
+		if (remote.defaultBranch !== branch) {
+			const url = api(remote, remote.provider === "github" ? "pulls" : "merge_requests")
+			url.search = new URLSearchParams(
+				remote.provider === "github"
+					? {
+							state: "all",
+							head: `${remote.name.split("/")[0]}:${branch}`,
+							sort: "updated",
+							direction: "desc",
+							per_page: "1",
+						}
+					: {
+							scope: "all",
+							state: "all",
+							source_branch: branch,
+							// Forks often reuse branch names such as main; older GitLab ignores this filter, so results are checked below.
+							source_project_id: String(remote.id),
+							order_by: "updated_at",
+							sort: "desc",
+							per_page: "100",
+						},
+			).toString()
+			const values =
+				remote.provider === "gitlab"
+					? await pages(remote, url, signal, deadline)
+					: (await requestJSON(remote, url, signal, deadline)).value
+			if (!Array.isArray(values)) throw new LookupError(`${label(remote)} returned invalid pull requests.`)
+			const value =
+				remote.provider === "gitlab"
+					? values.find(
+							(value) => object(value) && value.source_project_id === remote.id && value.source_branch === branch,
+						)
+					: values[0]
+			if (value !== undefined) {
+				const head = object(value)
+					? remote.provider === "gitlab"
+						? value.source_branch
+						: object(value.head)
+							? value.head.ref
+							: undefined
+					: undefined
+				if (head !== branch) throw new LookupError(`${label(remote)} returned a pull request for a different branch.`)
+				pull = pullRequest(value, remote, new Date().toISOString())
+			}
 		}
 	} catch (error) {
 		failure = error
