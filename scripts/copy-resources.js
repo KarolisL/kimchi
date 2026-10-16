@@ -12,7 +12,18 @@
 //                                   so the compiled binary resolves assets from the shared data directory
 
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+	cpSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs"
+import { createRequire } from "node:module"
 import { platform, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -133,15 +144,21 @@ try {
 	const jszipPkg = JSON.parse(readFileSync(join(jszipDest, "package.json"), "utf-8"))
 	jszipPkg.main = "dist/jszip.min.js"
 	writeFileSync(join(jszipDest, "package.json"), JSON.stringify(jszipPkg))
-	// @xmldom/xmldom is dependency-free; stage as-is.
-	cpSync(
-		join(projectRoot, "node_modules", "@xmldom", "xmldom"),
-		join(pptxStaging, "node_modules", "@xmldom", "xmldom"),
-		{
+	// @xmldom/xmldom and image-size are dependency-free; pptxgenjs depends
+	// only on the already-staged jszip/image-size. image-size isn't hoisted
+	// to node_modules root (pnpm nests it under pptxgenjs), so resolve it
+	// through pptxgenjs's own package context.
+	for (const dep of ["@xmldom/xmldom", "pptxgenjs", "marked"]) {
+		cpSync(join(projectRoot, "node_modules", dep), join(pptxStaging, "node_modules", dep), {
 			dereference: true,
 			recursive: true,
-		},
-	)
+		})
+	}
+	// Walk through pnpm's symlink: deps live next to pptxgenjs's real path.
+	const pptxgenjsPkg = realpathSync(join(projectRoot, "node_modules", "pptxgenjs", "package.json"))
+	const pptxgenjsRequire = createRequire(pptxgenjsPkg)
+	const imageSizePath = dirname(dirname(pptxgenjsRequire.resolve("image-size/package.json")))
+	cpSync(imageSizePath, join(pptxStaging, "node_modules", "image-size"), { dereference: true, recursive: true })
 	const stagedOut = join(pptxStaging, "pptx.mjs")
 	execFileSync("bun", ["build", stagedEntry, "--target=node", "--format=esm", "--outfile", stagedOut], {
 		stdio: "inherit",

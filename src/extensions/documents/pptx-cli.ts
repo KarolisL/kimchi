@@ -10,11 +10,16 @@
  *                                      names — the vocabulary `edit` accepts.
  *   pptx.mjs check <deck>              Static defects (see pptx-check.ts).
  *
- * create/edit land in their own commits; the dispatcher already knows them so
- * the skill's documentation stays accurate.
+ *   pptx.mjs create <out> --content <file.md> [--theme f.json] [--template deck]
+ *                                      Build a deck from deck Markdown (see
+ *                                      deck-markdown.md for the format).
+ *
+ * edit lands in its own commit; the dispatcher already knows it so the
+ * skill's documentation stays accurate.
  */
 
-import { readFileSync, realpathSync } from "node:fs"
+import { readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs"
+import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { extractPptx } from "./extractors/pptx.js"
 import { MAX_UNITS_PER_CALL, maxFileBytes } from "./limits.js"
@@ -22,11 +27,16 @@ import { DocumentError, isDocumentError } from "./model.js"
 import { checkPptx, renderFindings } from "./pptx-check.js"
 import { inspectPptx, renderInspection } from "./pptx-inspect.js"
 import { renderDocument } from "./render.js"
+import { parseDeckMarkdown, writePptx } from "./writers/pptx.js"
+import type { DeckTheme } from "./writers/pptx-model.js"
+import { createFromTemplate } from "./writers/template.js"
 
 export interface CliIo {
 	stdout: (line: string) => void
 	stderr: (line: string) => void
 	readFile?: (path: string) => Uint8Array
+	/** Write overrides let tests intercept outputs; default is atomic temp+rename. */
+	writeFile?: (path: string, data: Uint8Array) => void
 }
 
 const USAGE = `usage: pptx.mjs <command> [args]
@@ -35,7 +45,7 @@ commands:
   read <deck.pptx> [start-end]                    slides as Markdown (20 per call)
   inspect <deck.pptx>                             layouts, placeholders, shape names
   check <deck.pptx>                               likely defects (overflow, alt text, off-slide)
-  create <out.pptx> --content <file.md>           (lands in a later commit)
+  create <out.pptx> --content <file.md> [--theme <f.json>] [--template <deck.pptx>]
   edit <in.pptx> --out <out.pptx> --ops <file>    (lands in a later commit)`
 
 function readBytes(io: Required<CliIo>["readFile"], path: string): Uint8Array {
@@ -115,9 +125,60 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 				io.stdout(renderFindings(await checkPptx(data)))
 				return 0
 			}
-			case "create":
+			case "create": {
+				const [out, ...flags] = args
+				if (!out)
+					throw new DocumentError(
+						"corrupt",
+						"create needs an output path: pptx.mjs create <out.pptx> --content <file.md>",
+					)
+				if (!out.toLowerCase().endsWith(".pptx"))
+					throw new DocumentError("corrupt", `output path must end in .pptx: ${out}`)
+				const flag = (name: string) => {
+					const i = flags.indexOf(name)
+					return i >= 0 ? flags[i + 1] : undefined
+				}
+				const contentPath = flag("--content")
+				if (!contentPath)
+					throw new DocumentError("corrupt", "create needs --content <file.md> (deck Markdown, see deck-markdown.md)")
+				const content = new TextDecoder().decode(readBytes(readFile, contentPath))
+				const themePath = flag("--theme")
+				let theme: DeckTheme = {}
+				if (themePath) {
+					const raw = new TextDecoder().decode(readBytes(readFile, themePath))
+					let parsed: Record<string, unknown>
+					try {
+						parsed = JSON.parse(raw) as Record<string, unknown>
+					} catch {
+						throw new DocumentError("corrupt", `theme file is not valid JSON: ${themePath}`)
+					}
+					theme = {
+						font: typeof parsed.font === "string" ? parsed.font : undefined,
+						accent: typeof parsed.accent === "string" ? parsed.accent : undefined,
+						slideWidth: typeof parsed.slideWidth === "number" ? parsed.slideWidth : undefined,
+						slideHeight: typeof parsed.slideHeight === "number" ? parsed.slideHeight : undefined,
+					}
+				}
+				const spec = parseDeckMarkdown(content, theme)
+				const templatePath = flag("--template")
+				let bytes: Uint8Array
+				if (templatePath) {
+					if (theme.font || theme.accent || theme.slideWidth || theme.slideHeight) {
+						io.stderr("note: --theme fields are ignored in --template mode; the template's theme wins.")
+					}
+					const templateData = readBytes(readFile, templatePath)
+					enforceSizeCap(templatePath, templateData)
+					bytes = await createFromTemplate(spec, templateData)
+				} else {
+					bytes = await writePptx(spec, { baseDir: dirname(resolve(contentPath)) })
+				}
+				const writeFile = io.writeFile ?? atomicWrite
+				writeFile(out, bytes)
+				io.stdout(`created ${out} (${spec.slides.length} slide${spec.slides.length === 1 ? "" : "s"})`)
+				return 0
+			}
 			case "edit":
-				io.stderr(`${command} is not in this build yet — it lands in a later commit.`)
+				io.stderr("edit is not in this build yet — it lands in a later commit.")
 				return 2
 			case undefined:
 			case "--help":
@@ -135,6 +196,17 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 		}
 		throw err
 	}
+}
+
+/** Write via temp + rename so an interrupted create never leaves a half file. */
+function atomicWrite(path: string, data: Uint8Array): void {
+	const temp = `${path}.pptx-mjs-tmp`
+	try {
+		writeFileSync(temp, data)
+	} catch (err) {
+		throw new DocumentError("corrupt", `Cannot write ${path}: ${(err as Error).message}`)
+	}
+	renameSync(temp, path)
 }
 
 const invokedAsScript = (() => {

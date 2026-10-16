@@ -157,8 +157,16 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 				const notesPath = joinOoxmlPart(ooxmlPartDir(path), target)
 				if (!/notesSlide\d+\.xml$/.test(notesPath) || !pkg.hasXml(notesPath)) continue
 				const notesDoc = pkg.getXml(notesPath)
-				const notesText = byTag(notesDoc, "p")
-					.map((p) => ooxmlTextOf(p))
+				// Only the notes BODY placeholder's text: pull a:p whose nearest sp
+				// ancestor carries <p:ph type="body"> (notes slides also contain the
+				// slide-image and slide-number placeholders, which leak their text).
+				const bodyShape = byTag(notesDoc, "sp").filter((sp) => {
+					for (const ph of byTag(sp, "ph")) return (ph.getAttribute("type") ?? "body") === "body"
+					return false
+				})
+				const scope = bodyShape.length > 0 ? bodyShape : byTag(notesDoc, "sp")
+				const notesText = scope
+					.flatMap((sp) => extractPptxShapeText(sp).text)
 					.filter((line) => line.trim())
 					.join("\n")
 				if (notesText.trim()) blocks.push(`Notes:\n${notesText}`)

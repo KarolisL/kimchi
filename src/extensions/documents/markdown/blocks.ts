@@ -11,7 +11,7 @@
 
 import { lexer, type Token, type Tokens } from "marked"
 
-export type Inline = { text: string; bold?: boolean; italic?: boolean; code?: boolean; href?: string }
+export type Inline = { text: string; bold?: boolean; italic?: boolean; code?: boolean; href?: string; image?: boolean }
 
 export type Block =
 	| { type: "heading"; level: number; inline: Inline[] }
@@ -123,7 +123,7 @@ function inlineOf(tokens: Token[]): Inline[] {
 					break
 				case "image": {
 					const t = tok as Tokens.Image
-					out.push({ text: t.text || t.href, href: t.href })
+					out.push({ text: t.text || t.href, href: t.href, image: true })
 					break
 				}
 				case "br":
