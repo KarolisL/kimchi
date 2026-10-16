@@ -103,12 +103,14 @@ import {
 import { getFermentV2Settings } from "./settings.js"
 import {
 	FERMENT_V2_COMPLETION_CONFIDENCES,
+	type FermentV2Baseline,
 	type FermentV2CompletionConfidence,
 	type FermentV2Evaluation,
 	type PendingFermentV2Continuation,
 	type SessionFermentV2,
 } from "./types.js"
 import { formatFermentV2EvaluatorModelWarning } from "./verifier-model.js"
+import { pruneStaleBaselineWorktrees, snapshotWorkspace } from "./workspace.js"
 
 type FermentV2MutationContext = ExtensionContext & Partial<Pick<ExtensionCommandContext, "waitForIdle">>
 
@@ -368,6 +370,18 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 		const elapsed = startedAt === undefined ? 0 : Math.max(0, nowMs - startedAt)
 		if (tokensUsed === 0 && elapsed === 0) return fermentV2
 		return addFermentV2Accounting(fermentV2, fermentV2.id, tokensUsed, elapsed, timestamp(nowMs))
+	}
+
+	/**
+	 * Capture the ferment's baseline: a snapshot commit of the working tree
+	 * including untracked, non-ignored files (temporary index — the real index,
+	 * tree, and refs are never touched). Outside a git repository, or when the
+	 * snapshot fails, the ferment runs without a baseline: no baseline facts,
+	 * no test-inventory flags, no baseline worktree, and verification proceeds.
+	 */
+	async function captureFermentV2Baseline(cwd: string): Promise<FermentV2Baseline | undefined> {
+		const snapshot = await snapshotWorkspace(cwd)
+		return snapshot ? { commit: snapshot.commit, capturedAt: timestamp() } : undefined
 	}
 
 	function resetFermentV2Runtime(): void {
@@ -971,6 +985,7 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 				todos: todoState?.todos ?? [],
 				...(claim?.completionConfidence ? { completionConfidence: claim.completionConfidence } : {}),
 				...(previousGap ? { previousGap } : {}),
+				...(fermentV2.baseline ? { baseline: fermentV2.baseline } : {}),
 				onVerifierStart: (info) => {
 					verifyingModelRef = info.model
 					updateVerifyingStatus()
@@ -1212,7 +1227,7 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			captured,
 			ctx,
 			source,
-			() => {
+			async () => {
 				assertCurrentSession(ctx, sessionId)
 				assertUnchanged(captured)
 				ensureFermentV2ExecutionMode(sessionId)
@@ -1220,9 +1235,21 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 				const now = timestamp(nowMs)
 				const effectiveTokenBudget = tokenBudget ?? getFermentV2Settings().defaultTokenBudget
 				const replaced = captured ? checkpointFermentV2(captured, 0, nowMs) : undefined
+				// Baseline: the snapshot every verifier run compares against, taken
+				// inside the serialized mutation so nothing moves the tree between
+				// capture and ferment creation. Outside git (or on failure) the
+				// ferment starts without one — no flags, no baseline worktree.
+				const baseline = await captureFermentV2Baseline(ctx.cwd)
+				// The capture awaits git work, and the mutation queue is keyed by
+				// session — it does not serialize replaySession. A session_start
+				// or session_tree during the capture replays another state;
+				// without revalidation this command would resume, overwrite the
+				// replayed state, and journal through the current session.
+				assertCurrentSession(ctx, sessionId)
+				assertUnchanged(captured)
 				const next = captured
-					? replaceFermentV2(objective, randomUUID(), now, effectiveTokenBudget, presentation)
-					: createFermentV2(undefined, objective, randomUUID(), now, effectiveTokenBudget, presentation)
+					? replaceFermentV2(objective, randomUUID(), now, effectiveTokenBudget, presentation, baseline)
+					: createFermentV2(undefined, objective, randomUUID(), now, effectiveTokenBudget, presentation, baseline)
 				commitFermentV2(next)
 				if (replaced) {
 					emitFermentV2Lifecycle(FERMENT_V2_EVENTS.REPLACED, replaced, { replacementFermentV2Id: next.id })
@@ -1623,6 +1650,9 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		replaySession(ctx)
+		// Leftover baseline worktrees from crashed runs never clean themselves
+		// up; remove them before any new verifier run can race them.
+		void pruneStaleBaselineWorktrees(ctx.cwd).catch(() => {})
 		// Defer a resumed Ferment V2's kick so an embedder's incoming prompt wins the
 		// streaming-slot race; the timer rechecks busy, pending, and Ferment V2 identity.
 		// No waiter is held open, and pendingContinuation keeps repeated resumes idempotent.

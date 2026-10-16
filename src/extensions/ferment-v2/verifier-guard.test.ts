@@ -15,17 +15,15 @@ import { join } from "node:path"
 import { promisify } from "node:util"
 import { describe, expect, it } from "vitest"
 import { createExtensionApi } from "../__mocks__/extension-api.js"
+import { createVerifierGuard, enforceWorkspaceIntegrity, type VerifierGuard } from "./verifier-guard.js"
 import {
-	createVerifierGuard,
 	detectGitWorkspace,
 	diffSnapshots,
-	enforceWorkspaceIntegrity,
 	removePaths,
 	restorePaths,
 	snapshotWorkspace,
-	type VerifierGuard,
 	workspaceHead,
-} from "./verifier-guard.js"
+} from "./workspace.js"
 
 const execFile = promisify(execFileCallback)
 

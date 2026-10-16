@@ -59,6 +59,8 @@ export interface SessionFermentV2 {
 	timeUsedMs: number
 	/** Cumulative executing-verifier usage, tracked separately from the implementer's tokens. */
 	verifierUsage?: FermentV2VerifierUsage
+	/** Working-tree snapshot the verifier's facts, flags, and baseline worktree are anchored to. */
+	baseline?: FermentV2Baseline
 	createdAt: string
 	updatedAt: string
 }
@@ -71,6 +73,18 @@ export interface FermentV2VerifierUsage {
 	cacheWrite: number
 	totalTokens: number
 	costUsd: number
+}
+
+/**
+ * Baseline snapshot of the working tree, captured when a ferment is created or
+ * replaced (approved-plan starts included): a snapshot commit of every
+ * untracked, non-ignored file alongside the tracked content. Absent outside a
+ * git repository or when the snapshot failed — verification then runs without
+ * baseline facts, flags, or a baseline worktree. Preserved on objective edit.
+ */
+export interface FermentV2Baseline {
+	commit: string
+	capturedAt: string
 }
 
 export type FermentV2JournalEntry =

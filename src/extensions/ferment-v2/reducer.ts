@@ -3,6 +3,7 @@ import {
 	FERMENT_V2_COMPLETION_CONFIDENCES,
 	FERMENT_V2_EVALUATION_VERDICTS,
 	FERMENT_V2_STATUSES,
+	type FermentV2Baseline,
 	type FermentV2Evaluation,
 	type FermentV2EvaluatorUsage,
 	type FermentV2JournalEntry,
@@ -29,9 +30,10 @@ export function createFermentV2(
 	now: string,
 	tokenBudget?: number,
 	presentation?: FermentV2Presentation,
+	baseline?: FermentV2Baseline,
 ): SessionFermentV2 {
 	if (state) throw new Error("A Ferment V2 already exists.")
-	return newFermentV2(objective, id, now, tokenBudget, presentation)
+	return newFermentV2(objective, id, now, tokenBudget, presentation, baseline)
 }
 
 export function replaceFermentV2(
@@ -40,8 +42,9 @@ export function replaceFermentV2(
 	now: string,
 	tokenBudget?: number,
 	presentation?: FermentV2Presentation,
+	baseline?: FermentV2Baseline,
 ): SessionFermentV2 {
-	return newFermentV2(objective, id, now, tokenBudget, presentation)
+	return newFermentV2(objective, id, now, tokenBudget, presentation, baseline)
 }
 
 export function editFermentV2(
@@ -270,6 +273,7 @@ function newFermentV2(
 	now: string,
 	tokenBudget?: number,
 	presentation?: FermentV2Presentation,
+	baseline?: FermentV2Baseline,
 ): SessionFermentV2 {
 	if (!id.trim()) throw new Error("Ferment V2 ID cannot be empty.")
 	if (tokenBudget !== undefined && !isPositiveInteger(tokenBudget)) {
@@ -286,6 +290,7 @@ function newFermentV2(
 		tokensUsed: 0,
 		...(presentation ? { presentation } : {}),
 		...(tokenBudget === undefined ? {} : { tokenBudget }),
+		...(baseline ? { baseline } : {}),
 		timeUsedMs: 0,
 		createdAt: now,
 		updatedAt: now,
@@ -324,6 +329,7 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 	const lastEvaluation = parseFermentV2Evaluation(value.lastEvaluation)
 	const presentation = parseFermentV2Presentation(value.presentation)
 	const verifierUsage = parseFermentV2VerifierUsage(value.verifierUsage)
+	const baseline = parseFermentV2Baseline(value.baseline)
 	if (
 		value.schemaVersion !== 1 ||
 		!isNonEmptyString(value.id) ||
@@ -368,9 +374,19 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 		...(value.tokenBudget === undefined ? {} : { tokenBudget: value.tokenBudget }),
 		timeUsedMs: value.timeUsedMs ?? 0,
 		...(verifierUsage ? { verifierUsage } : {}),
+		...(baseline ? { baseline } : {}),
 		createdAt: value.createdAt,
 		updatedAt: value.updatedAt,
 	}
+}
+
+function parseFermentV2Baseline(value: unknown): FermentV2Baseline | undefined {
+	if (value === undefined) return undefined
+	// A malformed baseline is dropped rather than rejecting the entry: the
+	// baseline is optional metadata, and a ferment without one simply verifies
+	// without baseline facts, flags, or a baseline worktree.
+	if (!isRecord(value) || !isNonEmptyString(value.commit) || !isNonEmptyString(value.capturedAt)) return undefined
+	return { commit: value.commit, capturedAt: value.capturedAt }
 }
 
 function parseFermentV2VerifierUsage(value: unknown): FermentV2VerifierUsage | undefined {

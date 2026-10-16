@@ -1,3 +1,4 @@
+import { execFile as execFileCallback } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import {
 	existsSync,
@@ -11,6 +12,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { promisify } from "node:util"
 import type {
 	ContextEvent,
 	ExtensionAPI,
@@ -51,15 +53,23 @@ import {
 	type FermentV2JournalEntry,
 	type SessionFermentV2,
 } from "./types.js"
+import { snapshotWorkspace } from "./workspace.js"
 
 vi.mock("./evaluator.js", () => ({ evaluateFermentV2: vi.fn() }))
 vi.mock("./settings.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./settings.js")>()
 	return { ...actual, getFermentV2Settings: vi.fn() }
 })
+vi.mock("./workspace.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./workspace.js")>()
+	// Only the baseline snapshot is controllable; every other export stays
+	// real so baseline capture and worktree pruning behave as in production.
+	return { ...actual, snapshotWorkspace: vi.fn(actual.snapshotWorkspace) }
+})
 
 const evaluateFermentV2Mock = vi.mocked(evaluateFermentV2)
 const fermentV2SettingsMock = vi.mocked(getFermentV2Settings)
+const snapshotWorkspaceMock = vi.mocked(snapshotWorkspace)
 const TEST_SESSION_ID = "session-a"
 const EVALUATOR_USAGE = {
 	input: 10,
@@ -210,6 +220,60 @@ describe("Ferment V2 extension", () => {
 			fermentV2Id: first?.id,
 			replacementFermentV2Id: replacement?.id,
 		})
+	})
+
+	it("captures a baseline snapshot of the working tree when a ferment is created in a git repository", async () => {
+		await gitForTests(cwd, ["init", "-q"])
+		await gitForTests(cwd, ["config", "user.email", "test@example.com"])
+		await gitForTests(cwd, ["config", "user.name", "Test"])
+		writeFileSync(join(cwd, "tracked.txt"), "tracked\n")
+		await gitForTests(cwd, ["add", "-A"])
+		await gitForTests(cwd, ["commit", "-q", "-m", "initial"])
+		writeFileSync(join(cwd, "untracked.txt"), "untracked\n")
+
+		await harness.command("ship feature A")
+
+		const ferment = harness.currentFermentV2()
+		expect(ferment?.baseline?.commit).toMatch(/^[0-9a-f]{40}$/)
+		expect(ferment?.baseline?.capturedAt).toBeTruthy()
+		// The baseline carries files that were untracked at capture time, and the
+		// snapshot left the real index and refs alone.
+		const listing = await gitForTests(cwd, ["ls-tree", "-r", "--name-only", ferment?.baseline?.commit ?? ""])
+		expect(listing).toContain("untracked.txt")
+		expect(await gitForTests(cwd, ["status", "--porcelain=v1"])).toContain("?? untracked.txt")
+	})
+
+	it("does not overwrite the replayed session when the baseline capture spans a session switch", async () => {
+		await harness.command("session A objective")
+		expect(harness.currentFermentV2()).toMatchObject({ objective: "session A objective" })
+		harness.appendEntry.mockClear()
+
+		// Hold the replacement command's baseline capture mid-flight: the
+		// snapshot is pending while the session underneath it switches.
+		let releaseCapture!: () => void
+		const captureHeld = new Promise<void>((resolve) => {
+			releaseCapture = resolve
+		})
+		snapshotWorkspaceMock.mockImplementationOnce(async () => {
+			await captureHeld
+			return undefined
+		})
+		const commandPromise = harness.command("session B objective")
+		await new Promise((resolve) => setTimeout(resolve, 0))
+
+		// A new session starts while the capture is in flight: replaySession
+		// switches the extension to that session's (empty) state.
+		harness.setSession("session-b", [])
+		await harness.fire("session_start", { type: "session_start", reason: "new" })
+
+		releaseCapture()
+		await commandPromise
+
+		// The replayed session's state survives: no ferment was journaled into
+		// it, no replacement was committed, and the user is told to retry.
+		expect(harness.currentFermentV2()).toBeUndefined()
+		expect(harness.appendEntry).not.toHaveBeenCalled()
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/active session changed/i), "warning")
 	})
 
 	it("waits for a headless Ferment V2 turn before resolving the command", async () => {
@@ -4876,6 +4940,14 @@ describe("Ferment V2 extension", () => {
 		})
 	})
 })
+
+const execFileForGit = promisify(execFileCallback)
+
+/** Real git for harness tests that need a repository (baseline capture). */
+async function gitForTests(cwd: string, args: readonly string[]): Promise<string> {
+	const { stdout } = await execFileForGit("git", args, { cwd, encoding: "utf-8" })
+	return stdout
+}
 
 function createHarness(options: { hasUI?: boolean; cwd?: string } = {}) {
 	const handlers = new Map<string, ExtensionHandler[]>()

@@ -232,6 +232,23 @@ describe("Ferment V2 reducer", () => {
 		).toThrow(/current Ferment V2 is ferment-v2-a/)
 	})
 
+	it("round-trips the baseline through the journal and preserves it on objective edit", () => {
+		const baseline = { commit: "snapshot-commit", capturedAt: T1 }
+		const run = createFermentV2(undefined, "old", "ferment-v2-a", T1, undefined, undefined, baseline)
+		expect(run.baseline).toEqual(baseline)
+		expect(restoreFermentV2([putFermentV2Entry(run)])).toEqual(run)
+		const edited = editFermentV2(run, "ferment-v2-a", 1, "new objective", T2)
+		expect(edited.baseline).toEqual(baseline)
+		const replaced = replaceFermentV2("new objective", "ferment-v2-b", T2, undefined, undefined, {
+			commit: "replacement-snapshot",
+			capturedAt: T2,
+		})
+		expect(replaced.baseline).toEqual({ commit: "replacement-snapshot", capturedAt: T2 })
+		// A malformed baseline is dropped on restore instead of rejecting the entry.
+		const restored = restoreFermentV2([{ ...putFermentV2Entry(run), fermentV2: { ...run, baseline: { commit: "" } } }])
+		expect(restored?.baseline).toBeUndefined()
+	})
+
 	it("re-applies the budget check when resuming a Ferment V2 that is already over budget", () => {
 		const fermentV2 = createFermentV2(undefined, "old", "ferment-v2-a", T1, 1_500)
 		const overBudget = addFermentV2Accounting(fermentV2, "ferment-v2-a", 1_500, 1_000, T2)

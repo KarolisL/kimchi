@@ -144,4 +144,116 @@ describe("buildVerifierTaskPrompt", () => {
 		expect(prompt).not.toContain("Proposed final answer")
 		expect(prompt).not.toContain("Previous verifier gap")
 	})
+
+	it("renders baseline facts: changed files, diff stat, git state, and flagged test changes with IDs", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Fix the bug",
+			cwd: "/workspace",
+			facts: {
+				...facts,
+				baselineCommit: "baseline-123",
+				workspace: {
+					baseline: "baseline-1234567890",
+					changedFiles: facts.changedFiles,
+					diffStat: " src/a.ts | 2 +-\n 2 files changed",
+					testInventoryFlags: [
+						{ id: "f1", kind: "test_file_deleted", path: "src/old.test.ts" },
+						{
+							id: "f2",
+							kind: "skip_marker_added",
+							path: "src/a.test.ts",
+							detail: "it.skip('works')",
+						},
+					],
+					testInventoryIncomplete: false,
+					git: { branch: "main", head: "abc123", commitsSinceBaseline: 2, uncommittedFiles: 2 },
+					truncated: true,
+				},
+			},
+			todos: [],
+		})
+		expect(prompt).toContain("compared against the baseline baseline-123")
+		expect(prompt).toContain("modified: src/a.ts")
+		expect(prompt).toContain("Diff stat vs baseline")
+		expect(prompt).toContain("2 commit(s) since baseline")
+		expect(prompt).toContain("truncated by the host")
+		expect(prompt).toContain("- f1: test file deleted — src/old.test.ts")
+		expect(prompt).toContain("- f2: skip marker added — src/a.test.ts (it.skip('works'))")
+		expect(prompt).toContain("must be addressed by some check's flags array")
+	})
+
+	it("tells the verifier when the test inventory could not be collected completely", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Fix the bug",
+			cwd: "/workspace",
+			facts: {
+				...facts,
+				baselineCommit: "baseline-123",
+				workspace: {
+					baseline: "baseline-1234567890",
+					changedFiles: facts.changedFiles,
+					diffStat: "",
+					testInventoryFlags: [{ id: "f1", kind: "test_file_modified", path: "src/a.test.ts" }],
+					testInventoryIncomplete: true,
+					git: { branch: "main", head: "abc123", commitsSinceBaseline: 0, uncommittedFiles: 2 },
+					truncated: false,
+				},
+			},
+			todos: [],
+		})
+		expect(prompt).toContain("could not collect the test inventory completely")
+		expect(prompt).toContain("inspect the changed test files yourself")
+	})
+
+	it("carries the baseline worktree path with the attribution and vacuous-test steps and the traps", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Fix the bug",
+			cwd: "/workspace",
+			facts: { ...facts, baselineCommit: "base123", baselineWorktree: "/tmp/kimchi-ferment-v2-baseline-x" },
+			todos: [],
+		})
+		expect(prompt).toContain("Baseline worktree (host-provided, disposable): /tmp/kimchi-ferment-v2-baseline-x")
+		expect(prompt).toContain("pre-existing, not caused by the implementer's changes")
+		expect(prompt).toContain("they must FAIL there")
+		expect(prompt).toContain("does not verify the change")
+		// The verifier must be able to transfer the implementer's new tests into
+		// the worktree (they do not exist at the baseline) while the production
+		// code stays pre-change, and must tell assertion failures from setup ones.
+		expect(prompt).toContain("copy the implementer's new or changed test files into the baseline worktree")
+		expect(prompt).toContain("never commit anything inside the worktree")
+		expect(prompt).toContain("an assertion failure is the strong evidence")
+		expect(prompt).toContain("inconclusive")
+		expect(prompt).toContain("editable install")
+		expect(prompt).toContain("generated files")
+		expect(prompt).toContain("nested node_modules")
+	})
+
+	it("explains a missing baseline (comparison basis and worktree) instead of staying silent", () => {
+		const noBaseline = buildVerifierTaskPrompt({ objective: "Do it", cwd: "/workspace", facts, todos: [] })
+		expect(noBaseline).toContain("no baseline snapshot was captured")
+		expect(noBaseline).toContain("listed against HEAD")
+		const failedDiff = buildVerifierTaskPrompt({
+			objective: "Do it",
+			cwd: "/workspace",
+			facts: { ...facts, baselineCommit: "base123" },
+			todos: [],
+		})
+		expect(failedDiff).toContain("baseline diff could not be computed")
+		expect(failedDiff).toContain("Baseline worktree: unavailable")
+	})
+
+	it("tells the verifier when the baseline comparison failed so no inventory was collected", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Do it",
+			cwd: "/workspace",
+			facts: { ...facts, baselineCommit: "base123", testInventoryUnavailable: true },
+			todos: [],
+		})
+		expect(prompt).toContain("baseline diff could not be computed")
+		expect(prompt).toContain("the test inventory could not be collected at all")
+		expect(prompt).toContain("inspect the changed test files yourself")
+		// No flags were collected on this path — the flag section must stay
+		// absent rather than imply a clean inventory.
+		expect(prompt).not.toContain("Test-inventory flags")
+	})
 })

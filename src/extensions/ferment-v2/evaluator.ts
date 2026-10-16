@@ -35,22 +35,28 @@ import { latestFinalAnswerDraft } from "./final-answer.js"
 import { objectiveText } from "./objective-file.js"
 import { isRecord } from "./reducer.js"
 import { getFermentV2Settings } from "./settings.js"
-import type { FermentV2CompletionConfidence, FermentV2EvaluatorUsage } from "./types.js"
+import type { FermentV2Baseline, FermentV2CompletionConfidence, FermentV2EvaluatorUsage } from "./types.js"
 import {
 	createVerifierGuard,
-	detectGitWorkspace,
 	enforceWorkspaceIntegrity,
-	type GitWorkspaceProbe,
-	type HeadState,
 	type IntegrityResult,
-	snapshotWorkspace,
 	type VerifierEvidence,
 	type VerifierGuard,
-	type WorkspaceSnapshot,
-	workspaceHead,
 } from "./verifier-guard.js"
 import { resolveFermentV2VerifierModel } from "./verifier-model.js"
 import { buildVerifierTaskPrompt, type FermentV2VerifierFacts, gatherVerifierFacts } from "./verifier-prompt.js"
+import {
+	type BaselineWorktree,
+	createBaselineWorktree,
+	detectGitWorkspace,
+	type GitWorkspaceProbe,
+	gatherWorkspaceFacts,
+	type HeadState,
+	snapshotWorkspace,
+	type TestInventoryFlag,
+	type WorkspaceSnapshot,
+	workspaceHead,
+} from "./workspace.js"
 
 const MAX_REASON_CHARS = 1_000
 
@@ -64,7 +70,7 @@ const VERIFIER_RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000, 60_000]
 const TRANSIENT_FAILURE_REASONS = new Set(["rate_limit", "transport_failure", "stream_interrupted", "provider_5xx"])
 
 const INVALID_OUTPUT_CORRECTION_PROMPT =
-	'The previous response was rejected by host validation: {reason} Return exactly one valid JSON object matching the output contract and nothing else. Cite only [eN] evidence IDs that appear in your tool results. Every "pass" check needs cited evidence and a failureMode; a "continue" verdict needs at least one cited "fail" check; an "impossible" verdict needs at least one check citing executed evidence.'
+	'The previous response was rejected by host validation: {reason} Return exactly one valid JSON object matching the output contract and nothing else. Cite only [eN] evidence IDs that appear in your tool results. Every "pass" check needs cited evidence and a failureMode; a "continue" verdict needs at least one cited "fail" check; an "impossible" verdict needs at least one check citing executed evidence; when the task lists test-inventory flag IDs, a met verdict needs every flag addressed in some check\'s flags array.'
 
 export type FermentV2EvaluatorVerdict = "continue" | "met" | "impossible"
 
@@ -119,6 +125,10 @@ export interface FermentV2EvaluationInput {
 	completionConfidence?: FermentV2CompletionConfidence
 	/** Task-facing reason of the previous verifier `continue` verdict, when one exists. */
 	previousGap?: string
+	/** The ferment's baseline snapshot — the fixed point the facts, the flags, and the baseline worktree anchor to. */
+	baseline?: FermentV2Baseline
+	/** Kept failing probes from earlier verifier runs, flagged when modified or deleted. */
+	keptProbes?: readonly { path: string; requirementId: string }[]
 	/** Fired once when the verifier run starts (after model resolution), for status-line UX. */
 	onVerifierStart?: (info: { model: string }) => void
 	signal?: AbortSignal
@@ -144,7 +154,17 @@ export interface FermentV2VerifierDeps {
 	createGuard?: () => VerifierGuard
 	snapshot?: (cwd: string, signal?: AbortSignal) => Promise<WorkspaceSnapshot | undefined>
 	head?: (cwd: string, signal?: AbortSignal) => Promise<HeadState | undefined>
-	facts?: (cwd: string, signal?: AbortSignal) => Promise<FermentV2VerifierFacts>
+	facts?: (request: {
+		cwd: string
+		/** The ferment baseline commit; absent when no baseline was captured. */
+		baseline?: string
+		/** The before-run snapshot the baseline is diffed against (absent outside git). */
+		current?: WorkspaceSnapshot
+		keptProbes: readonly { path: string; requirementId: string }[]
+		signal?: AbortSignal
+	}) => Promise<FermentV2VerifierFacts>
+	/** Creates the baseline worktree for the run; defaults to createBaselineWorktree. */
+	createWorktree?: (cwd: string, baseline: string, signal?: AbortSignal) => Promise<BaselineWorktree | undefined>
 	enforceIntegrity?: typeof enforceWorkspaceIntegrity
 	redact?: (text: string) => Promise<string>
 	/** Backoff sleep; the default ends early when the signal aborts. */
@@ -160,6 +180,8 @@ interface FermentV2VerifierCheck {
 	observedAnswer?: string
 	expectedAnswer?: string | null
 	evidence: string[]
+	/** Test-inventory flag IDs (f1, f2, …) this check addresses. */
+	flags?: string[]
 }
 
 interface ParsedFermentV2EvaluatorOutput {
@@ -256,6 +278,13 @@ function parseChecks(value: unknown): FermentV2VerifierCheck[] | undefined {
 			return undefined
 		}
 		if (evidence.some((item) => typeof item !== "string" || !item.trim())) return undefined
+		const flags = candidate.flags
+		if (
+			flags !== undefined &&
+			(!Array.isArray(flags) || flags.some((item) => typeof item !== "string" || !item.trim().match(/^f\d+$/)))
+		) {
+			return undefined
+		}
 		checks.push({
 			...(candidate.kind ? { kind: candidate.kind } : {}),
 			requirement: candidate.requirement.trim(),
@@ -269,6 +298,7 @@ function parseChecks(value: unknown): FermentV2VerifierCheck[] | undefined {
 				? { expectedAnswer: candidate.expectedAnswer }
 				: {}),
 			evidence: evidence.map(normalizeEvidenceId),
+			...(flags !== undefined ? { flags: flags.map((item) => item.trim()) } : {}),
 		})
 	}
 	return checks
@@ -414,10 +444,20 @@ type ValidatedVerdict =
 	| { kind: "ok"; verdict: FermentV2EvaluatorVerdict; reason: string; acceptedFinalAnswer?: string }
 	| { kind: "correct"; reason: string; failureType: FermentV2EvaluatorFailureType }
 
+/** The first test-inventory flag no check addresses (in its flags array) — a `met` verdict must cover every flag. */
+function unaddressedTestInventoryFlag(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	testInventoryFlags: readonly TestInventoryFlag[],
+): TestInventoryFlag | undefined {
+	return testInventoryFlags.find((flag) => !checks?.some((check) => check.flags?.includes(flag.id)))
+}
+
 function validateParsedVerdict(
 	parsed: ParsedFermentV2EvaluatorOutput,
 	evidence: ReadonlyMap<string, VerifierEvidence>,
 	proposedAnswer: string | undefined,
+	testInventoryFlags: readonly TestInventoryFlag[],
+	testInventoryIncomplete: boolean,
 ): ValidatedVerdict {
 	// Every cited ID must match a stamped tool result before any verdict is
 	// accepted — a hallucinated [eN] citation rejects the verdict.
@@ -438,6 +478,34 @@ function validateParsedVerdict(
 		}
 	}
 	if (parsed.verdict === "met") {
+		// An incomplete inventory is never a clean one: when git failed while
+		// computing the baseline comparison — the whole diff, the baseline
+		// test-file enumeration, or a changed-file marker diff — the flag list
+		// may be missing entries or was not collected at all, so a `met`
+		// verdict cannot be accepted on it.
+		if (testInventoryIncomplete) {
+			return {
+				kind: "ok",
+				verdict: "continue",
+				reason:
+					"The test inventory could not be collected completely (git failed while diffing the workspace against the baseline, enumerating baseline test files, or diffing changed ones), so this completion claim cannot be accepted yet — the flag list may be missing deleted, renamed, or modified test files or added skip/only markers, or was not collected at all; claim completion again so the host re-collects the inventory.",
+			}
+		}
+		// A met verdict must address every host-detected test-inventory flag:
+		// deleted, renamed, or modified pre-existing tests, added skip/only
+		// markers, and kept-probe changes are the classic ways an implementer
+		// makes a suite green without making it pass.
+		const unaddressed = unaddressedTestInventoryFlag(parsed.checks, testInventoryFlags)
+		if (unaddressed) {
+			const described = `${unaddressed.kind.replaceAll("_", " ")}: ${unaddressed.path}${
+				unaddressed.detail ? ` (${unaddressed.detail})` : ""
+			}`
+			return {
+				kind: "ok",
+				verdict: "continue",
+				reason: `Flag ${unaddressed.id} (${described}) is not addressed by any check; address every test-inventory flag in a check's flags array before claiming completion.`,
+			}
+		}
 		const unsupported = unsupportedMetReason(parsed.checks, evidence, proposedAnswer)
 		if (unsupported) {
 			// An uncited `met` is downgraded to a host-authored `continue`.
@@ -474,6 +542,51 @@ function validateParsedVerdict(
 	return { kind: "ok", verdict: parsed.verdict, reason: failingCheckReason(parsed.checks, evidence) ?? parsed.reason }
 }
 
+/**
+ * The default facts gatherer: workspace facts against the ferment baseline
+ * when one exists and its diff can be computed — changed files including the
+ * ones that were untracked at start, diff stat, git state, and the
+ * test-inventory flags — and vs-HEAD facts otherwise (outside git, or when
+ * the baseline diff failed; the prompt says which basis the verifier sees).
+ */
+async function defaultGatherVerifierFacts(request: {
+	cwd: string
+	baseline?: string
+	current?: WorkspaceSnapshot
+	keptProbes: readonly { path: string; requirementId: string }[]
+	signal?: AbortSignal
+}): Promise<FermentV2VerifierFacts> {
+	if (!request.baseline || !request.current) return gatherVerifierFacts(request.cwd, request.signal)
+	const workspace = await gatherWorkspaceFacts(
+		request.cwd,
+		request.baseline,
+		request.current,
+		request.keptProbes,
+		request.signal,
+	)
+	if (!workspace) {
+		return {
+			...(await gatherVerifierFacts(request.cwd, request.signal)),
+			baselineCommit: request.baseline,
+			// The whole baseline comparison failed, so the inventory was never
+			// collected — an absent flag list must never read as a clean one.
+			// Validation rejects a `met` verdict until a run collects it.
+			testInventoryUnavailable: true,
+		}
+	}
+	return {
+		available: true,
+		changedFiles: workspace.changedFiles,
+		git: {
+			branch: workspace.git.branch,
+			head: workspace.git.head,
+			uncommittedFiles: workspace.git.uncommittedFiles,
+		},
+		baselineCommit: request.baseline,
+		workspace,
+	}
+}
+
 export async function evaluateFermentV2(
 	input: FermentV2EvaluationInput,
 	ctx: ExtensionContext,
@@ -491,6 +604,7 @@ export async function evaluateFermentV2(
 	let toolCalls = 0
 	let turns = 0
 	let guard: VerifierGuard | undefined
+	let worktree: BaselineWorktree | undefined
 	let modelRef: string | undefined
 	let sameModelAsImplementer: boolean | undefined
 	let modelFallback: "session" | undefined
@@ -606,6 +720,18 @@ export async function evaluateFermentV2(
 			)
 		}
 	}
+	// The baseline worktree is disposed after every run — verdict, error, and
+	// abort alike — once integrity has been enforced. Disposal is best-effort:
+	// a leftover is pruned at the next session start.
+	if (worktree) {
+		const stale = worktree
+		worktree = undefined
+		try {
+			await stale.dispose()
+		} catch {
+			// Removal failed (git vanished mid-run, say); nothing to retry here.
+		}
+	}
 	return result
 
 	async function runVerifier(): Promise<FermentV2EvaluationResult> {
@@ -620,13 +746,26 @@ export async function evaluateFermentV2(
 		unusableEvaluatorRefs = modelChoice.unusableRefs
 
 		guard = (deps?.createGuard ?? createVerifierGuard)()
-		const facts = await (deps?.facts ?? gatherVerifierFacts)(input.cwd, input.signal)
+		// Before every run: the host-provided baseline worktree the verifier
+		// attributes failures and checks new tests in. A baseline implies a git
+		// workspace (capture returns undefined outside git); `before` is the
+		// fresh snapshot the facts are diffed against.
+		if (input.baseline && before) {
+			worktree = await (deps?.createWorktree ?? createBaselineWorktree)(input.cwd, input.baseline.commit, input.signal)
+		}
+		const facts = await (deps?.facts ?? defaultGatherVerifierFacts)({
+			cwd: input.cwd,
+			...(input.baseline ? { baseline: input.baseline.commit } : {}),
+			...(before ? { current: before } : {}),
+			keptProbes: input.keptProbes ?? [],
+			signal: input.signal,
+		})
 
 		const proposedAnswer = latestFinalAnswerDraft(input.messages)
 		let prompt = buildVerifierTaskPrompt({
 			objective: objectiveText(input.objective, ctx.cwd),
 			cwd: input.cwd,
-			facts,
+			facts: { ...facts, ...(worktree ? { baselineWorktree: worktree.path } : {}) },
 			todos: input.todos,
 			...(input.completionConfidence ? { completionConfidence: input.completionConfidence } : {}),
 			...(proposedAnswer !== undefined ? { proposedAnswer } : {}),
@@ -713,9 +852,18 @@ export async function evaluateFermentV2(
 		}
 		const verifierRun = run
 
+		// The flag list that validation runs against is never treated as clean
+		// when it could not be collected — partially (a workspace comparison
+		// marked it incomplete) or not at all (the baseline diff failed and the
+		// facts degraded to vs-HEAD with no workspace section; zero flags there
+		// mean "not collected", never "no flags").
+		const testInventoryFlags = facts.workspace?.testInventoryFlags ?? []
+		const testInventoryIncomplete =
+			facts.workspace?.testInventoryIncomplete === true || facts.testInventoryUnavailable === true
+
 		const parsed = parseFermentV2EvaluatorOutput(verifierRun.text)
 		let validated = parsed
-			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer)
+			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags, testInventoryIncomplete)
 			: ({ kind: "correct", reason: "no valid JSON verdict was returned.", failureType: "invalid_output" } as const)
 		if (validated.kind === "correct") {
 			correctionCount++
@@ -745,7 +893,7 @@ export async function evaluateFermentV2(
 			}
 			const reparsed = parseFermentV2EvaluatorOutput(corrected.text)
 			validated = reparsed
-				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer)
+				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags, testInventoryIncomplete)
 				: ({
 						kind: "correct",
 						reason: "no valid JSON verdict was returned after the correction.",
