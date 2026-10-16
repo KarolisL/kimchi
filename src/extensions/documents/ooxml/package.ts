@@ -14,7 +14,10 @@
  *   - ZIP64 size fields honored via the 0x0001 extra record
  *
  * Parts are inflated with jszip only after the census passes; untouched
- * parts are carried through save() unchanged.
+ * parts are carried through save() unchanged. Inflation itself is bounded:
+ * entries are streamed with a running byte counter and aborted when actual
+ * output exceeds the declared uncompressed size (LIES-in-the-central-
+ * directory defense), plus a global cumulative cap.
  */
 
 import type { Document as XmlDocument } from "@xmldom/xmldom"
@@ -194,6 +197,77 @@ export interface OoxmlPackage {
 	save(): Promise<Uint8Array>
 }
 
+/**
+ * Inflate one verified entry, aborting once actual output exceeds the
+ * declared uncompressed size past a small grace window (declared sizes are
+ * attacker-controlled); also enforces the per-entry inflated cap.
+ */
+interface InflateWorker {
+	on(event: "data", cb: (chunk: unknown) => void): this
+	on(event: "end", cb: () => void): this
+	on(event: "error", cb: (err: Error) => void): this
+	pause?(): void
+	resume?(): void
+}
+
+/** jszip's .d.ts doesn't declare internalStream on JSZipObject; runtime has it. */
+function internalStream(file: JSZip.JSZipObject): InflateWorker {
+	return (file as unknown as { internalStream(type: "uint8array"): InflateWorker }).internalStream("uint8array")
+}
+
+async function inflateBounded(file: JSZip.JSZipObject, entry: zipEntryName): Promise<Uint8Array> {
+	// Declared sizes are attacker-controlled; honest entries never grow past
+	// what the central directory says. Grace covers deflator rounding quirks.
+	const perEntryCap = entry.uncompressedSize + 4096
+	return new Promise<Uint8Array>((resolve, reject) => {
+		const chunks: Uint8Array[] = []
+		let actual = 0
+		let settled = false
+		const worker = internalStream(file)
+		worker
+			.on("data", (chunk) => {
+				if (settled) return
+				const buf = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayLike<number>)
+				actual += buf.length
+				if (actual > perEntryCap) {
+					settled = true
+					worker.pause?.()
+					reject(
+						new DocumentError(
+							"safety-limit",
+							`Zip entry ${entry.name} inflates past its declared size (${entry.uncompressedSize} bytes declared, aborted at ${actual})`,
+						),
+					)
+					return
+				}
+				chunks.push(buf)
+			})
+			.on("end", () => {
+				if (settled) return
+				settled = true
+				const out = new Uint8Array(actual)
+				let off = 0
+				for (const c of chunks) {
+					out.set(c, off)
+					off += c.length
+				}
+				resolve(out)
+			})
+			.on("error", (err) => {
+				if (settled) return
+				settled = true
+				reject(err)
+			})
+		// jszip workers start paused; events only flow after resume().
+		worker.resume?.()
+	})
+}
+
+interface zipEntryName {
+	name: string
+	uncompressedSize: number
+}
+
 export async function openOoxml(data: Uint8Array): Promise<OoxmlPackage> {
 	if (!(data[0] === 0x50 && data[1] === 0x4b)) {
 		throw new DocumentError("corrupt", "Not a zip package")
@@ -209,11 +283,24 @@ export async function openOoxml(data: Uint8Array): Promise<OoxmlPackage> {
 
 	const cache = new Map<string, { data: Uint8Array; dirty: boolean }>()
 	const removed = new Set<string>()
-	// Prime every (capped) part so getBytes/getXml stay synchronous for readers.
+	// Prime every (capped) part so getBytes/getXml stay synchronous for
+	// readers. STREAM, counting actual inflated bytes: a hostile archive can
+	// lie about sizes in the central directory (jszip validates only at end-
+	// of-stream, after buffering everything), so any entry whose real output
+	// runs past its declared size + grace is rejected mid-stream.
+	let totalActual = 0
 	for (const entry of entries) {
 		const file = zip.file(entry.name)
 		if (!file) throw new DocumentError("corrupt", `Central directory lists missing entry: ${entry.name}`)
-		cache.set(entry.name, { data: await file.async("uint8array"), dirty: false })
+		const data = await inflateBounded(file, entry)
+		totalActual += data.length
+		if (totalActual > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES) {
+			throw new DocumentError(
+				"safety-limit",
+				`Zip total inflated size exceeds cap (${ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes)`,
+			)
+		}
+		cache.set(entry.name, { data, dirty: false })
 	}
 
 	const pkg: OoxmlPackage = {

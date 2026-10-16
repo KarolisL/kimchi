@@ -1,3 +1,4 @@
+import { crc32, deflateRawSync } from "node:zlib"
 import JSZip from "jszip"
 import { describe, expect, it } from "vitest"
 import { listZipEntries, openOoxml } from "./package.js"
@@ -111,4 +112,71 @@ describe("openOoxml", () => {
 		const pkg = await openOoxml(data)
 		expect(() => pkg.getXml("bad.xml")).toThrow(/XML parse failed/)
 	})
+
+	it("rejects a zip whose central directory lies about uncompressed size", async () => {
+		await expect(openOoxml(makeLyingZip())).rejects.toMatchObject({ code: "safety-limit" })
+	})
 })
+
+// --- hostile-input: declared size vs real inflation --------------------------
+
+function u16(v: number): Buffer {
+	const b = Buffer.alloc(2)
+	b.writeUInt16LE(v)
+	return b
+}
+function u32(v: number): Buffer {
+	const b = Buffer.alloc(4)
+	b.writeUInt32LE(v >>> 0)
+	return b
+}
+
+/**
+ * Hand-rolled zip: the central directory claims the entry inflates to 80
+ * bytes, but its deflate stream actually carries ~200 KB. The per-entry
+ * bounded inflater must abort mid-stream — trusting the census alone lets
+ * lies through (jszip validates sizes only after full inflation).
+ */
+function makeLyingZip(): Uint8Array {
+	const content = Buffer.alloc(200_000, 65) // 200 KB of 'A's
+	const deflated = deflateRawSync(content)
+	const name = Buffer.from("ppt/slides/slide1.xml")
+	const crc = crc32(content)
+	const fakeSize = 80
+	const local = Buffer.concat([
+		Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+		Buffer.from([20, 0, 0, 0, 8, 0, 0, 0, 0, 0]), // version, flags, method=8, time, date
+		u32(crc),
+		u32(deflated.length),
+		u32(fakeSize),
+		u16(name.length),
+		u16(0),
+		name,
+		deflated,
+	])
+	const cd = Buffer.concat([
+		Buffer.from([0x50, 0x4b, 0x01, 0x02]),
+		Buffer.from([20, 3, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0]), // made-by, ver, flags, method, time, date
+		u32(crc),
+		u32(deflated.length),
+		u32(fakeSize), // LIE
+		u16(name.length),
+		u16(0),
+		u16(0),
+		u16(0),
+		u16(0),
+		u32(0), // external attrs
+		u32(0), // local header offset
+		name,
+	])
+	const eocd = Buffer.concat([
+		Buffer.from([0x50, 0x4b, 0x05, 0x06]),
+		Buffer.from([0, 0, 0, 0]),
+		u16(1),
+		u16(1),
+		u32(cd.length),
+		u32(local.length),
+		u16(0),
+	])
+	return new Uint8Array(Buffer.concat([local, cd, eocd]))
+}

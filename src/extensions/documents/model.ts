@@ -44,6 +44,7 @@ export type DocumentErrorCode =
 	| "too-large" // over the 20 MB cap (or KIMCHI_DOCUMENT_MAX_MB)
 	| "safety-limit" // zip-bomb / symlink / path-traversal / entry caps
 	| "corrupt"
+	| "package-validation" // post-edit revalidation failed: the edit produced a package that won't open
 	| "password-protected"
 	| "extraction-failed"
 	| "timeout"

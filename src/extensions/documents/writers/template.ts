@@ -43,7 +43,6 @@ export function listTemplateLayouts(pkg: OoxmlPackage): TemplateLayout[] {
 		}
 		layouts.push({ path: name, name: layoutName, placeholders })
 	}
-	if (layouts.length === 0) throw new DocumentError("corrupt", "Template has no slide layouts.")
 	return layouts
 }
 
@@ -211,6 +210,7 @@ export async function createFromTemplate(spec: DeckSpec, templateBytes: Uint8Arr
 	const pkg = await openOoxml(templateBytes)
 	if (!pkg.hasXml("ppt/presentation.xml")) throw new DocumentError("corrupt", "Not a PPTX template.")
 	const layouts = listTemplateLayouts(pkg)
+	if (layouts.length === 0) throw new DocumentError("corrupt", "Template has no slide layouts.")
 
 	for (const slide of spec.slides) {
 		if (slide.elements.some((e) => e.type === "chart" || e.type === "image")) {

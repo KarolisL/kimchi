@@ -10,6 +10,7 @@ import { extractPptxShapeText, joinOoxmlPart, ooxmlPartDir, ooxmlRelsPath, parse
 import { DocumentError } from "./model.js"
 import { type OoxmlPackage, openOoxml } from "./ooxml/package.js"
 import { byTag } from "./ooxml/xml.js"
+import { listTemplateLayouts } from "./writers/template.js"
 
 export interface PlaceholderInfo {
 	/** Placeholder type attr, e.g. "title", "body" — "body" when absent. */
@@ -29,11 +30,14 @@ export interface InspectedSlide {
 		placeholder?: PlaceholderInfo
 		chars: number
 	}>
+	/** Tables in document order — the exact `[table N]` vocabulary edit takes. */
+	tables: Array<{ index: number; rows: number; cols: number }>
 }
 
 export interface InspectedDeck {
 	slideSizePt?: { width: number; height: number }
-	layouts: string[]
+	/** Layout name → placeholder inventory (the vocabulary append_slide takes). */
+	layouts: Array<{ name: string; placeholders: Array<{ type: string; idx?: number }> }>
 	slides: InspectedSlide[]
 }
 
@@ -105,14 +109,14 @@ export async function inspectPptx(data: Uint8Array): Promise<InspectedDeck> {
 	const slides = slideParts(pkg)
 	if (slides.length === 0) throw new DocumentError("corrupt", "PPTX has no slides in sldIdLst.", "pptx")
 
-	const layoutSet = new Set<string>()
+	const layoutNames = new Set<string>()
 	const inspected: InspectedSlide[] = []
 	for (let i = 0; i < slides.length; i++) {
 		const layoutPath = layoutPartOf(pkg, slides[i].path)
 		let layoutName: string | undefined
 		if (layoutPath) {
 			layoutName = layoutNameOf(pkg, layoutPath)
-			layoutSet.add(layoutName)
+			layoutNames.add(layoutName)
 		}
 		const slide = pkg.getXml(slides[i].path)
 		const shapes: InspectedSlide["shapes"] = []
@@ -121,9 +125,19 @@ export async function inspectPptx(data: Uint8Array): Promise<InspectedDeck> {
 			const { name, text } = extractPptxShapeText(sp)
 			shapes.push({ name, placeholder: readPlaceholder(sp), chars: text.length })
 		}
-		inspected.push({ index: i + 1, hidden: slides[i].hidden, layoutName, shapes })
+		// Tables belong in inspect output — their document order is the [table N]
+		// edit vocabulary (same counting as the editor's byTag(slide, "tbl")).
+		const tables = byTag(slide, "tbl").map((tbl, t) => {
+			const rows = byTag(tbl, "tr").length
+			const firstRow = byTag(tbl, "tr")[0]
+			return { index: t + 1, rows, cols: firstRow ? byTag(firstRow, "tc").length : 0 }
+		})
+		inspected.push({ index: i + 1, hidden: slides[i].hidden, layoutName, shapes, tables })
 	}
-	return { slideSizePt: slideSizeOf(pkg), layouts: [...layoutSet], slides: inspected }
+	const layouts = listTemplateLayouts(pkg)
+		.filter((l) => layoutNames.has(l.name))
+		.map((l) => ({ name: l.name, placeholders: l.placeholders }))
+	return { slideSizePt: slideSizeOf(pkg), layouts, slides: inspected }
 }
 
 /** Text rendering for the CLI: one block per slide, layouts listed first. */
@@ -132,7 +146,14 @@ export function renderInspection(deck: InspectedDeck): string {
 	if (deck.slideSizePt) {
 		lines.push(`slide size: ${deck.slideSizePt.width}pt x ${deck.slideSizePt.height}pt`)
 	}
-	lines.push(`layouts: ${deck.layouts.length === 0 ? "(none)" : deck.layouts.map((l) => `"${l}"`).join(", ")}`)
+	for (const layout of deck.layouts) {
+		const phs =
+			layout.placeholders.length === 0
+				? ""
+				: ` — placeholders: ${layout.placeholders.map((p) => `${p.type}${p.idx !== undefined ? ` idx ${p.idx}` : ""}`).join(", ")}`
+		lines.push(`layout "${layout.name}"${phs}`)
+	}
+	if (deck.layouts.length === 0) lines.push("layouts: (none)")
 	for (const slide of deck.slides) {
 		const hidden = slide.hidden ? " (hidden)" : ""
 		const layout = slide.layoutName ? ` layout "${slide.layoutName}"` : ""
@@ -143,6 +164,9 @@ export function renderInspection(deck: InspectedDeck): string {
 				? ` placeholder(${shape.placeholder.type}${shape.placeholder.idx !== undefined ? `, idx ${shape.placeholder.idx}` : ""})`
 				: ""
 			lines.push(`  ${name}${ph} ${shape.chars} chars`)
+		}
+		for (const table of slide.tables) {
+			lines.push(`  [table ${table.index}] ${table.rows} rows x ${table.cols} cols`)
 		}
 	}
 	return lines.join("\n")

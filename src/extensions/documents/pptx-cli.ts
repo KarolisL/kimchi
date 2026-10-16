@@ -4,7 +4,7 @@
  * pptx.mjs ...`) and under plain node, with no Python and no LibreOffice.
  *
  *   pptx.mjs read <deck> [start-end]   Slides as Markdown (≤20 per call) with
- *                                      [shape "..."]/[table] locators; a
+ *                                      [shape "..."]/[table N] locators; a
  *                                      continuation hint when capped.
  *   pptx.mjs inspect <deck>            Layouts, placeholders and exact shape
  *                                      names — the vocabulary `edit` accepts.
@@ -20,7 +20,7 @@
  *                                      revalidate the package, write atomically.
  */
 
-import { readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs"
+import { readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { applyPptxOps, parsePptxOps } from "./editors/pptx.js"
@@ -28,7 +28,7 @@ import { extractPptx } from "./extractors/pptx.js"
 import { MAX_UNITS_PER_CALL, maxFileBytes } from "./limits.js"
 import { DocumentError, isDocumentError } from "./model.js"
 import { openOoxml } from "./ooxml/package.js"
-import { requireNoProblems, validateContentTypes, validatePresentationChildOrder } from "./ooxml/validate.js"
+import { validateContentTypes, validatePresentationChildOrder } from "./ooxml/validate.js"
 import { checkPptx, renderFindings } from "./pptx-check.js"
 import { inspectPptx, renderInspection } from "./pptx-inspect.js"
 import { renderDocument } from "./render.js"
@@ -226,7 +226,13 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 					...validateContentTypes(pkg, pkg.getXml("[Content_Types].xml")),
 					...validatePresentationChildOrder(pkg.getXml("ppt/presentation.xml")),
 				].filter((p) => !inputProblems.includes(p))
-				requireNoProblems(outputProblems, `post-edit package validation for ${input}`)
+				if (outputProblems.length > 0) {
+					throw new DocumentError(
+						"package-validation",
+						`post-edit package validation for ${input}: ${outputProblems.join("; ")} — fix the op and retry; the input is unchanged`,
+						"pptx",
+					)
+				}
 				const bytes = await pkg.save()
 				const writeFile = io.writeFile ?? atomicWrite
 				writeFile(out, bytes)
@@ -253,14 +259,27 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 
 /** Write via temp + rename so an interrupted create never leaves a half file. */
 function atomicWrite(path: string, data: Uint8Array): void {
-	const temp = `${path}.pptx-mjs-tmp`
+	// pid + counter: two concurrent edits to the same --out path must not
+	// clobber each other's temp. Same-dir keeps renameSync on one filesystem.
+	const temp = `${path}.pptx-mjs-tmp.${process.pid}.${++atomicWriteCounter}`
 	try {
 		writeFileSync(temp, data)
 	} catch (err) {
 		throw new DocumentError("corrupt", `Cannot write ${path}: ${(err as Error).message}`)
 	}
-	renameSync(temp, path)
+	try {
+		renameSync(temp, path)
+	} catch (err) {
+		try {
+			unlinkSync(temp)
+		} catch {
+			// temp cleanup is best-effort; the OS reclaims temp files
+		}
+		throw new DocumentError("corrupt", `Cannot move output into place at ${path}: ${(err as Error).message}`)
+	}
 }
+
+let atomicWriteCounter = 0
 
 const invokedAsScript = (() => {
 	const entry = process.argv[1]

@@ -1,6 +1,6 @@
 ---
 name: pptx
-description: Read, inspect, check, create, and edit PowerPoint decks (.pptx) with zero prerequisites — no Python, no LibreOffice, no sign-in. Use whenever the user mentions a .pptx file, slides, or a deck.
+description: Read, inspect, check, create, and edit PowerPoint decks (.pptx) locally — no Python or LibreOffice. Use whenever the user mentions a .pptx file or slides.
 requires-resource: skills.pptx
 disables-skills: pptx
 ---

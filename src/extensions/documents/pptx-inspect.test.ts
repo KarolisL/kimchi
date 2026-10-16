@@ -6,7 +6,15 @@ describe("inspectPptx", () => {
 	it("lists layouts, placeholders, and exact shape names per slide", async () => {
 		const deck = await inspectPptx(await makeTemplatedPptx())
 		expect(deck.slideSizePt).toEqual({ width: 720, height: 540 })
-		expect(deck.layouts).toEqual(["Title and Content"])
+		expect(deck.layouts).toEqual([
+			{
+				name: "Title and Content",
+				placeholders: [
+					{ type: "title", idx: 0 },
+					{ type: "body", idx: 1 },
+				],
+			},
+		])
 		expect(deck.slides).toHaveLength(1)
 		const [slide] = deck.slides
 		expect(slide.layoutName).toBe("Title and Content")
@@ -19,10 +27,17 @@ describe("inspectPptx", () => {
 	it('renders names in the [shape "..."] form edit accepts', async () => {
 		const deck = await inspectPptx(await makeTemplatedPptx())
 		const text = renderInspection(deck)
-		expect(text).toContain('layouts: "Title and Content"')
+		expect(text).toContain('layout "Title and Content" — placeholders: title idx 0, body idx 1')
 		expect(text).toContain('slide 1 layout "Title and Content"')
 		expect(text).toContain('[shape "Title 1"] placeholder(title) 7 chars')
 		expect(text).toContain('[shape "Content Placeholder 2"] placeholder(body, idx 1) 21 chars')
+	})
+
+	it("lists tables with their document-order indices", async () => {
+		const deck = await inspectPptx(await makeSimplePptx())
+		const tableSlide = deck.slides[2]
+		expect(tableSlide.tables).toEqual([{ index: 1, rows: 2, cols: 2 }])
+		expect(renderInspection(deck)).toContain("[table 1] 2 rows x 2 cols")
 	})
 
 	it("handles decks without layouts", async () => {

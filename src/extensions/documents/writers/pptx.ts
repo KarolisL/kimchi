@@ -2,14 +2,14 @@
  * Deck writer: deck Markdown → .pptx bytes via pptxgenjs.
  *
  * Parser half honors the contract in deck-markdown.md: `---` splits slides,
- * read-output locators (`## Slide N`, `[shape "..."]`, `[table]`, `[chart]`)
+ * read-output locators (`## Slide N`, `[shape "..."]`, `[table N]`, `[chart]`)
  * are accepted and stripped, `Notes:` paragraphs become speaker notes, chart
  * fences become real charts, and unknown syntax is a typed error naming the
  * slide — never dropped content.
  *
  * Writer half maps the DeckSpec onto geometry per layout hint; every guard
  * in writers/pitfalls.ts runs before pptxgenjs is touched. Output is
- * byte-stable when a pinned clock is passed.
+ * shape-stable, not byte-stable (jszip stamps current-date mtimes).
  */
 
 import { existsSync, statSync } from "node:fs"
@@ -23,8 +23,6 @@ import { type Block, type Inline, parseMarkdownBlocks } from "../markdown/blocks
 import { DocumentError } from "../model.js"
 import { enforcePitfalls, slideNeedsLightText } from "./pitfalls.js"
 import type { ChartSpec, DeckMeta, DeckSpec, DeckTheme, LayoutHint, SlideElement, SlideSpec } from "./pptx-model.js"
-
-export type { ChartSpec, DeckSpec, SlideSpec }
 
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".svg"])
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -104,10 +102,20 @@ function parseChartSpec(spec: string, slideIndex: number): ChartSpec {
 		type: obj.type as ChartSpec["type"],
 		title: obj.title,
 		labels: obj.labels.map(String),
-		series: (obj.series as Array<{ name?: unknown; values?: unknown }>).map((s) => ({
-			name: s.name === undefined ? undefined : String(s.name),
-			values: Array.isArray(s.values) ? (s.values as number[]) : [],
-		})),
+		series: (obj.series as Array<{ name?: unknown; values?: unknown }>).map((s) => {
+			const raw = Array.isArray(s.values) ? s.values : []
+			for (const [vi, v] of raw.entries()) {
+				if (typeof v !== "number" || !Number.isFinite(v)) {
+					throw new DeckParseError(
+						`chart-values-must-be-numeric: series ${String(s.name ?? "(unnamed)")} value ${vi + 1} is ${JSON.stringify(v)}`,
+					)
+				}
+			}
+			return {
+				name: s.name === undefined ? undefined : String(s.name),
+				values: raw as number[],
+			}
+		}),
 	}
 }
 
@@ -264,8 +272,6 @@ function pptxRunFromInline(
 	}))
 }
 
-export type DeckClock = () => Date
-
 /** Minimal typed surface of pptxgenjs this writer uses (see the import note). */
 interface PptxSlide {
 	addText(text: string | Array<{ text: string; options: Record<string, unknown> }>, opts: Record<string, unknown>): void
@@ -290,7 +296,6 @@ interface PptxInstance {
 const PptxGenJS = pptxgenDefault as unknown as new () => PptxInstance
 
 export interface WriteOptions {
-	clock?: DeckClock
 	/** Base directory for resolving relative image paths. */
 	baseDir?: string
 	/** File existence/read hooks (tests inject; CLI uses defaults). */
@@ -381,12 +386,6 @@ export async function writePptx(spec: DeckSpec, options: WriteOptions = {}): Pro
 	const h = theme.slideHeight ?? DEFAULT_SLIDE_H
 	const font = theme.font ?? DEFAULT_FONT
 	const accent = (theme.accent ?? DEFAULT_ACCENT).replace("#", "")
-	// Pinned for byte-stable output: jszip uses the current date for zip entry
-	// mtimes unless overridden, and pptxgenjs does not expose that override, so
-	// byte stability comes from the deterministic content path and is asserted
-	// with a pinned clock in tests on repeated writes.
-	void options.clock
-
 	const pptx: PptxInstance = new PptxGenJS()
 	pptx.defineLayout({ name: "KIMCHI", width: w, height: h })
 	pptx.layout = "KIMCHI"

@@ -41,7 +41,7 @@ describe("parseDeckMarkdown", () => {
 
 	it("strips read-output locators (`## Slide N`, shape/table/chart markers)", () => {
 		const spec = parseDeckMarkdown(
-			'## Slide 1\n\n# Kickoff\n\n[shape "Title 1"]\nBody\n\n[table]\n\n[chart]\n\nNotes: hi\n',
+			'## Slide 1\n\n# Kickoff\n\n[shape "Title 1"]\nBody\n\n[table 1]\n\n[chart]\n\nNotes: hi\n',
 		)
 		expect(spec.slides).toHaveLength(1)
 		expect(spec.slides[0].heading).toBe("Kickoff")

@@ -29,6 +29,15 @@ describe("pitfall guards", () => {
 				}),
 			]),
 		).toThrow(/chart-needs-series/)
+		// Unnamed series are checked too (numbered in the message).
+		expect(() =>
+			enforcePitfalls([
+				slideWith({
+					type: "chart",
+					spec: { type: "bar", labels: ["Q1", "Q2"], series: [{ values: [1, 2, 3, 4, 5] }] },
+				}),
+			]),
+		).toThrow(/chart-needs-series: series 1 has 5 values for 2 labels/)
 	})
 
 	it("two-column-needs-hint rejects two body blocks without the hint", () => {

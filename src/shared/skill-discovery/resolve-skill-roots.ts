@@ -356,6 +356,11 @@ function copySkillsToTempDir(bundledDir: string, names: string[]): string {
  * matters: fs watchers and palette-refresh dedupes key off the path, so a
  * fresh mkdtemp per call re-triggers them on every resolve. The cache key
  * includes the visible-skill set so a toggle flip computes a new path.
+ *
+ * The key covers only WHICH bundled skills are visible, not their content:
+ * in dev, editing a bundled SKILL.md stays stale until the long-lived ACP
+ * process restarts. Shipped binaries never change bundled content at
+ * runtime, so this is a dev-ergonomics note only.
  */
 const visibleBundledDirCache = new Map<string, string | undefined>()
 

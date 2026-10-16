@@ -145,6 +145,47 @@ describe("append_slide / delete_slide / reorder_slides", () => {
 		expect(() => applyPptxOps(pkg, [{ type: "delete_slide", index: 1 }])).toThrow(/only slide/)
 	})
 
+	it("applies structural ops in sequence against the renumbered deck", async () => {
+		const markdown = "# One\n\n- a\n\n---\n# Two\n\n- b\n\n---\n# Three\n\n- c\n\n---\n# Four\n\n- d\n"
+
+		// two deletes: slide numbers shift after the first removal.
+		{
+			const pkg = await openOoxml(await writtenDeck(markdown))
+			applyPptxOps(pkg, [
+				{ type: "delete_slide", index: 1 },
+				{ type: "delete_slide", index: 2 },
+			])
+			const doc = await extractPptx(await pkg.save())
+			expect(doc.units.map((u) => u.markdown)).toEqual([
+				expect.stringContaining("Two"),
+				expect.stringContaining("Four"),
+			])
+		}
+
+		// append then edit the NEW slide (its index only exists post-append).
+		{
+			const pkg = await openOoxml(await writtenDeck("# Base\n\n- a\n"))
+			applyPptxOps(pkg, [
+				{ type: "append_slide", title: "Fresh" },
+				{ type: "set_shape_text", slide: 2, shape: "Text 0", value: "Written after append" },
+			])
+			const doc = await extractPptx(await pkg.save())
+			expect(doc.units[1].markdown).toContain("Written after append")
+		}
+
+		// delete then edit the renumbered survivor.
+		{
+			const pkg = await openOoxml(await writtenDeck(markdown))
+			applyPptxOps(pkg, [
+				{ type: "delete_slide", index: 1 },
+				{ type: "set_shape_text", slide: 1, shape: "Text 0", value: "renamed-hero" },
+			])
+			const doc = await extractPptx(await pkg.save())
+			expect(doc.units[0].markdown).toContain("renamed-hero")
+			expect(JSON.stringify(doc.units)).not.toContain("One")
+		}
+	})
+
 	it("reorders slides and enforces full permutations", async () => {
 		const pkg = await openOoxml(await writtenDeck("# One\n\n- a\n\n---\n# Two\n\n- b\n\n---\n# Three\n\n- c\n"))
 		applyPptxOps(pkg, [{ type: "reorder_slides", order: [3, 1, 2] }])

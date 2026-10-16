@@ -127,28 +127,31 @@ function reqNum(o: Record<string, unknown>, key: string, bad: (msg: string) => E
 
 /** Apply every op in order to `pkg`; throws on the first failure. */
 export function applyPptxOps(pkg: OoxmlPackage, ops: PptxOp[]): void {
-	const slides = slidePartOrder(pkg)
+	// Slide indices resolve against the CURRENT order — structural ops
+	// (append/delete/reorder) renumber subsequent slides, so resolve lazily
+	// per op rather than once up front.
+	const at = (slide: number) => slidePath(slidePartOrder(pkg), slide)
 	for (const op of ops) {
 		switch (op.type) {
 			case "set_shape_text":
-				setShapeText(pkg, slidePath(slides, op.slide), op.shape, op.value)
+				setShapeText(pkg, at(op.slide), op.shape, op.value)
 				break
 			case "set_shape_notes":
-				setShapeNotes(pkg, slidePath(slides, op.slide), op.value)
+				setShapeNotes(pkg, at(op.slide), op.value)
 				break
 			case "set_table_cell": {
 				const [col, row] = parseCellRef(op.cell)
-				setTableCell(pkg, slidePath(slides, op.slide), op.table, col, row, op.value)
+				setTableCell(pkg, at(op.slide), op.table, col, row, op.value)
 				break
 			}
 			case "set_table_row":
-				setTableRow(pkg, slidePath(slides, op.slide), op.table, op.row, op.values)
+				setTableRow(pkg, at(op.slide), op.table, op.row, op.values)
 				break
 			case "append_slide":
 				appendSlide(pkg, op.layout, op.title)
 				break
 			case "delete_slide":
-				deleteSlide(pkg, slides, op.index)
+				deleteSlide(pkg, slidePartOrder(pkg), op.index)
 				break
 			case "reorder_slides":
 				reorderSlides(pkg, op.order)

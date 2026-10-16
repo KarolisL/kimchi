@@ -22,7 +22,7 @@ describe("extractPptx", () => {
 	it("renders shape locators, tables, and notes", async () => {
 		const doc = await extractPptx(await makeSimplePptx())
 		expect(doc.units[0].markdown).toContain('[shape "Title 1"]')
-		expect(doc.units[2].markdown).toContain("[table]")
+		expect(doc.units[2].markdown).toContain("[table 1]")
 		expect(doc.units[2].markdown).toContain("| H1 | H2 |")
 		expect(doc.units[1].markdown).toContain("Notes:")
 		expect(doc.units[1].markdown).toContain("Remember to thank sponsors")

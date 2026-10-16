@@ -7,7 +7,7 @@
  * inside create_document.
  */
 
-import type { ChartSpec, SlideSpec } from "./pptx-model.js"
+import type { SlideSpec } from "./pptx-model.js"
 
 export interface Pitfall {
 	/** Stable id, named in error messages and tests. */
@@ -48,10 +48,11 @@ const CHART_NEEDS_SERIES: Pitfall = {
 				if (el.spec.series.length === 0 || el.spec.labels.length === 0) {
 					throw new Error(`chart-needs-series: chart on "${slide.heading ?? "(untitled)"}" has no series or labels`)
 				}
-				for (const series of el.spec.series) {
-					if (series.name !== undefined && series.values.length !== el.spec.labels.length) {
+				for (const [si, series] of el.spec.series.entries()) {
+					if (series.values.length !== el.spec.labels.length) {
+						const who = series.name === undefined ? `series ${si + 1}` : `series "${series.name}"`
 						throw new Error(
-							`chart-needs-series: series "${series.name}" has ${series.values.length} values for ${el.spec.labels.length} labels`,
+							`chart-needs-series: ${who} has ${series.values.length} values for ${el.spec.labels.length} labels`,
 						)
 					}
 				}
@@ -121,6 +122,3 @@ export function enforcePitfalls(slides: SlideSpec[]): void {
 		for (const rule of PPTX_WRITING_PITFALLS) rule.check(slide)
 	}
 }
-
-/** Re-exported so tests can pin the JSON shape without importing pptx-model. */
-export type { ChartSpec }

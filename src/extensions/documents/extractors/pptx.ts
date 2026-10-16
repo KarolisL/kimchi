@@ -125,6 +125,7 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 		const slide = pkg.getXml(path)
 		const blocks: string[] = []
 		let chartCount = 0
+		let tableIndex = 0 // [table N] — document order, the exact vocabulary edit takes
 		for (const child of topLevelShapes(slide)) {
 			const tag = ooxmlLocalName(child.tagName)
 			if (tag === "sp") {
@@ -135,7 +136,8 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 				const tbl = firstTable(child)
 				if (tbl) {
 					const md = extractTable(tbl)
-					if (md) blocks.push(`[table]\n${md}`)
+					tableIndex += 1
+					if (md) blocks.push(`[table ${tableIndex}]\n${md}`)
 				} else if (byTag(child, "chart").length > 0) {
 					chartCount += 1
 					blocks.push("[chart]")
