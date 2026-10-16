@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os"
 import { delimiter, join, resolve } from "node:path"
 import { promisify } from "node:util"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
 	BASELINE_WORKTREE_PREFIX,
 	type BaselineWorktree,
@@ -113,6 +113,40 @@ fi`,
 }
 
 describe("snapshotWorkspace", () => {
+	it("snapshots a repository where git has no author identity (fresh containers, CI images)", async () => {
+		const repo = await makeRepo()
+		writeFileSync(join(repo, "a.txt"), "a\n")
+		await commitAll(repo, "initial")
+		writeFileSync(join(repo, "b.txt"), "untracked\n")
+		// No identity anywhere: no repository user, an empty global config, no
+		// system config, no identity environment, and no hostname-derived
+		// fallback — exactly what `git commit-tree` sees in a fresh container.
+		await git(repo, ["config", "--unset", "user.name"])
+		await git(repo, ["config", "--unset", "user.email"])
+		await git(repo, ["config", "user.useConfigOnly", "true"])
+		const emptyGlobal = join(repo, ".git", "empty-global-config")
+		writeFileSync(emptyGlobal, "")
+		vi.stubEnv("GIT_CONFIG_GLOBAL", emptyGlobal)
+		vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1")
+		for (const name of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"]) {
+			vi.stubEnv(name, undefined)
+		}
+		try {
+			// Precondition: git itself refuses to create a commit here.
+			await expect(git(repo, ["commit-tree", "-m", "probe", await git(repo, ["write-tree"])])).rejects.toThrow()
+
+			const snapshot = await snapshotWorkspace(repo)
+
+			expect(snapshot?.commit).toMatch(/^[0-9a-f]{40}$/)
+			expect(await git(repo, ["show", "-s", "--format=%an <%ae>", snapshot?.commit ?? ""])).toContain(
+				"kimchi ferment-v2 <ferment-v2@kimchi.invalid>",
+			)
+			expect(await git(repo, ["ls-tree", "--name-only", snapshot?.commit ?? ""])).toContain("b.txt")
+		} finally {
+			vi.unstubAllEnvs()
+		}
+	})
+
 	it("leaves git status, the index, refs, and HEAD byte-identical on a dirty tree with untracked files", async () => {
 		const repo = await makeRepo()
 		writeFileSync(join(repo, "tracked.txt"), "original\n")

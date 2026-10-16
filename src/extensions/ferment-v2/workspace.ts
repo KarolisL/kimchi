@@ -56,6 +56,19 @@ const GIT_COMMAND_TIMEOUT_MS = 15_000
  */
 const SNAPSHOT_GIT_TIMEOUT_MS = 60_000
 
+/**
+ * Fixed identity for snapshot commits. `git commit-tree` refuses to run
+ * without an author identity, and fresh containers and CI images have none
+ * configured; snapshot commits are internal objects that never reach a ref,
+ * so they never borrow the user's identity either.
+ */
+const SNAPSHOT_COMMIT_IDENTITY = {
+	GIT_AUTHOR_NAME: "kimchi ferment-v2",
+	GIT_AUTHOR_EMAIL: "ferment-v2@kimchi.invalid",
+	GIT_COMMITTER_NAME: "kimchi ferment-v2",
+	GIT_COMMITTER_EMAIL: "ferment-v2@kimchi.invalid",
+}
+
 export interface WorkspaceSnapshot {
 	commit: string
 	tree: string
@@ -190,7 +203,7 @@ export async function snapshotWorkspace(cwd: string, signal?: AbortSignal): Prom
 					"-m",
 					"kimchi ferment-v2 verifier workspace snapshot",
 				],
-				{ env: { GIT_INDEX_FILE: indexFile }, signal },
+				{ env: { GIT_INDEX_FILE: indexFile, ...SNAPSHOT_COMMIT_IDENTITY }, signal },
 			)
 		).trim()
 		if (!commit) return undefined
