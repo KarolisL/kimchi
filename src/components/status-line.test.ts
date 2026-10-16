@@ -201,11 +201,15 @@ describe("buildScriptPayload", () => {
 			expect(segment?.text).not.toContain("\x1b]8;")
 		}
 	})
-	it.each([null, "detached"])("hides stale PRs when Git reports %s", (branch) => {
+	it.each([
+		["feature", null],
+		["feature", "detached"],
+		["detached", "detached"],
+	])("hides a %s branch PR when Git reports %s", (statusBranch, branch) => {
 		const context = {
 			ctx: createMockContext(),
 			theme: createMockTheme(),
-			statusLineData: createMockStatusLineData({ workPr: "feature · PR #7 open", gitBranch: branch }),
+			statusLineData: createMockStatusLineData({ workPr: `${statusBranch} · PR #7 open`, gitBranch: branch }),
 		}
 		expect(buildStatusLineSegments(context, new Set()).some((item) => item.id === "work-pr")).toBe(false)
 	})

@@ -625,8 +625,8 @@ function buildWorkPrSegment(theme: Theme, statusLineData: ReadonlyFooterDataProv
 	if (statusBranch) {
 		// Git's watcher updates before the next provider poll; never render a link for the old checkout.
 		const branch = statusLineData.getGitBranch()
+		if (!branch || branch === "detached") return null
 		if (branch !== statusBranch) {
-			if (!branch || branch === "detached") return null
 			const text = accentText(theme, branch)
 			return { id: "work-pr", text, width: visibleWidth(text) }
 		}
