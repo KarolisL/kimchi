@@ -32,8 +32,7 @@ export async function lookupBranchPullRequest(
 	let failure: unknown
 	try {
 		const remote = await repositoryIdentity(cwd, signal, deadline, new Map(), branch)
-		// A branch-derived PR/MR on the repository's default branch only ever belongs to another
-		// author, so the footer stays clear there; identity metadata already names the default branch.
+		// Default branches are shared, so a branch-name match cannot identify the current work.
 		if (remote.defaultBranch !== branch) {
 			const url = api(remote, remote.provider === "github" ? "pulls" : "merge_requests")
 			url.search = new URLSearchParams(

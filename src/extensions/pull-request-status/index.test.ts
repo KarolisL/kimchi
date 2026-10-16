@@ -109,7 +109,10 @@ describe("PR status extension", () => {
 	it("shows no branch PR on the default branch without tracking or work records", async () => {
 		vi.mocked(branches.currentBranch).mockResolvedValue("master")
 		vi.mocked(branches.lookupBranchPullRequest).mockResolvedValue({ branch: "master", pullRequest: undefined })
-		await startStandalone()
+		// startStandalone() pins the checkout to feature; this case has to start on the default branch.
+		const api = createExtensionApi()
+		pullRequestStatusExtension(api.api)
+		await start(api)
 		await vi.waitFor(() => expect(branches.lookupBranchPullRequest).toHaveBeenCalledOnce())
 		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("work-pr", undefined)
 		expect(supervisor.subscribePullRequestReconciliation).not.toHaveBeenCalled()
