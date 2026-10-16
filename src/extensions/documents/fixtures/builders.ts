@@ -214,7 +214,10 @@ export async function makeTemplatedPptx(): Promise<Uint8Array> {
 	})
 	const layoutXml = `<?xml version="1.0" encoding="UTF-8"?>
 <p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-  <p:cSld name="Title and Content"><p:spTree><p:nvGrpSpPr/><p:grpSpPr/></p:spTree></p:cSld>
+  <p:cSld name="Title and Content"><p:spTree><p:nvGrpSpPr/><p:grpSpPr/>
+    <p:sp><p:nvSpPr><p:cNvPr id="2" name="Title Placeholder"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>
+    <p:sp><p:nvSpPr><p:cNvPr id="3" name="Body Placeholder"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>
+  </p:spTree></p:cSld>
 </p:sldLayout>`
 	const slideRels = `<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">

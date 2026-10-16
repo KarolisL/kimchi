@@ -25,6 +25,8 @@ export interface SlideSpec {
 	/** 1-based among parsed slides. */
 	index: number
 	layoutHint?: LayoutHint
+	/** Template layout NAME from `inspect` (edit-time append_slide / create --template). */
+	layoutName?: string
 	heading?: string
 	background?: string
 	elements: SlideElement[]

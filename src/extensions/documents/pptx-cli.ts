@@ -8,22 +8,27 @@
  *                                      continuation hint when capped.
  *   pptx.mjs inspect <deck>            Layouts, placeholders and exact shape
  *                                      names — the vocabulary `edit` accepts.
- *   pptx.mjs check <deck>              Static defects (see pptx-check.ts).
+ *   pptx.mjs check <deck>              Static defects (see pptx-check.ts):
+ *                                      exit 0 when clean, 1 with findings.
  *
  *   pptx.mjs create <out> --content <file.md> [--theme f.json] [--template deck]
  *                                      Build a deck from deck Markdown (see
  *                                      deck-markdown.md for the format).
  *
- * edit lands in its own commit; the dispatcher already knows it so the
- * skill's documentation stays accurate.
+ *
+ *   pptx.mjs edit <in> --out <out> --ops f.json   Apply ops (never in place),
+ *                                      revalidate the package, write atomically.
  */
 
 import { readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { applyPptxOps, parsePptxOps } from "./editors/pptx.js"
 import { extractPptx } from "./extractors/pptx.js"
 import { MAX_UNITS_PER_CALL, maxFileBytes } from "./limits.js"
 import { DocumentError, isDocumentError } from "./model.js"
+import { openOoxml } from "./ooxml/package.js"
+import { requireNoProblems, validateContentTypes, validatePresentationChildOrder } from "./ooxml/validate.js"
 import { checkPptx, renderFindings } from "./pptx-check.js"
 import { inspectPptx, renderInspection } from "./pptx-inspect.js"
 import { renderDocument } from "./render.js"
@@ -46,7 +51,7 @@ commands:
   inspect <deck.pptx>                             layouts, placeholders, shape names
   check <deck.pptx>                               likely defects (overflow, alt text, off-slide)
   create <out.pptx> --content <file.md> [--theme <f.json>] [--template <deck.pptx>]
-  edit <in.pptx> --out <out.pptx> --ops <file>    (lands in a later commit)`
+  edit <in.pptx> --out <out.pptx> --ops <ops.json>  apply ops, never in place`
 
 function readBytes(io: Required<CliIo>["readFile"], path: string): Uint8Array {
 	try {
@@ -122,8 +127,9 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 				if (!path) throw new DocumentError("corrupt", "check needs a deck path: pptx.mjs check <deck.pptx>")
 				const data = readBytes(readFile, path)
 				enforceSizeCap(path, data)
-				io.stdout(renderFindings(await checkPptx(data)))
-				return 0
+				const findings = await checkPptx(data)
+				io.stdout(renderFindings(findings))
+				return findings.length === 0 ? 0 : 1
 			}
 			case "create": {
 				const [out, ...flags] = args
@@ -177,9 +183,56 @@ export async function runPptxCli(argv: string[], io: CliIo): Promise<number> {
 				io.stdout(`created ${out} (${spec.slides.length} slide${spec.slides.length === 1 ? "" : "s"})`)
 				return 0
 			}
-			case "edit":
-				io.stderr("edit is not in this build yet — it lands in a later commit.")
-				return 2
+			case "edit": {
+				const [input, ...flags] = args
+				if (!input)
+					throw new DocumentError(
+						"corrupt",
+						"edit needs an input: pptx.mjs edit <in.pptx> --out <out.pptx> --ops <ops.json>",
+					)
+				const flag = (name: string) => {
+					const i = flags.indexOf(name)
+					return i >= 0 ? flags[i + 1] : undefined
+				}
+				const out = flag("--out")
+				const opsPath = flag("--ops")
+				if (!out) throw new DocumentError("corrupt", "edit needs --out <out.pptx> — edits never write in place")
+				if (!opsPath) throw new DocumentError("corrupt", "edit needs --ops <ops.json> (a JSON array of ops)")
+				if (!out.toLowerCase().endsWith(".pptx"))
+					throw new DocumentError("corrupt", `output path must end in .pptx: ${out}`)
+				if (resolve(out) === resolve(input)) {
+					throw new DocumentError("corrupt", "--out must differ from the input — edits never write in place", "pptx")
+				}
+				const data = readBytes(readFile, input)
+				enforceSizeCap(input, data)
+				const opsJson = new TextDecoder().decode(readBytes(readFile, opsPath))
+				let raw: unknown
+				try {
+					raw = JSON.parse(opsJson)
+				} catch {
+					throw new DocumentError("corrupt", `ops file is not valid JSON: ${opsPath}`)
+				}
+				const ops = parsePptxOps(raw)
+				const pkg = await openOoxml(data)
+				const inputProblems = [
+					...validateContentTypes(pkg, pkg.getXml("[Content_Types].xml")),
+					...validatePresentationChildOrder(pkg.getXml("ppt/presentation.xml")),
+				]
+				applyPptxOps(pkg, ops)
+				// Fail only on defects WE introduced — decks produced by third-party
+				// writers routinely violate strict schema order yet open fine in
+				// PowerPoint, and edits must preserve, not "fix", their packaging.
+				const outputProblems = [
+					...validateContentTypes(pkg, pkg.getXml("[Content_Types].xml")),
+					...validatePresentationChildOrder(pkg.getXml("ppt/presentation.xml")),
+				].filter((p) => !inputProblems.includes(p))
+				requireNoProblems(outputProblems, `post-edit package validation for ${input}`)
+				const bytes = await pkg.save()
+				const writeFile = io.writeFile ?? atomicWrite
+				writeFile(out, bytes)
+				io.stdout(`edited ${input} -> ${out} (${ops.length} op${ops.length === 1 ? "" : "s"} applied)`)
+				return 0
+			}
 			case undefined:
 			case "--help":
 			case "-h":

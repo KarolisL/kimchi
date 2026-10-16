@@ -80,6 +80,28 @@ export function pickLayout(layouts: TemplateLayout[], hint: LayoutHint | undefin
 	}
 }
 
+/** Exact (case/space-insensitive) layout-name lookup — the vocabulary `inspect` prints. */
+export function pickLayoutByName(layouts: TemplateLayout[], name: string, slideNo?: number): TemplateLayout {
+	const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
+	const match = layouts.find((l) => normalize(l.name) === normalize(name))
+	if (match) return match
+	throw new DocumentError(
+		"corrupt",
+		`no layout named "${name}" in the deck (layouts: ${layouts.map((l) => `"${l.name}"`).join(", ") || "none"})${slideNo !== undefined ? ` — slide ${slideNo}` : ""}; run \`inspect\` for exact names`,
+	)
+}
+
+/** Plain textbox shape (geometry matching the writer's defaults) — the no-placeholder fallback. */
+function freeFormTextShape(name: string, inner: string, id: number): string {
+	return `<p:sp>
+      <p:nvSpPr><p:cNvPr id="${id}" name="${name}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+      <p:spPr>
+        <a:xfrm><a:off x="457200" y="274320"/><a:ext cx="8229600" cy="914400"/></a:xfrm>
+      </p:spPr>
+      <p:txBody><a:bodyPr/><a:lstStyle/>${inner}</p:txBody>
+    </p:sp>`
+}
+
 function fail(hint: string, slideNo: number, layouts: TemplateLayout[]): never {
 	throw new DocumentError(
 		"corrupt",
@@ -100,6 +122,17 @@ function buildSlideXml(slide: SlideSpec, layout: TemplateLayout): string {
 	const titlePh = layout.placeholders.find((p) => p.type === "title" || p.type === "ctrTitle")
 	if (slide.heading && titlePh) {
 		shapeText.push(phShape(titlePh, `<a:p><a:r><a:t>${escapeXml(slide.heading)}</a:t></a:r></a:p>`, 2))
+	} else if (slide.heading) {
+		// Layouts with no placeholders (e.g. created decks' bare layouts): fall
+		// back to a free-form text box at the standard writer position so the
+		// title is still visible and editable.
+		shapeText.push(
+			freeFormTextShape(
+				"Text 0",
+				`<a:p><a:r><a:rPr lang="en-US" b="1"/><a:t>${escapeXml(slide.heading)}</a:t></a:r></a:p>`,
+				2,
+			),
+		)
 	}
 	let bodySlot = 1
 	for (let i = 0; i < layout.placeholders.length; i++) {
@@ -188,7 +221,29 @@ export async function createFromTemplate(spec: DeckSpec, templateBytes: Uint8Arr
 		}
 	}
 
-	// Determine next slide file number.
+	// Remove existing sldId entries (the template's slides go away; their
+	// parts stay in the package harmlessly — PowerPoint ignores unlisted slides).
+	const presentation = pkg.getXml("ppt/presentation.xml")
+	for (const sldId of byTag(presentation, "sldId")) {
+		sldId.parentNode?.removeChild(sldId)
+	}
+	pkg.putXml("ppt/presentation.xml", presentation)
+
+	appendSlides(pkg, spec.slides, layouts)
+	return pkg.save()
+}
+
+/**
+ * Append slides to a TEMPLATE-STYLE package: each new slide is created
+ * against the template's own layouts and wired into presentation.xml, its
+ * rels, and [Content_Types].xml. Numbering (slide part ids, rIds, sldId
+ * ids) continues from the package's existing maxima. Shared by the template
+ * create path and the editor's append_slide op.
+ */
+export function appendSlides(pkg: OoxmlPackage, slides: SlideSpec[], layouts: TemplateLayout[]): void {
+	if (layouts.length === 0) {
+		throw new DocumentError("corrupt", "Deck has no slide layouts — cannot append slides.")
+	}
 	const existing = pkg
 		.names()
 		.map((n) => /^ppt\/slides\/slide(\d+)\.xml$/.exec(n)?.[1])
@@ -209,16 +264,12 @@ export async function createFromTemplate(spec: DeckSpec, templateBytes: Uint8Arr
 		.filter((n) => Number.isFinite(n))
 	let nextSldId = usedSldIds.length === 0 ? 256 : Math.max(...usedSldIds) + 1
 
-	// Remove existing sldId entries (the template's slides go away; their
-	// parts stay in the package harmlessly — PowerPoint ignores unlisted slides).
-	for (const sldId of byTag(presentation, "sldId")) {
-		sldId.parentNode?.removeChild(sldId)
-	}
-
 	const contentTypes = pkg.getXml("[Content_Types].xml")
 
-	for (const slide of spec.slides) {
-		const layout = pickLayout(layouts, slide.layoutHint, slide.index)
+	for (const slide of slides) {
+		const layout = slide.layoutName
+			? pickLayoutByName(layouts, slide.layoutName, slide.index)
+			: pickLayout(layouts, slide.layoutHint, slide.index)
 		const slidePath = `ppt/slides/slide${nextId++}.xml`
 		const rid = `rId${nextRid++}`
 		const sldIdValue = nextSldId++
@@ -264,7 +315,6 @@ export async function createFromTemplate(spec: DeckSpec, templateBytes: Uint8Arr
 	pkg.putXml("ppt/presentation.xml", presentation)
 	pkg.putXml(presRelsPath, presRels)
 	pkg.putXml("[Content_Types].xml", contentTypes)
-	return pkg.save()
 }
 
 /** Target of a rels part relative to fromDir ("ppt/slides" → "../slideLayouts/x.xml"). */

@@ -188,6 +188,8 @@ export interface OoxmlPackage {
 	getXml(name: string): XmlDocument
 	hasXml(name: string): boolean
 	putXml(name: string, doc: XmlDocument): void
+	/** Drop a part and any parts under it when recursive (delete_slide uses it). */
+	remove(name: string, opts?: { recursive?: boolean }): void
 	/** Saves with untouched entries carried byte-for-byte from the original. */
 	save(): Promise<Uint8Array>
 }
@@ -206,6 +208,7 @@ export async function openOoxml(data: Uint8Array): Promise<OoxmlPackage> {
 	}
 
 	const cache = new Map<string, { data: Uint8Array; dirty: boolean }>()
+	const removed = new Set<string>()
 	// Prime every (capped) part so getBytes/getXml stay synchronous for readers.
 	for (const entry of entries) {
 		const file = zip.file(entry.name)
@@ -228,9 +231,19 @@ export async function openOoxml(data: Uint8Array): Promise<OoxmlPackage> {
 		hasXml: (name) => cache.has(name),
 		putXml: (name, doc) => {
 			validateEntryName(name)
+			removed.delete(name)
 			cache.set(name, { data: UTF8_ENCODER.encode(serializeXml(doc)), dirty: true })
 		},
+		remove: (name, opts) => {
+			for (const part of [...cache.keys()]) {
+				if (part === name || (opts?.recursive && part.startsWith(name))) {
+					cache.delete(part)
+					removed.add(part)
+				}
+			}
+		},
 		save: async () => {
+			for (const name of removed) zip.remove(name)
 			for (const [name, state] of cache) {
 				if (state.dirty) zip.file(name, state.data)
 			}

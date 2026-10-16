@@ -54,6 +54,16 @@ export function byTag(element: XmlDocument | Element, localName: string): Elemen
 }
 
 /** Concatenated text of all descendant <w:t>/<a:t>-style text nodes under `el`. */
+/** Direct child ELEMENTS of `el` (matching byTag's traversal style, one level). */
+export function childElements(el: Element): Element[] {
+	const out: Element[] = []
+	for (let i = 0; i < el.childNodes.length; i++) {
+		const child = el.childNodes.item(i)
+		if (child?.nodeType === 1) out.push(child as Element)
+	}
+	return out
+}
+
 export function textContentOf(el: Element, localNames: readonly string[]): string {
 	let text = ""
 	for (const name of localNames) {

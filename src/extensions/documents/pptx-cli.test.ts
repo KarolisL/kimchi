@@ -108,7 +108,7 @@ describe("pptx.mjs check / inspect", () => {
 	it("check prints locator-carrying findings", async () => {
 		const t = io()
 		t.files.set("defect.pptx", await makeDefectivePptx())
-		expect(await runPptxCli(["check", "defect.pptx"], t.io)).toBe(0)
+		expect(await runPptxCli(["check", "defect.pptx"], t.io)).toBe(1)
 		expect(t.out.join("\n")).toContain('slide 1 [shape "Body Overflow"] text-overflow: likely text overflow')
 	})
 
