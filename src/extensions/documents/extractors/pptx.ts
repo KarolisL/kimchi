@@ -12,12 +12,12 @@ import { DocumentError, type ExtractedDocument } from "../model.js"
 import { openOoxml } from "../ooxml/package.js"
 import { byTag } from "../ooxml/xml.js"
 
-interface RelMap {
+export interface RelMap {
 	/** rId → target part path (relative to the part's directory). */
 	[rId: string]: string
 }
 
-function parseRels(xml: XmlDocument): RelMap {
+export function parseOoxmlRels(xml: XmlDocument): RelMap {
 	const map: RelMap = {}
 	for (const rel of byTag(xml, "Relationship")) {
 		const id = rel.getAttribute("Id")
@@ -27,7 +27,7 @@ function parseRels(xml: XmlDocument): RelMap {
 	return map
 }
 
-function joinPart(baseDir: string, target: string): string {
+export function joinOoxmlPart(baseDir: string, target: string): string {
 	if (target.startsWith("/")) return target.slice(1)
 	const segments = `${baseDir}/${target}`.split("/")
 	const out: string[] = []
@@ -39,17 +39,17 @@ function joinPart(baseDir: string, target: string): string {
 }
 
 /** Directory of a part path: "ppt/slides/slide1.xml" → "ppt/slides". */
-function partDir(path: string): string {
+export function ooxmlPartDir(path: string): string {
 	const idx = path.lastIndexOf("/")
 	return idx < 0 ? "" : path.slice(0, idx)
 }
 
 /** Rels part for a part path: "ppt/slides/slide1.xml" → "ppt/slides/_rels/slide1.xml.rels". */
-function relsPath(path: string): string {
-	return `${partDir(path)}/_rels/${path.slice(partDir(path).length + 1)}.rels`
+export function ooxmlRelsPath(path: string): string {
+	return `${ooxmlPartDir(path)}/_rels/${path.slice(ooxmlPartDir(path).length + 1)}.rels`
 }
 
-function textOf(el: Element): string {
+export function ooxmlTextOf(el: Element): string {
 	const texts: string[] = []
 	for (const t of byTag(el, "t")) {
 		texts.push(t.textContent ?? "")
@@ -57,11 +57,11 @@ function textOf(el: Element): string {
 	return texts.join("")
 }
 
-function localName(tag: string): string {
+export function ooxmlLocalName(tag: string): string {
 	return tag.split(":").pop() ?? tag
 }
 
-function extractShapeText(sp: Element): { name?: string; text: string } {
+export function extractPptxShapeText(sp: Element): { name?: string; text: string } {
 	let name: string | undefined
 	for (const cNvPr of byTag(sp, "cNvPr")) {
 		name = cNvPr.getAttribute("name") ?? undefined
@@ -70,8 +70,8 @@ function extractShapeText(sp: Element): { name?: string; text: string } {
 	// Paragraph-level joins keep line breaks between a:p paragraphs.
 	const paragraphs: string[] = []
 	for (const p of byTag(sp, "p")) {
-		if (localName((p.parentNode as Element | null)?.tagName ?? "") !== "txBody") continue
-		paragraphs.push(textOf(p))
+		if (ooxmlLocalName((p.parentNode as Element | null)?.tagName ?? "") !== "txBody") continue
+		paragraphs.push(ooxmlTextOf(p))
 	}
 	return { name, text: paragraphs.filter((line) => line.trim()).join("\n") }
 }
@@ -81,7 +81,7 @@ function extractTable(tbl: Element): string {
 	for (const tr of byTag(tbl, "tr")) {
 		const cells: string[] = []
 		for (const tc of byTag(tr, "tc")) {
-			cells.push(textOf(tc))
+			cells.push(ooxmlTextOf(tc))
 		}
 		rows.push(cells)
 	}
@@ -95,8 +95,8 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 		throw new DocumentError("corrupt", "Missing ppt/presentation.xml", "pptx")
 	}
 	const presentation = pkg.getXml("ppt/presentation.xml")
-	const presRels = pkg.hasXml(relsPath("ppt/presentation.xml"))
-		? parseRels(pkg.getXml(relsPath("ppt/presentation.xml")))
+	const presRels = pkg.hasXml(ooxmlRelsPath("ppt/presentation.xml"))
+		? parseOoxmlRels(pkg.getXml(ooxmlRelsPath("ppt/presentation.xml")))
 		: {}
 
 	// sldIdLst gives the true slide order; r:id maps to part via rels.
@@ -106,7 +106,7 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 		const show = sldId.getAttribute("show")
 		const target = rid ? presRels[rid] : undefined
 		if (!target) continue
-		slides.push({ path: joinPart("ppt", target), hidden: show === "0" })
+		slides.push({ path: joinOoxmlPart("ppt", target), hidden: show === "0" })
 	}
 	if (slides.length === 0) {
 		throw new DocumentError("corrupt", "PPTX has no slides in sldIdLst.", "pptx")
@@ -126,9 +126,9 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 		const blocks: string[] = []
 		let chartCount = 0
 		for (const child of topLevelShapes(slide)) {
-			const tag = localName(child.tagName)
+			const tag = ooxmlLocalName(child.tagName)
 			if (tag === "sp") {
-				const { name, text } = extractShapeText(child)
+				const { name, text } = extractPptxShapeText(child)
 				if (!text.trim()) continue
 				blocks.push(name ? `[shape "${name}"]\n${text}` : text)
 			} else if (tag === "graphicFrame") {
@@ -142,7 +142,7 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 				}
 			} else if (tag === "grpSp") {
 				const texts = byTag(child, "sp")
-					.map((sp) => extractShapeText(sp))
+					.map((sp) => extractPptxShapeText(sp))
 					.filter((t) => t.text.trim())
 				for (const t of texts) blocks.push(t.name ? `[shape "${t.name}"]\n${t.text}` : t.text)
 			}
@@ -150,15 +150,15 @@ export async function extractPptx(data: Uint8Array): Promise<ExtractedDocument> 
 		if (chartCount > 0) notes.push(`slide ${i + 1}: ${chartCount} chart(s) shown as [chart] markers`)
 
 		// Notes slide: slide rels → ../notesSlides/notesSlideN.xml
-		const slideRelsPath = relsPath(path)
+		const slideRelsPath = ooxmlRelsPath(path)
 		if (pkg.hasXml(slideRelsPath)) {
-			const rels = parseRels(pkg.getXml(slideRelsPath))
+			const rels = parseOoxmlRels(pkg.getXml(slideRelsPath))
 			for (const target of Object.values(rels)) {
-				const notesPath = joinPart(partDir(path), target)
+				const notesPath = joinOoxmlPart(ooxmlPartDir(path), target)
 				if (!/notesSlide\d+\.xml$/.test(notesPath) || !pkg.hasXml(notesPath)) continue
 				const notesDoc = pkg.getXml(notesPath)
 				const notesText = byTag(notesDoc, "p")
-					.map((p) => textOf(p))
+					.map((p) => ooxmlTextOf(p))
 					.filter((line) => line.trim())
 					.join("\n")
 				if (notesText.trim()) blocks.push(`Notes:\n${notesText}`)

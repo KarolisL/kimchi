@@ -109,6 +109,52 @@ if (!isDev) {
 	cpSync(proxyHelperSrc, join(proxyHelperBinDest, proxyHelperName))
 }
 
+// Bundle the pptx skill's CLI (same staging-deref dance as validate-skill:
+// bun resolves jszip/@xmldom from the staged node_modules, not the repo).
+const pptxCliDest = join(projectRoot, isDev ? "resources" : "dist/share/kimchi", "skills/pptx/scripts/pptx.mjs")
+mkdirSync(dirname(pptxCliDest), { recursive: true })
+const pptxStaging = mkdtempSync(join(tmpdir(), "kimchi-pptx-build-"))
+try {
+	const stagedEntry = join(pptxStaging, "pptx-cli.ts")
+	cpSync(join(projectRoot, "src", "extensions", "documents", "pptx-cli.ts"), stagedEntry)
+	// The entry imports its siblings — stage the whole documents module tree.
+	cpSync(join(projectRoot, "src", "extensions", "documents"), join(pptxStaging, "documents"), {
+		recursive: true,
+		filter: (src) => !src.endsWith(".test.ts"),
+	})
+	// Rewrite the entry's relative imports to the staged tree.
+	let entry = readFileSync(stagedEntry, "utf-8")
+	entry = entry.replaceAll('from "./', 'from "./documents/')
+	writeFileSync(stagedEntry, entry)
+	// jszip's CJS entry pulls transitive deps (lie, pako, …) we don't stage;
+	// its dist/jszip.min.js is self-contained, so point the staged package at it.
+	const jszipDest = join(pptxStaging, "node_modules", "jszip")
+	cpSync(join(projectRoot, "node_modules", "jszip"), jszipDest, { dereference: true, recursive: true })
+	const jszipPkg = JSON.parse(readFileSync(join(jszipDest, "package.json"), "utf-8"))
+	jszipPkg.main = "dist/jszip.min.js"
+	writeFileSync(join(jszipDest, "package.json"), JSON.stringify(jszipPkg))
+	// @xmldom/xmldom is dependency-free; stage as-is.
+	cpSync(
+		join(projectRoot, "node_modules", "@xmldom", "xmldom"),
+		join(pptxStaging, "node_modules", "@xmldom", "xmldom"),
+		{
+			dereference: true,
+			recursive: true,
+		},
+	)
+	const stagedOut = join(pptxStaging, "pptx.mjs")
+	execFileSync("bun", ["build", stagedEntry, "--target=node", "--format=esm", "--outfile", stagedOut], {
+		stdio: "inherit",
+	})
+	cpSync(stagedOut, pptxCliDest)
+} finally {
+	try {
+		rmSync(pptxStaging, { recursive: true, force: true })
+	} catch {
+		// ignore — the OS reclaims temp dirs
+	}
+}
+
 // Bundle YAML into the validator: discovered skills are copied to temporary
 // directories, and installed binaries have no node_modules to resolve it from.
 //
