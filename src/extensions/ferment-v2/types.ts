@@ -57,8 +57,20 @@ export interface SessionFermentV2 {
 	tokensUsed: number
 	tokenBudget?: number
 	timeUsedMs: number
+	/** Cumulative executing-verifier usage, tracked separately from the implementer's tokens. */
+	verifierUsage?: FermentV2VerifierUsage
 	createdAt: string
 	updatedAt: string
+}
+
+export interface FermentV2VerifierUsage {
+	runs: number
+	input: number
+	output: number
+	cacheRead: number
+	cacheWrite: number
+	totalTokens: number
+	costUsd: number
 }
 
 export type FermentV2JournalEntry =

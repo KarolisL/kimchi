@@ -4,9 +4,11 @@ import {
 	FERMENT_V2_EVALUATION_VERDICTS,
 	FERMENT_V2_STATUSES,
 	type FermentV2Evaluation,
+	type FermentV2EvaluatorUsage,
 	type FermentV2JournalEntry,
 	type FermentV2Presentation,
 	type FermentV2Status,
+	type FermentV2VerifierUsage,
 	type SessionFermentV2,
 } from "./types.js"
 
@@ -109,6 +111,35 @@ export function addFermentV2Accounting(
 			state.status === "active" && isOverBudget(state.tokenBudget, nextTokensUsed) ? "budget_limited" : state.status,
 		tokensUsed: nextTokensUsed,
 		timeUsedMs: state.timeUsedMs + nonNegativeInteger(timeUsedMs, "elapsed time"),
+		updatedAt: now,
+	}
+}
+
+/** Fold one executing-verifier run's usage into the ferment's cumulative verifier accounting. */
+export function recordFermentV2VerifierUsage(
+	state: FermentV2State,
+	expectedId: string,
+	usage: FermentV2EvaluatorUsage,
+	now: string,
+): SessionFermentV2 {
+	if (!state) throw new Error("Ferment V2 verifier accounting rejected: no current Ferment V2 exists.")
+	if (state.id !== expectedId) {
+		throw new Error(
+			`Ferment V2 verifier accounting rejected: expected Ferment V2 ${expectedId}, but the current Ferment V2 is ${state.id}.`,
+		)
+	}
+	const previous = state.verifierUsage
+	return {
+		...state,
+		verifierUsage: {
+			runs: (previous?.runs ?? 0) + 1,
+			input: (previous?.input ?? 0) + usage.input,
+			output: (previous?.output ?? 0) + usage.output,
+			cacheRead: (previous?.cacheRead ?? 0) + usage.cacheRead,
+			cacheWrite: (previous?.cacheWrite ?? 0) + usage.cacheWrite,
+			totalTokens: (previous?.totalTokens ?? 0) + usage.totalTokens,
+			costUsd: (previous?.costUsd ?? 0) + usage.costUsd,
+		},
 		updatedAt: now,
 	}
 }
@@ -292,6 +323,7 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 	)
 	const lastEvaluation = parseFermentV2Evaluation(value.lastEvaluation)
 	const presentation = parseFermentV2Presentation(value.presentation)
+	const verifierUsage = parseFermentV2VerifierUsage(value.verifierUsage)
 	if (
 		value.schemaVersion !== 1 ||
 		!isNonEmptyString(value.id) ||
@@ -335,8 +367,36 @@ function parseFermentV2(value: unknown): SessionFermentV2 | undefined {
 		tokensUsed: value.tokensUsed ?? 0,
 		...(value.tokenBudget === undefined ? {} : { tokenBudget: value.tokenBudget }),
 		timeUsedMs: value.timeUsedMs ?? 0,
+		...(verifierUsage ? { verifierUsage } : {}),
 		createdAt: value.createdAt,
 		updatedAt: value.updatedAt,
+	}
+}
+
+function parseFermentV2VerifierUsage(value: unknown): FermentV2VerifierUsage | undefined {
+	if (value === undefined) return undefined
+	if (
+		!isRecord(value) ||
+		!isNonNegativeInteger(value.runs) ||
+		!isNonNegativeInteger(value.input) ||
+		!isNonNegativeInteger(value.output) ||
+		!isNonNegativeInteger(value.cacheRead) ||
+		!isNonNegativeInteger(value.cacheWrite) ||
+		!isNonNegativeInteger(value.totalTokens) ||
+		typeof value.costUsd !== "number" ||
+		!Number.isFinite(value.costUsd) ||
+		value.costUsd < 0
+	) {
+		return undefined
+	}
+	return {
+		runs: value.runs,
+		input: value.input,
+		output: value.output,
+		cacheRead: value.cacheRead,
+		cacheWrite: value.cacheWrite,
+		totalTokens: value.totalTokens,
+		costUsd: value.costUsd,
 	}
 }
 

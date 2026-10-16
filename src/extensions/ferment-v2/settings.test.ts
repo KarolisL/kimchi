@@ -35,8 +35,8 @@ afterEach(() => {
 })
 
 describe("parseFermentV2Settings", () => {
-	it("uses a ten-minute evaluator deadline by default", () => {
-		expect(parseFermentV2Settings(undefined).evaluationTimeoutMs).toBe(600_000)
+	it("has no verifier timeout cap by default", () => {
+		expect(parseFermentV2Settings(undefined).evaluationTimeoutMs).toBeUndefined()
 	})
 
 	it("defaults the evaluator model list to the ordered Ferment V2 pair", () => {
@@ -73,6 +73,10 @@ describe("parseFermentV2Settings", () => {
 		expect(
 			parseFermentV2Settings({ evaluatorModels: [" other/evaluator ", "another/reviewer"] }).evaluatorModels,
 		).toEqual(["other/evaluator", "another/reviewer"])
+	})
+
+	it("accepts null to disable the verifier timeout cap explicitly", () => {
+		expect(parseFermentV2Settings({ evaluationTimeoutMs: null }).evaluationTimeoutMs).toBeUndefined()
 	})
 
 	it.each([

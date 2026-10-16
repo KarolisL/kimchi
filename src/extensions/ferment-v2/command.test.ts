@@ -5,6 +5,7 @@ import {
 	formatFermentV2Duration,
 	formatFermentV2Status,
 	formatFermentV2Summary,
+	formatFermentV2VerifyingStatus,
 	parseFermentV2Command,
 } from "./command.js"
 import { FERMENT_V2_STATUSES, type FermentV2Status, type SessionFermentV2 } from "./types.js"
@@ -102,6 +103,36 @@ describe("Ferment V2 command", () => {
 		expect(formatFermentV2Status(fermentV2("blocked"))).toBe("◈ Ferment V2: blocked · ship it · /ferment-v2 resume")
 		expect(formatFermentV2Status(fermentV2("complete"))).toBe("◈ Ferment V2: complete · ship it")
 		expect(formatFermentV2Status(fermentV2("budget_limited"))).toBe("◈ Ferment V2: budget limited · ship it")
+	})
+
+	it("shows the verifying model, elapsed time and revert warning while the verifier runs", () => {
+		expect(formatFermentV2VerifyingStatus(undefined, 0)).toBe(
+			"◈ Ferment V2: verifying · … · 0ms · file edits may be reverted",
+		)
+		expect(formatFermentV2VerifyingStatus("judge/independent", 5_000)).toBe(
+			"◈ Ferment V2: verifying · judge/independent · 5.0s · file edits may be reverted",
+		)
+		expect(formatFermentV2VerifyingStatus("judge/independent", -1_000)).toBe(
+			"◈ Ferment V2: verifying · judge/independent · 0ms · file edits may be reverted",
+		)
+	})
+
+	it("shows the verifier usage breakdown in the full command summary", () => {
+		const verified = {
+			...fermentV2("active"),
+			evaluationCount: 2,
+			verifierUsage: {
+				runs: 2,
+				input: 4_000,
+				output: 1_000,
+				cacheRead: 500,
+				cacheWrite: 200,
+				totalTokens: 5_700,
+				costUsd: 0.0512,
+			},
+		}
+		expect(formatFermentV2Summary(verified)).toContain("Verifier: 2 runs · 5.7k tokens · $0.05")
+		expect(formatFermentV2Summary(fermentV2("active"))).not.toContain("Verifier:")
 	})
 
 	it("shows evaluation details only in the full command summary", () => {

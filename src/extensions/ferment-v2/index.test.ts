@@ -1320,16 +1320,17 @@ describe("Ferment V2 extension", () => {
 		expect(harness.currentFermentV2()).toMatchObject({
 			status: "active",
 			lastEvaluation: { verdict: "met" },
-			tokensUsed: 1_750,
-			timeUsedMs: 3_500,
+			// 1_500 turn tokens + 18 verifier tokens; 2_500ms turns + 123ms verifier run.
+			tokensUsed: 1_768,
+			timeUsedMs: 3_623,
 		})
 		expect(harness.ui.notify).not.toHaveBeenCalledWith("Ferment V2 complete.", "info")
 		await finishFinalAnswerTurn(harness, "Delivered final answer.", "stop", { input: 40, output: 10 })
 		expect(harness.currentFermentV2()).toMatchObject({
 			status: "complete",
 			completionConfidence: "proven",
-			tokensUsed: 1_750,
-			timeUsedMs: 3_500,
+			tokensUsed: 1_768,
+			timeUsedMs: 3_623,
 		})
 		expect(harness.ui.notify).toHaveBeenCalledWith("Ferment V2 complete.", "info")
 	})
@@ -2478,7 +2479,8 @@ describe("Ferment V2 extension", () => {
 		await settleFermentV2(harness, "continue")
 
 		expect(evaluateFermentV2Mock).toHaveBeenCalledWith(
-			expect.objectContaining({ todos: [], lessons: [] }),
+			expect.objectContaining({ todos: [] }),
+			expect.anything(),
 			expect.anything(),
 		)
 		expect(harness.currentFermentV2()).toMatchObject({ revision: 2, unchangedContinuationTurns: 1 })
@@ -3123,6 +3125,7 @@ describe("Ferment V2 extension", () => {
 				]),
 			}),
 			expect.anything(),
+			expect.anything(),
 		)
 	})
 
@@ -3144,8 +3147,77 @@ describe("Ferment V2 extension", () => {
 		await settled
 
 		expect(harness.sendMessage).not.toHaveBeenCalled()
-		expect(harness.appendEntry).not.toHaveBeenCalled()
+		// The verdict is inapplicable, but the verifier usage it already consumed
+		// is still settled against the Ferment V2 before the validity gates.
+		expect(harness.appendEntry).toHaveBeenCalledOnce()
+		expect(harness.appendEntry.mock.calls[0]?.[1]).toMatchObject({
+			fermentV2: expect.objectContaining({
+				tokensUsed: 18,
+				verifierUsage: expect.objectContaining({ totalTokens: 18, runs: 1 }),
+			}),
+		})
 		expect(harness.currentFermentV2()?.evaluationCount).toBeUndefined()
+	})
+
+	it("settles verifier usage even when a pause during verification cancels the verdict", async () => {
+		await harness.command("keep going")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		harness.appendEntry.mockClear()
+
+		const { release, settled, signal } = await holdEvaluation(harness)
+		setPermissionMode(TEST_SESSION_ID, { mode: "plan", initiatedBy: "user", source: "runtime" })
+		harness.events.emit(PERMISSION_EVENTS.MODE_CHANGED, { to: { mode: "plan" } })
+		expect(signal?.aborted).toBe(true)
+		release({
+			verdict: "met",
+			reason: "all good",
+			model: "test/evaluator",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+		})
+		await settled
+
+		expect(harness.currentFermentV2()).toMatchObject({
+			status: "paused",
+			tokensUsed: 18,
+			verifierUsage: expect.objectContaining({ totalTokens: 18, runs: 1 }),
+		})
+	})
+
+	it("emits budget_limited and schedules no further work when verifier usage crosses the token budget", async () => {
+		await harness.command("--tokens 10 keep going")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		await claimCompletion(harness)
+		evaluateFermentV2Mock.mockResolvedValueOnce({
+			verdict: "met",
+			reason: "All requirements are evidenced.",
+			model: "test/evaluator",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+		})
+		harness.sendMessage.mockClear()
+		harness.appendEntry.mockClear()
+		await harness.fire("agent_end", { type: "agent_end", messages: [] })
+		await harness.fire("agent_settled", { type: "agent_settled" })
+
+		expect(harness.currentFermentV2()).toMatchObject({
+			status: "budget_limited",
+			tokenBudget: 10,
+			tokensUsed: 18,
+			verifierUsage: expect.objectContaining({ totalTokens: 18, runs: 1 }),
+		})
+		expect(harness.events.emit).toHaveBeenCalledWith(
+			FERMENT_V2_EVENTS.BUDGET_LIMITED,
+			expect.objectContaining({ reason: "token_budget", status: "budget_limited" }),
+		)
+		expect(harness.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("stopped after reaching its 10 token budget."),
+			"warning",
+		)
+		// The budget outcome stopped the ferment: no evaluation record, no final-answer
+		// delivery, and no continuation turn are scheduled after it.
+		expect(harness.currentFermentV2()?.evaluationCount).toBeUndefined()
+		expect(harness.sendMessage).not.toHaveBeenCalled()
 	})
 
 	it("keeps evaluator met active until the current revision has a completed visible Todo", async () => {
@@ -3166,11 +3238,18 @@ describe("Ferment V2 extension", () => {
 		harness.appendEntry.mockClear()
 		await settleFermentV2(harness, "met")
 		expect(harness.currentFermentV2()).toMatchObject({ status: "complete", evaluationCount: 2 })
-		expect(harness.appendEntry).toHaveBeenCalledTimes(2)
+		expect(harness.appendEntry).toHaveBeenCalledTimes(3)
+		// Verifier usage settles first, before the verdict is recorded.
 		expect(harness.appendEntry.mock.calls[0]?.[1]).toMatchObject({
+			fermentV2: expect.objectContaining({
+				tokensUsed: 36,
+				verifierUsage: expect.objectContaining({ totalTokens: 36, runs: 2 }),
+			}),
+		})
+		expect(harness.appendEntry.mock.calls[1]?.[1]).toMatchObject({
 			fermentV2: { status: "active", lastEvaluation: { verdict: "met" } },
 		})
-		expect(harness.appendEntry.mock.calls[1]?.[1]).toMatchObject({ fermentV2: { status: "complete" } })
+		expect(harness.appendEntry.mock.calls[2]?.[1]).toMatchObject({ fermentV2: { status: "complete" } })
 	})
 
 	it("does not require an invisible Todo list for evidenced headless completion", async () => {
@@ -3254,7 +3333,17 @@ describe("Ferment V2 extension", () => {
 			FERMENT_V2_EVENTS.EVALUATED,
 			expect.not.objectContaining({ reason: expect.anything() }),
 		)
-		expect(harness.appendEntry).toHaveBeenCalledOnce()
+		expect(harness.appendEntry).toHaveBeenCalledTimes(2)
+		// Verifier usage settles before the blocked verdict is committed.
+		expect(harness.appendEntry.mock.calls[0]?.[1]).toMatchObject({
+			fermentV2: expect.objectContaining({
+				tokensUsed: 18,
+				verifierUsage: expect.objectContaining({ totalTokens: 18, runs: 1 }),
+			}),
+		})
+		expect(harness.appendEntry.mock.calls[1]?.[1]).toMatchObject({
+			fermentV2: { status: "blocked" },
+		})
 
 		await harness.command("resume")
 		expect(harness.currentFermentV2()).toMatchObject({ status: "active" })

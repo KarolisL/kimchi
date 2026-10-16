@@ -5,7 +5,8 @@ export interface FermentV2Settings {
 	maxUnchangedContinuations: number
 	maxConsecutiveErrors: number
 	defaultTokenBudget: number | undefined
-	evaluationTimeoutMs: number
+	/** Optional wall-clock cap on one verifier run in milliseconds. Default: no cap. */
+	evaluationTimeoutMs: number | undefined
 	evaluatorModels: readonly string[]
 }
 
@@ -21,7 +22,7 @@ export const DEFAULT_FERMENT_V2_SETTINGS: Readonly<FermentV2Settings> = {
 	maxUnchangedContinuations: 3,
 	maxConsecutiveErrors: 3,
 	defaultTokenBudget: undefined,
-	evaluationTimeoutMs: 600_000,
+	evaluationTimeoutMs: undefined,
 	evaluatorModels: DEFAULT_FERMENT_V2_EVALUATOR_MODELS,
 }
 
@@ -55,6 +56,7 @@ export function parseFermentV2Settings(raw: unknown): FermentV2Settings {
 	if (isPositiveInteger(raw.maxConsecutiveErrors)) settings.maxConsecutiveErrors = raw.maxConsecutiveErrors
 	if (isPositiveInteger(raw.defaultTokenBudget)) settings.defaultTokenBudget = raw.defaultTokenBudget
 	if (isPositiveInteger(raw.evaluationTimeoutMs)) settings.evaluationTimeoutMs = raw.evaluationTimeoutMs
+	else if (raw.evaluationTimeoutMs === null) settings.evaluationTimeoutMs = undefined
 	if (isNonEmptyTrimmedStringArray(raw.evaluatorModels))
 		settings.evaluatorModels = raw.evaluatorModels.map((entry) => entry.trim())
 

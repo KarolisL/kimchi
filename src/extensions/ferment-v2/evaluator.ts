@@ -1,75 +1,70 @@
-import type { Context, Usage } from "@earendil-works/pi-ai"
-import { completeSimple } from "@earendil-works/pi-ai/compat"
-import { type AgentEndEvent, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent"
+/**
+ * evaluator.ts — the Ferment V2 executing verifier.
+ *
+ * When the implementer claims completion, the host spawns the `Verifier`
+ * subagent (read/bash/grep/find/ls, unlimited turns and duration, model-only
+ * inactivity) with an inline guard extension that stamps every tool result
+ * with an evidence ID `[eN]` and accumulates the session's usage as
+ * assistant messages complete (compaction-proof). The verifier executes
+ * checks in the real working tree; the host validates its JSON verdict
+ * (citations must exist in the guard's evidence), keeps final-answer checks
+ * as literal host comparisons, enforces workspace integrity after the run
+ * (also on abort), and returns a `FermentV2EvaluationResult`. The verifier
+ * only runs when the workspace's integrity can be protected: a git workspace
+ * that cannot be snapshotted fails closed before spawning.
+ *
+ * The previous single-shot `completeSimple` call over a transcript digest is
+ * gone; `evaluateFermentV2` and the result shape remain the seam used by
+ * `index.ts`.
+ */
+
+import type { Api, Model } from "@earendil-works/pi-ai"
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-works/pi-coding-agent"
 import { classifyLLMGatewayError } from "../../llm-gateway-error.js"
-import { INTERNAL_SESSION_ENTRY } from "../../session-visibility.js"
+import {
+	type FermentV2VerifierAgentRun,
+	resumeFermentV2VerifierAgent,
+	spawnFermentV2VerifierAgent,
+} from "../agents/index.js"
 import { getRedactionConfig } from "../pii-redaction/config.js"
+import piiRedactionExtension from "../pii-redaction/index.js"
 import { redactTextOrThrow } from "../pii-redaction/redactor.js"
 import type { TodoItem } from "../todos/types.js"
-import { appendWorkRecord, getWorkId, recordProviderRequest, tryWorkAttribution } from "../work-attribution.js"
 import type { FermentV2EvaluatorFailureType } from "./domain-events.js"
 import { latestFinalAnswerDraft } from "./final-answer.js"
-import { type FermentV2Lesson, MAX_FERMENT_V2_LESSON_CHARS, MAX_FERMENT_V2_LESSONS } from "./lessons.js"
 import { objectiveText } from "./objective-file.js"
 import { isRecord } from "./reducer.js"
 import { getFermentV2Settings } from "./settings.js"
-import type { FermentV2EvaluatorUsage } from "./types.js"
+import type { FermentV2CompletionConfidence, FermentV2EvaluatorUsage } from "./types.js"
+import {
+	createVerifierGuard,
+	detectGitWorkspace,
+	enforceWorkspaceIntegrity,
+	type GitWorkspaceProbe,
+	type HeadState,
+	type IntegrityResult,
+	snapshotWorkspace,
+	type VerifierEvidence,
+	type VerifierGuard,
+	type WorkspaceSnapshot,
+	workspaceHead,
+} from "./verifier-guard.js"
 import { resolveFermentV2VerifierModel } from "./verifier-model.js"
+import { buildVerifierTaskPrompt, type FermentV2VerifierFacts, gatherVerifierFacts } from "./verifier-prompt.js"
 
-export const MAX_TRANSCRIPT_CHARS = 16_000
-export const MAX_TODO_STATE_CHARS = 8_000
 const MAX_REASON_CHARS = 1_000
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error)
-}
+/** Maximum characters of a failing check's evidence excerpt embedded in the task-facing reason (design: ≤300). */
+const FAILING_CHECK_EXCERPT_CHARS = 300
 
-function isKimchiManagedJsonModeProvider(provider: string): boolean {
-	return (
-		provider === "moonshotai" ||
-		provider === "kimchi-dev" ||
-		provider.startsWith("kimchi-dev/") ||
-		provider === "kimchi-experimental"
-	)
-}
-const INVALID_JSON_RETRY_PROMPT =
-	"The previous response was not valid JSON. Return one valid JSON object matching the output contract. Keep reason and failureMode short, and include observedAnswer only for final_answer checks."
+/** Backoff between transient verifier failures (design: ≈5s/20s/60s). */
+const VERIFIER_RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000, 60_000]
 
-const EVALUATOR_SYSTEM_PROMPT = `<ferment_v2_evaluator>
-You independently decide whether a persistent coding Ferment V2 should continue.
+/** Failure reasons that are transient: the verifier is retried up to 3× with backoff. */
+const TRANSIENT_FAILURE_REASONS = new Set(["rate_limit", "transport_failure", "stream_interrupted", "provider_5xx"])
 
-<output_contract>
-- Return exactly one JSON object and no markdown:
-{"verdict":"continue|met|impossible","checks":[{"kind":"work|final_answer","requirement":"one objective requirement","met":true,"failureMode":"plausible way this could still be wrong, and why the cited evidence rules it out","candidateRef":"last_assistant","observedAnswer":"complete last assistant entry for final_answer only","expectedAnswer":null,"evidence":["m12"],"todoIds":[1]}],"reason":"concise evidence-based reason"}
-- Write reason as a task-facing next action or missing evidence; never mention the evaluator, verdict, controller, or completion policy.
-</output_contract>
-
-<evidence_policy>
-- Authoritative tool results have IDs such as [m12]. Evidence-labelled Ferment V2 lessons have IDs such as [l3]. Other context is intentionally unnumbered. Cite only shown IDs.
-- Only tool results and lessons labelled evidence can support met. User or assistant claims, plans, tool calls, file edits, decision or dead-end lessons, and command exit status alone are not proof.
-- Judge evidence against the objective's full scope and likely failure modes, not only supplied examples or self-selected checks.
-</evidence_policy>
-
-<completion_checks>
-- Check each requirement separately.
-- The complete latest tool-free [assistant] entry is the proposed answer. Final delivery replays that draft verbatim after met; it is not rewritten or reformatted.
-- Mark final-response wording, formatting, and delivery constraints as kind=final_answer. They are checked against the proposed answer and do not require tool evidence or Todo IDs.
-- For final_answer checks, compare the complete last [assistant] entry literally. Do not infer a cleaner answer or treat quoted text inside a longer response as the answer, then set candidateRef to last_assistant and copy that complete entry into observedAnswer.
-- Omit observedAnswer from work checks. The host rejects a final_answer check whose candidateRef or observedAnswer does not match the proposed answer.
-- Every final_answer check must include expectedAnswer: the complete required literal string for an exact-output constraint, or null for a non-exact constraint. Derive it from the objective, not from the proposed answer. Do not replace an exact-output constraint with an explanation of the work. The host compares the full proposed answer to a string expectedAnswer, including an empty string.
-- Include the Todo IDs that substantiate each requirement. Incidental tactical Todos do not need separate checks.
-- Every met check needs a concrete failureMode that the cited evidence challenges.
-- Every met check needs retained evidence. Partial, missing, or ambiguous evidence means continue.
-</completion_checks>
-
-<verdict_policy>
-- met: every objective requirement is met and supported by retained evidence.
-- continue: work can still progress. Name the first unmet requirement and its exact missing or weak evidence.
-- impossible: progress requires unavailable user input or an external state change. A missing preferred tool or check is not enough when another approach exists.
-</verdict_policy>
-
-Never call tools.
-</ferment_v2_evaluator>`
+const INVALID_OUTPUT_CORRECTION_PROMPT =
+	'The previous response was rejected by host validation: {reason} Return exactly one valid JSON object matching the output contract and nothing else. Cite only [eN] evidence IDs that appear in your tool results. Every "pass" check needs cited evidence and a failureMode; a "continue" verdict needs at least one cited "fail" check; an "impossible" verdict needs at least one check citing executed evidence.'
 
 export type FermentV2EvaluatorVerdict = "continue" | "met" | "impossible"
 
@@ -79,6 +74,10 @@ export interface FermentV2EvaluatorDiagnostics {
 	providerRequestCount: number
 	timeoutCount: number
 	correctionCount: number
+	/** Tool calls executed by the verifier session. */
+	toolCalls?: number
+	/** Turns used by the verifier session. */
+	turns?: number
 	failureType?: FermentV2EvaluatorFailureType
 	httpStatusCode?: number
 }
@@ -94,6 +93,8 @@ export type FermentV2EvaluationResult =
 			sameModelAsImplementer?: boolean
 			modelFallback?: "session"
 			unusableEvaluatorRefs?: readonly string[]
+			/** Workspace integrity outcome of this verifier run. */
+			integrity?: IntegrityResult
 	  }
 	| {
 			verdict: "unavailable"
@@ -104,51 +105,104 @@ export type FermentV2EvaluationResult =
 			sameModelAsImplementer?: boolean
 			modelFallback?: "session"
 			unusableEvaluatorRefs?: readonly string[]
+			/** Workspace integrity outcome of this verifier run. */
+			integrity?: IntegrityResult
 	  }
 
-interface FermentV2EvaluatorCheck {
+export interface FermentV2EvaluationInput {
+	objective: string
+	/** The verifier child session's working directory (the real working tree). */
+	cwd: string
+	/** The implementer's conversation — used only to derive the proposed final answer. */
+	messages: ReadonlyArray<AgentEndEvent["messages"][number]>
+	todos: readonly TodoItem[]
+	completionConfidence?: FermentV2CompletionConfidence
+	/** Task-facing reason of the previous verifier `continue` verdict, when one exists. */
+	previousGap?: string
+	/** Fired once when the verifier run starts (after model resolution), for status-line UX. */
+	onVerifierStart?: (info: { model: string }) => void
+	signal?: AbortSignal
+}
+
+/** Options passed to the spawn seam. */
+export interface FermentV2VerifierSpawnInput {
+	model: Model<Api>
+	prompt: string
+	cwd: string
+	extensionFactories: InlineExtension[]
+	signal: AbortSignal
+	/** Wall-clock cap in seconds; 0 = unlimited. */
+	maxDuration: number
+}
+
+/** Injection seams so every validation branch is unit-testable without a real subagent. */
+export interface FermentV2VerifierDeps {
+	spawn?: (input: FermentV2VerifierSpawnInput) => Promise<FermentV2VerifierAgentRun | undefined>
+	resume?: (id: string, prompt: string, signal: AbortSignal) => Promise<FermentV2VerifierAgentRun | undefined>
+	/** Probes whether the workspace is a git work tree; defaults to detectGitWorkspace. */
+	gitProbe?: (cwd: string, signal?: AbortSignal) => Promise<GitWorkspaceProbe>
+	createGuard?: () => VerifierGuard
+	snapshot?: (cwd: string, signal?: AbortSignal) => Promise<WorkspaceSnapshot | undefined>
+	head?: (cwd: string, signal?: AbortSignal) => Promise<HeadState | undefined>
+	facts?: (cwd: string, signal?: AbortSignal) => Promise<FermentV2VerifierFacts>
+	enforceIntegrity?: typeof enforceWorkspaceIntegrity
+	redact?: (text: string) => Promise<string>
+	/** Backoff sleep; the default ends early when the signal aborts. */
+	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+}
+
+interface FermentV2VerifierCheck {
 	kind?: "work" | "final_answer"
 	requirement: string
-	met: boolean
+	status: "pass" | "fail" | "unverifiable"
 	failureMode?: string
 	candidateRef?: string
 	observedAnswer?: string
 	expectedAnswer?: string | null
 	evidence: string[]
-	todoIds: number[]
 }
 
 interface ParsedFermentV2EvaluatorOutput {
 	verdict: FermentV2EvaluatorVerdict
 	reason: string
-	checks?: FermentV2EvaluatorCheck[]
+	checks?: FermentV2VerifierCheck[]
 }
 
-function toFermentV2EvaluatorUsage(usage: Usage): FermentV2EvaluatorUsage {
-	return {
-		input: usage.input,
-		output: usage.output,
-		cacheRead: usage.cacheRead,
-		cacheWrite: usage.cacheWrite,
-		totalTokens: usage.totalTokens,
-		costUsd: usage.cost.total,
-	}
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error)
 }
 
-export interface FermentV2EvaluationInput {
-	objective: string
-	messages: ReadonlyArray<AgentEndEvent["messages"][number]>
-	todos: readonly TodoItem[]
-	lessons?: readonly FermentV2Lesson[]
-	signal?: AbortSignal
+function emptyUsage(): FermentV2EvaluatorUsage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costUsd: 0 }
 }
 
-type RenderedTranscriptEntry = {
-	index: number
-	id: string
-	prefix: string
-	content: string
-	evidence: boolean
+/**
+ * Backoff sleep that ends early when the signal aborts, so a timeout or
+ * cancellation proceeds promptly to integrity cleanup instead of waiting out
+ * the full delay.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		let timer: ReturnType<typeof setTimeout> | undefined
+		const onAbort = () => {
+			if (timer !== undefined) clearTimeout(timer)
+			resolve()
+		}
+		timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort)
+			resolve()
+		}, ms)
+		if (signal?.aborted) {
+			onAbort()
+			return
+		}
+		signal?.addEventListener("abort", onAbort)
+	})
+}
+
+function normalizeEvidenceId(evidence: string): string {
+	const normalized = evidence.trim()
+	return normalized.match(/^\[?(e\d+)\]?(?:\s|$)/i)?.[1]?.toLowerCase() ?? normalized
 }
 
 export function parseFermentV2EvaluatorOutput(raw: string): ParsedFermentV2EvaluatorOutput | undefined {
@@ -160,34 +214,33 @@ export function parseFermentV2EvaluatorOutput(raw: string): ParsedFermentV2Evalu
 		const hasChecks = Object.hasOwn(value, "checks")
 		const checks = parseChecks(value.checks)
 		if (hasChecks && checks === undefined) continue
+		// The reason stays the verifier's own task-facing summary here — the
+		// failing-check composition needs the guard's evidence map and happens
+		// in validation (failingCheckReason), not in parsing.
 		return {
 			verdict: value.verdict,
-			reason: taskFacingReason(value.reason, checks),
+			reason: value.reason.trim().slice(0, MAX_REASON_CHARS),
 			...(checks ? { checks } : {}),
 		}
 	}
 	return undefined
 }
 
-function taskFacingReason(reason: string, checks: readonly FermentV2EvaluatorCheck[] | undefined): string {
-	const normalized = reason.trim().slice(0, MAX_REASON_CHARS)
-	const requirement = checks?.find((check) => !check.met)?.requirement.replace(/[.\s]+$/, "")
-	if (requirement) return `Remaining requirement: ${requirement}.`
-	return normalized
-}
-
-function parseChecks(value: unknown): FermentV2EvaluatorCheck[] | undefined {
+function parseChecks(value: unknown): FermentV2VerifierCheck[] | undefined {
 	if (!Array.isArray(value)) return undefined
-	const checks: FermentV2EvaluatorCheck[] = []
+	const checks: FermentV2VerifierCheck[] = []
 	for (const candidate of value) {
-		if (!isRecord(candidate) || typeof candidate.requirement !== "string" || !candidate.requirement.trim())
+		if (!isRecord(candidate) || typeof candidate.requirement !== "string" || !candidate.requirement.trim()) {
 			return undefined
+		}
+		if (candidate.status !== "pass" && candidate.status !== "fail" && candidate.status !== "unverifiable") {
+			return undefined
+		}
 		const evidence =
 			(candidate.evidence === undefined || candidate.evidence === null) && candidate.kind === "final_answer"
 				? []
 				: candidate.evidence
 		if (
-			typeof candidate.met !== "boolean" ||
 			!Array.isArray(evidence) ||
 			(candidate.kind !== undefined && candidate.kind !== "work" && candidate.kind !== "final_answer") ||
 			(candidate.candidateRef !== undefined &&
@@ -198,17 +251,15 @@ function parseChecks(value: unknown): FermentV2EvaluatorCheck[] | undefined {
 				typeof candidate.observedAnswer !== "string") ||
 			(candidate.kind === "final_answer" &&
 				candidate.expectedAnswer !== null &&
-				typeof candidate.expectedAnswer !== "string") ||
-			(candidate.todoIds !== undefined && candidate.todoIds !== null && !Array.isArray(candidate.todoIds))
-		)
+				typeof candidate.expectedAnswer !== "string")
+		) {
 			return undefined
+		}
 		if (evidence.some((item) => typeof item !== "string" || !item.trim())) return undefined
-		const todoIds = candidate.todoIds ?? []
-		if (todoIds.some((todoId) => !Number.isSafeInteger(todoId) || todoId <= 0)) return undefined
 		checks.push({
 			...(candidate.kind ? { kind: candidate.kind } : {}),
 			requirement: candidate.requirement.trim(),
-			met: candidate.met,
+			status: candidate.status,
 			...(typeof candidate.failureMode === "string" && candidate.failureMode.trim()
 				? { failureMode: candidate.failureMode.trim() }
 				: {}),
@@ -218,15 +269,9 @@ function parseChecks(value: unknown): FermentV2EvaluatorCheck[] | undefined {
 				? { expectedAnswer: candidate.expectedAnswer }
 				: {}),
 			evidence: evidence.map(normalizeEvidenceId),
-			todoIds,
 		})
 	}
 	return checks
-}
-
-function normalizeEvidenceId(evidence: string): string {
-	const normalized = evidence.trim()
-	return normalized.match(/^\[?([ml]\d+)\]?(?:\s|$)/i)?.[1]?.toLowerCase() ?? normalized
 }
 
 /**
@@ -258,23 +303,199 @@ function* jsonObjects(raw: string): Generator<unknown> {
 	}
 }
 
+/** Evidence IDs cited by the verdict that the guard never stamped — hallucinated citations. */
+function unknownEvidenceIds(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+): string[] {
+	const unknown: string[] = []
+	for (const check of checks ?? []) {
+		for (const id of check.evidence) {
+			if (!evidence.has(id) && !unknown.includes(id)) unknown.push(id)
+		}
+	}
+	return unknown
+}
+
+/** Host reason when a `met` verdict is not backed by the verifier's own evidence. */
+function unsupportedMetReason(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+	proposedAnswer: string | undefined,
+): string | undefined {
+	if (!checks?.length) return "Map each objective requirement to a check backed by executed evidence before finishing."
+	for (const check of checks) {
+		const requirement = JSON.stringify(check.requirement.slice(0, 200))
+		if (check.status === "fail") {
+			const excerpt = citedExcerpt(check, evidence)
+			return `Requirement ${requirement} is not met; continue work and verify it.${excerpt ? ` Failing check: ${excerpt}.` : ""}`
+		}
+		if (check.kind === "final_answer") {
+			if (
+				proposedAnswer === undefined ||
+				check.candidateRef !== "last_assistant" ||
+				check.observedAnswer !== proposedAnswer
+			) {
+				return `Requirement ${requirement} has not been checked against the exact proposed answer; return only the required answer with no extra text.`
+			}
+			if (typeof check.expectedAnswer === "string" && proposedAnswer !== check.expectedAnswer) {
+				return `Requirement ${requirement} requires exactly ${JSON.stringify(check.expectedAnswer)}; return that answer with no extra text.`
+			}
+			continue
+		}
+		if (check.status === "pass" && !check.failureMode) {
+			return `Requirement ${requirement} does not name the plausible failure mode ruled out by its evidence; inspect the risk and verify it.`
+		}
+		if (check.evidence.length === 0) {
+			return `Requirement ${requirement} has no cited evidence; run a relevant check and cite its [eN] result.`
+		}
+	}
+	return undefined
+}
+
+/** A `continue` verdict needs at least one `fail` check citing evidence the guard stamped. */
+function hasCitedFail(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+): boolean {
+	return checks?.some((check) => check.status === "fail" && check.evidence.some((id) => evidence.has(id))) ?? false
+}
+
+/** An `impossible` verdict blocks the ferment only with a check citing stamped evidence (design: ≥ 1 cited check). */
+function hasCitedCheck(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+): boolean {
+	return checks?.some((check) => check.evidence.some((id) => evidence.has(id))) ?? false
+}
+
+/** A check's first stamped evidence excerpt, whitespace-flattened and clipped for a task-facing reason. */
+function citedExcerpt(
+	check: FermentV2VerifierCheck,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+): string | undefined {
+	for (const id of check.evidence) {
+		const excerpt = evidence.get(id)?.excerpt
+		if (!excerpt) continue
+		const flattened = excerpt.replace(/\s+/g, " ").trim()
+		if (flattened) {
+			return flattened.length > FAILING_CHECK_EXCERPT_CHARS
+				? `${flattened.slice(0, FAILING_CHECK_EXCERPT_CHARS)}…`
+				: flattened
+		}
+	}
+	return undefined
+}
+
+/**
+ * The task-facing reason for a verdict that keeps a failing check (plan
+ * Chunk 8): the requirement plus the observed error from the check's cited
+ * evidence. Returned results carry neither the checks nor their evidence, so
+ * without this the implementer would never see what the verifier observed —
+ * the excerpt is the diagnosis and the repair anchor. Falls back to the
+ * verifier's own summary when no failing check cites a stamped, non-empty
+ * excerpt.
+ */
+function failingCheckReason(
+	checks: readonly FermentV2VerifierCheck[] | undefined,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+): string | undefined {
+	for (const check of checks ?? []) {
+		if (check.status !== "fail") continue
+		const excerpt = citedExcerpt(check, evidence)
+		if (excerpt === undefined) continue
+		const requirement = check.requirement.replace(/[.\s]+$/, "")
+		return `Remaining requirement: ${requirement}. Failing check: ${excerpt}`
+	}
+	return undefined
+}
+
+type ValidatedVerdict =
+	| { kind: "ok"; verdict: FermentV2EvaluatorVerdict; reason: string; acceptedFinalAnswer?: string }
+	| { kind: "correct"; reason: string; failureType: FermentV2EvaluatorFailureType }
+
+function validateParsedVerdict(
+	parsed: ParsedFermentV2EvaluatorOutput,
+	evidence: ReadonlyMap<string, VerifierEvidence>,
+	proposedAnswer: string | undefined,
+): ValidatedVerdict {
+	// Every cited ID must match a stamped tool result before any verdict is
+	// accepted — a hallucinated [eN] citation rejects the verdict.
+	const unknown = unknownEvidenceIds(parsed.checks, evidence)
+	if (unknown.length > 0) {
+		if (parsed.verdict === "met") {
+			// Mirrors an uncited `met`: downgraded to a host-authored `continue`.
+			return {
+				kind: "ok",
+				verdict: "continue",
+				reason: `The verdict cites evidence ID${unknown.length > 1 ? "s" : ""} ${unknown.join(", ")} that match no executed tool result; run the supporting check and cite its [eN] result.`,
+			}
+		}
+		return {
+			kind: "correct",
+			reason: `the verdict cited unknown evidence ID${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}.`,
+			failureType: "uncited_verdict",
+		}
+	}
+	if (parsed.verdict === "met") {
+		const unsupported = unsupportedMetReason(parsed.checks, evidence, proposedAnswer)
+		if (unsupported) {
+			// An uncited `met` is downgraded to a host-authored `continue`.
+			return { kind: "ok", verdict: "continue", reason: unsupported }
+		}
+		return {
+			kind: "ok",
+			verdict: "met",
+			reason: parsed.reason,
+			...(parsed.checks?.some((check) => check.kind === "final_answer") && proposedAnswer !== undefined
+				? { acceptedFinalAnswer: proposedAnswer }
+				: {}),
+		}
+	}
+	if (parsed.verdict === "continue" && !hasCitedFail(parsed.checks, evidence)) {
+		return {
+			kind: "correct",
+			reason: "the verdict had no cited failing check.",
+			failureType: "uncited_verdict",
+		}
+	}
+	// Design (Chunk 8): "impossible: ≥ 1 cited check → blocked." An unsupported
+	// impossible never blocks the ferment on its own say-so.
+	if (parsed.verdict === "impossible" && !hasCitedCheck(parsed.checks, evidence)) {
+		return {
+			kind: "correct",
+			reason: "the verdict had no cited check.",
+			failureType: "uncited_verdict",
+		}
+	}
+	// A verdict with a failing check keeps the composed task-facing gap
+	// (requirement + observed error); without one the verifier's own
+	// summary stands.
+	return { kind: "ok", verdict: parsed.verdict, reason: failingCheckReason(parsed.checks, evidence) ?? parsed.reason }
+}
+
 export async function evaluateFermentV2(
 	input: FermentV2EvaluationInput,
 	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	deps?: FermentV2VerifierDeps,
 ): Promise<FermentV2EvaluationResult> {
 	const startedAt = Date.now()
-	const sessionModelRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined
-	let modelRef = sessionModelRef
-	let sameModelAsImplementer: boolean | undefined
-	let modelFallback: "session" | undefined
-	let unusableEvaluatorRefs: readonly string[] | undefined
-	let deadline: AbortSignal | undefined
 	const settings = getFermentV2Settings()
 	const evaluationTimeoutMs = settings.evaluationTimeoutMs
+	const sleep = deps?.sleep ?? abortableSleep
+
 	let providerRequestCount = 0
 	let timeoutCount = 0
 	let correctionCount = 0
-	let usage: FermentV2EvaluatorUsage | undefined
+	let toolCalls = 0
+	let turns = 0
+	let guard: VerifierGuard | undefined
+	let modelRef: string | undefined
+	let sameModelAsImplementer: boolean | undefined
+	let modelFallback: "session" | undefined
+	let unusableEvaluatorRefs: readonly string[] | undefined
+
 	const diagnostics = (
 		failureType?: FermentV2EvaluatorFailureType,
 		httpStatusCode?: number,
@@ -284,491 +505,393 @@ export async function evaluateFermentV2(
 		providerRequestCount,
 		timeoutCount,
 		correctionCount,
+		toolCalls,
+		turns,
 		...(failureType ? { failureType } : {}),
 		...(httpStatusCode !== undefined ? { httpStatusCode } : {}),
 	})
-	const unavailable = (
-		reason: string,
-		failureType: FermentV2EvaluatorFailureType,
-		model?: string,
-		httpStatusCode?: number,
-	): FermentV2EvaluationResult => ({
-		verdict: "unavailable",
-		reason,
-		...(model ? { model } : {}),
-		...(usage ? { usage } : {}),
+
+	const baseResultFields = () => ({
 		...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
 		...(modelFallback ? { modelFallback } : {}),
 		...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
-		diagnostics: diagnostics(failureType, httpStatusCode),
 	})
+
+	// The verifier's usage is accumulated by its in-session guard per assistant
+	// message, so compaction rewriting the session messages cannot erase it.
+	const verifierUsage = (): FermentV2EvaluatorUsage => (guard ? { ...guard.usage } : emptyUsage())
+
+	const unavailable = (
+		reason: string,
+		failureType: FermentV2EvaluatorFailureType,
+		httpStatusCode?: number,
+	): FermentV2EvaluationResult => {
+		const usage = verifierUsage()
+		return {
+			verdict: "unavailable",
+			reason,
+			...(modelRef ? { model: modelRef } : {}),
+			...(usage.totalTokens > 0 || usage.costUsd > 0 ? { usage } : {}),
+			diagnostics: diagnostics(failureType, httpStatusCode),
+			...baseResultFields(),
+		}
+	}
+
+	// Fail closed: the verifier runs only when the workspace's integrity can
+	// be protected. A confirmed non-git workspace ("outside_git") runs without
+	// integrity; a git workspace whose tree cannot be snapshotted — or whose
+	// HEAD cannot be resolved — never spawns the verifier, so its verdicts
+	// cannot certify a tree the host could not restore. An undeterminable
+	// workspace ("unknown") fails closed the same way.
+	if (input.signal?.aborted) return unavailable(`Verifier ${modelRef ?? "session model"} was cancelled.`, "cancelled")
+	const gitProbe = await (deps?.gitProbe ?? detectGitWorkspace)(input.cwd, input.signal)
+	if (gitProbe === "unknown") {
+		return unavailable(
+			"Workspace git state could not be determined, so the verifier did not run: the working tree could not be protected.",
+			"integrity_unavailable",
+		)
+	}
+	const before = gitProbe === "git" ? await (deps?.snapshot ?? snapshotWorkspace)(input.cwd, input.signal) : undefined
+	if (gitProbe === "git" && !before) {
+		return unavailable(
+			"The working tree could not be snapshotted before the verifier run, so the verifier did not run: the working tree could not be protected.",
+			"integrity_unavailable",
+		)
+	}
+	const beforeHead = before ? await (deps?.head ?? workspaceHead)(input.cwd, input.signal) : undefined
+	if (before && !beforeHead) {
+		return unavailable(
+			"Workspace HEAD could not be resolved before the verifier run, so the verifier did not run: HEAD moves could not be detected.",
+			"integrity_unavailable",
+		)
+	}
+
+	let result: FermentV2EvaluationResult
 	try {
-		const inheritedWorkId = tryWorkAttribution(() => getWorkId(ctx))
-		const objective = objectiveText(input.objective, ctx.cwd)
+		result = await runVerifier()
+	} catch (error) {
+		if (input.signal?.aborted) {
+			result = unavailable(`Verifier ${modelRef ?? "session model"} was cancelled.`, "cancelled")
+		} else {
+			const classified = classifyLLMGatewayError(errorMessage(error))
+			result = unavailable(
+				`Verifier ${modelRef ?? "session model"} failed: ${errorMessage(error)}`,
+				classified?.reason ?? "call_failed",
+				classified?.httpStatusCode,
+			)
+		}
+	}
+
+	// Integrity runs after every verifier run — verdict, error, and abort alike.
+	// The (possibly aborted) input signal is deliberately not passed: the
+	// restore must complete.
+	if (before) {
+		try {
+			const integrity = await (deps?.enforceIntegrity ?? enforceWorkspaceIntegrity)(
+				input.cwd,
+				before,
+				beforeHead,
+				undefined,
+			)
+			result = applyIntegrity(result, integrity, diagnostics, baseResultFields)
+		} catch (error) {
+			// Integrity enforcement failed (e.g. a restore could not be written or
+			// git disappeared mid-run): the working tree may still carry verifier
+			// changes, so a `met` verdict cannot be trusted.
+			result = discardMetOnEnforcementFailure(
+				result,
+				`could not be enforced (${errorMessage(error)})`,
+				diagnostics,
+				baseResultFields,
+			)
+		}
+	}
+	return result
+
+	async function runVerifier(): Promise<FermentV2EvaluationResult> {
+		input.signal?.throwIfAborted()
+
 		const modelChoice = await resolveFermentV2VerifierModel(ctx, settings.evaluatorModels)
-		if (!modelChoice) return unavailable("No evaluator model is available.", "no_model")
+		if (!modelChoice) return unavailable("No verifier model is available.", "no_model")
 		const model = modelChoice.model
 		modelRef = modelChoice.ref
 		sameModelAsImplementer = modelChoice.sameAsImplementer || undefined
 		modelFallback = modelChoice.fallback
 		unusableEvaluatorRefs = modelChoice.unusableRefs
-		const todoState = renderTodoState(input.todos)
-		if (!todoState) {
-			return unavailable("Current Todo state is too large for a bounded evaluation.", "todo_state_too_large", modelRef)
-		}
-		let auth: Awaited<ReturnType<typeof ctx.modelRegistry.getApiKeyAndHeaders>>
-		try {
-			auth = await ctx.modelRegistry.getApiKeyAndHeaders(model)
-		} catch {
-			return unavailable("Evaluator authentication is unavailable.", "auth_unavailable", modelRef)
-		}
-		if (!auth.ok) return unavailable("Evaluator authentication is unavailable.", "auth_unavailable", modelRef)
 
-		const transcript = renderRecentTranscript(input.messages)
-		const lessons = renderFermentV2Lessons(input.lessons)
-		const evidenceIds = new Set([...transcript.evidenceIds, ...lessons.evidenceIds])
-		let prompt = `Objective:\n${objective}\n\nCurrent Todo state:\n${todoState}\n\nDurable Ferment V2 lessons:\n${lessons.text || "(none)"}\n\nRecent transcript:\n${transcript.text}`
+		guard = (deps?.createGuard ?? createVerifierGuard)()
+		const facts = await (deps?.facts ?? gatherVerifierFacts)(input.cwd, input.signal)
+
+		const proposedAnswer = latestFinalAnswerDraft(input.messages)
+		let prompt = buildVerifierTaskPrompt({
+			objective: objectiveText(input.objective, ctx.cwd),
+			cwd: input.cwd,
+			facts,
+			todos: input.todos,
+			...(input.completionConfidence ? { completionConfidence: input.completionConfidence } : {}),
+			...(proposedAnswer !== undefined ? { proposedAnswer } : {}),
+			...(input.previousGap ? { previousGap: input.previousGap } : {}),
+		})
 		if (getRedactionConfig().enabled) {
 			try {
-				prompt = await redactTextOrThrow(prompt)
+				prompt = await (deps?.redact ?? redactTextOrThrow)(prompt)
 			} catch {
-				return unavailable("Evaluator input redaction failed.", "redaction_failed", modelRef)
+				return unavailable("Verifier input redaction failed.", "redaction_failed")
 			}
 		}
-		const context: Context = {
-			systemPrompt: EVALUATOR_SYSTEM_PROMPT,
-			messages: [
-				{
-					role: "user" as const,
-					content: [
-						{
-							type: "text" as const,
-							text: prompt,
-						},
-					],
-					timestamp: Date.now(),
-				},
-			],
-		}
-		const evaluatorSession = createEvaluatorSession(ctx)
-		const workContext = { cwd: ctx.cwd, sessionManager: evaluatorSession }
-		if (inheritedWorkId) tryWorkAttribution(() => appendWorkRecord(workContext, { type: "work" }, inheritedWorkId))
-		evaluatorSession.appendCustomEntry(INTERNAL_SESSION_ENTRY, { kind: "ferment-evaluator" })
-		evaluatorSession.appendSessionInfo("Ferment V2 evaluator")
-		evaluatorSession.appendModelChange(model.provider, model.id)
-		evaluatorSession.appendMessage(context.messages[0])
 
-		const timeoutMs = evaluationTimeoutMs
-		const request = async (requestContext = context, correcting = false) => {
-			const requestOnce = async () => {
-				input.signal?.throwIfAborted()
-				deadline = AbortSignal.timeout(timeoutMs)
-				const signal = input.signal ? AbortSignal.any([deadline, input.signal]) : deadline
-				const attribution = inheritedWorkId
-					? tryWorkAttribution(() => recordProviderRequest(workContext, model, inheritedWorkId))
-					: undefined
-				providerRequestCount++
-				const response = await completeSimple(model, requestContext, {
-					apiKey: auth.apiKey,
-					headers: { ...auth.headers, ...(attribution ? { "X-Request-Id": attribution.requestId } : {}) },
-					reasoning: "minimal",
-					thinkingBudgets: correcting ? { minimal: 0 } : undefined,
-					samplingParams: isKimchiManagedJsonModeProvider(model.provider)
-						? { response_format: { type: "json_object" } }
-						: undefined,
-					signal,
-				})
-				if (signal.aborted) throw signal.reason
-				deadline = undefined
-				return response
-			}
-			try {
-				return await requestOnce()
-			} catch (error) {
-				if (!deadline?.aborted || input.signal?.aborted) throw error
+		const timeoutSignal = evaluationTimeoutMs ? AbortSignal.timeout(evaluationTimeoutMs) : undefined
+		const runSignal = timeoutSignal
+			? input.signal
+				? AbortSignal.any([timeoutSignal, input.signal])
+				: timeoutSignal
+			: (input.signal ?? new AbortController().signal)
+		// The spawn's wall-clock cap mirrors the optional timeout (0 = unlimited).
+		const maxDuration = evaluationTimeoutMs ? Math.ceil(evaluationTimeoutMs / 1000) : 0
+
+		input.onVerifierStart?.({ model: modelRef })
+		const spawn = deps?.spawn ?? defaultSpawn
+		let run: FermentV2VerifierAgentRun | undefined
+		for (let attempt = 0; ; attempt++) {
+			// The combined signal is checked before every attempt — including the
+			// first and each retry after backoff — so a timeout that already fired
+			// is never retried and cancellation proceeds to integrity cleanup.
+			if (input.signal?.aborted) return unavailable(`Verifier ${modelRef} was cancelled.`, "cancelled")
+			if (timeoutSignal?.aborted) {
 				timeoutCount++
-				return requestOnce()
+				return unavailable(
+					`Verifier ${modelRef} timed out after ${(evaluationTimeoutMs ?? 0) / 1_000} seconds.`,
+					"timeout",
+				)
 			}
-		}
-		let response = await request()
-		evaluatorSession.appendMessage(response)
-		usage = toFermentV2EvaluatorUsage(response.usage)
-		if (response.stopReason === "error") throw new Error(response.errorMessage ?? "Evaluator provider error")
-		const responseText = contentParts(response.content)
-		if (
-			!input.signal?.aborted &&
-			!parseFermentV2EvaluatorOutput(responseText) &&
-			(response.stopReason === "aborted" || response.stopReason === "length" || responseText.includes("{"))
-		) {
-			correctionCount++
-			const correction = {
-				role: "user" as const,
-				content: [{ type: "text" as const, text: INVALID_JSON_RETRY_PROMPT }],
-				timestamp: Date.now(),
-			}
-			evaluatorSession.appendMessage(correction)
-			response = await request({ ...context, messages: [...context.messages, response, correction] }, true)
-			evaluatorSession.appendMessage(response)
-			const retriedUsage = toFermentV2EvaluatorUsage(response.usage)
-			usage = {
-				input: usage.input + retriedUsage.input,
-				output: usage.output + retriedUsage.output,
-				cacheRead: usage.cacheRead + retriedUsage.cacheRead,
-				cacheWrite: usage.cacheWrite + retriedUsage.cacheWrite,
-				totalTokens: usage.totalTokens + retriedUsage.totalTokens,
-				costUsd: usage.costUsd + retriedUsage.costUsd,
-			}
-			if (response.stopReason === "error") throw new Error(response.errorMessage ?? "Evaluator provider error")
-		}
-		if (input.signal?.aborted) throw input.signal.reason
-		const parsed = parseFermentV2EvaluatorOutput(contentParts(response.content))
-		if (parsed) {
-			const decision = { verdict: parsed.verdict, reason: parsed.reason }
-			const proposedAnswer = latestFinalAnswerDraft(input.messages)
-			const unsupportedReason =
-				parsed.verdict === "met"
-					? unsupportedMetReason(parsed.checks, evidenceIds, input.todos, proposedAnswer)
-					: undefined
-			if (unsupportedReason) {
-				return {
-					verdict: "continue",
-					reason: unsupportedReason,
-					model: modelRef,
-					usage,
-					diagnostics: diagnostics(),
-					...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
-					...(modelFallback ? { modelFallback } : {}),
-					...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
+			providerRequestCount++
+			// The Verifier persona disables extensions, so PII redaction rides
+			// along as an inline factory (no-op when redaction is disabled). It
+			// runs before the guard so the guard stamps — and records as evidence
+			// excerpts for verdict reasons — already-redacted content.
+			run = await spawn({
+				model,
+				prompt,
+				cwd: input.cwd,
+				extensionFactories: [piiRedactionExtension, guard.extension],
+				signal: runSignal,
+				maxDuration,
+			})
+			if (!run) return unavailable("The verifier subagent system is not available.", "agent_unavailable")
+			toolCalls += run.toolCalls
+			turns += run.turns
+			if (run.status === "error") {
+				const classified = classifyLLMGatewayError(run.error ?? "")
+				if (
+					classified &&
+					TRANSIENT_FAILURE_REASONS.has(classified.reason) &&
+					attempt < VERIFIER_RETRY_DELAYS_MS.length
+				) {
+					// The abortable backoff ends early on timeout/cancellation; the
+					// loop-top check reports it instead of spawning again.
+					await sleep(VERIFIER_RETRY_DELAYS_MS[attempt], runSignal)
+					continue
 				}
+				return unavailable(
+					`Verifier ${modelRef} run failed: ${run.error ?? "unknown error"}`,
+					classified?.reason ?? "call_failed",
+					classified?.httpStatusCode,
+				)
 			}
-			const acceptedFinalAnswer = parsed.checks?.some((check) => check.kind === "final_answer")
-				? proposedAnswer
-				: undefined
-			return {
-				...decision,
-				model: modelRef,
-				usage,
-				diagnostics: diagnostics(),
-				...(acceptedFinalAnswer ? { acceptedFinalAnswer } : {}),
-				...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
-				...(modelFallback ? { modelFallback } : {}),
-				...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
+			if (input.signal?.aborted) return unavailable(`Verifier ${modelRef} was cancelled.`, "cancelled")
+			if (timeoutSignal?.aborted) {
+				timeoutCount++
+				return unavailable(
+					`Verifier ${modelRef} timed out after ${(evaluationTimeoutMs ?? 0) / 1_000} seconds.`,
+					"timeout",
+				)
 			}
+			if (run.status === "aborted" || run.status === "stopped") {
+				return unavailable(`Verifier ${modelRef} was aborted (${run.abortReason ?? run.status}).`, "call_failed")
+			}
+			break
 		}
-		const reason =
-			response.stopReason === "length"
-				? `Evaluator ${modelRef} response was truncated before it returned a verdict.`
-				: `Evaluator ${modelRef} returned no parseable verdict (${describeUnparseable(response)}).`
-		return unavailable(reason, response.stopReason === "length" ? "truncated_output" : "invalid_output", modelRef)
-	} catch (error) {
-		if (input.signal?.aborted) {
-			return unavailable(`Evaluator ${modelRef ?? "session model"} was cancelled.`, "cancelled", modelRef)
-		}
-		if (deadline?.aborted) {
-			timeoutCount++
-			return unavailable(
-				`Evaluator ${modelRef ?? "session model"} timed out after ${(evaluationTimeoutMs ?? 0) / 1_000} seconds.`,
-				"timeout",
-				modelRef,
+		const verifierRun = run
+
+		const parsed = parseFermentV2EvaluatorOutput(verifierRun.text)
+		let validated = parsed
+			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer)
+			: ({ kind: "correct", reason: "no valid JSON verdict was returned.", failureType: "invalid_output" } as const)
+		if (validated.kind === "correct") {
+			correctionCount++
+			const corrected = await resumeWithRetries(
+				verifierRun.id,
+				INVALID_OUTPUT_CORRECTION_PROMPT.replace("{reason}", validated.reason),
+				runSignal,
+				verifierRun.toolCalls,
 			)
-		}
-		const classified = classifyLLMGatewayError(errorMessage(error))
-		return {
-			verdict: "unavailable",
-			reason: `Evaluator ${modelRef ?? "session model"} call failed: ${errorMessage(error)}`,
-			...(modelRef ? { model: modelRef } : {}),
-			...(usage ? { usage } : {}),
-			...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
-			...(modelFallback ? { modelFallback } : {}),
-			...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
-			diagnostics: diagnostics(classified?.reason ?? "call_failed", classified?.httpStatusCode),
-		}
-	}
-}
-
-function createEvaluatorSession(ctx: ExtensionContext): SessionManager {
-	const parentSession = ctx.sessionManager.getSessionFile()
-	return parentSession
-		? SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession })
-		: SessionManager.inMemory(ctx.cwd)
-}
-
-function describeUnparseable(response: { content: unknown; stopReason?: unknown }): string {
-	const parts = Array.isArray(response.content)
-		? response.content.map((part) => (isRecord(part) && typeof part.type === "string" ? part.type : "unknown"))
-		: ["unknown"]
-	const stop = typeof response.stopReason === "string" ? response.stopReason : "unknown"
-	return `stop=${stop}, parts=[${parts.join(",")}], text=${contentParts(response.content).length} chars`
-}
-
-function contentParts(content: unknown): string {
-	if (!Array.isArray(content)) return ""
-	return content
-		.map((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : ""))
-		.join("")
-		.trim()
-}
-
-function unsupportedMetReason(
-	checks: FermentV2EvaluatorCheck[] | undefined,
-	evidenceIds: ReadonlySet<string>,
-	todos: readonly TodoItem[],
-	proposedAnswer: string | undefined,
-): string | undefined {
-	if (!checks?.length) return "Map each objective requirement to retained evidence before finishing."
-	const todoIds = new Set(todos.map((todo) => todo.id))
-	for (const check of checks) {
-		const requirement = JSON.stringify(check.requirement.slice(0, 200))
-		if (!check.met) return `Requirement ${requirement} is not met; continue work and verify it.`
-		if (check.kind === "final_answer") {
-			if (
-				proposedAnswer === undefined ||
-				check.candidateRef !== "last_assistant" ||
-				check.observedAnswer !== proposedAnswer
-			)
-				return `Requirement ${requirement} has not been checked against the exact proposed answer; return only the required answer with no extra text.`
-			if (typeof check.expectedAnswer === "string" && proposedAnswer !== check.expectedAnswer) {
-				return `Requirement ${requirement} requires exactly ${JSON.stringify(check.expectedAnswer)}; return that answer with no extra text.`
+			// A timeout is never retried and reported as such; the same cap covered the whole run.
+			if (timeoutSignal?.aborted) {
+				timeoutCount++
+				return unavailable(
+					`Verifier ${modelRef} timed out after ${(evaluationTimeoutMs ?? 0) / 1_000} seconds.`,
+					"timeout",
+				)
 			}
-			continue
+			if (input.signal?.aborted) return unavailable(`Verifier ${modelRef} was cancelled.`, "cancelled")
+			if (corrected === undefined) return unavailable(`Verifier ${modelRef} correction failed.`, "call_failed")
+			if (corrected.status === "error") {
+				const classified = classifyLLMGatewayError(corrected.error ?? "")
+				return unavailable(
+					`Verifier ${modelRef} correction failed: ${corrected.error ?? "unknown error"}`,
+					classified?.reason ?? "call_failed",
+					classified?.httpStatusCode,
+				)
+			}
+			const reparsed = parseFermentV2EvaluatorOutput(corrected.text)
+			validated = reparsed
+				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer)
+				: ({
+						kind: "correct",
+						reason: "no valid JSON verdict was returned after the correction.",
+						failureType: "invalid_output",
+					} as const)
+			if (validated.kind === "correct") {
+				return unavailable(`Verifier ${modelRef} ${validated.reason}`, validated.failureType)
+			}
 		}
-		if (!check.failureMode)
-			return `Requirement ${requirement} does not name the plausible failure mode ruled out by its evidence; inspect the risk and verify it.`
-		if (check.evidence.length === 0)
-			return `Requirement ${requirement} has no retained evidence; run a relevant check and surface its result.`
-		if (!check.evidence.some((evidenceId) => evidenceIds.has(evidenceId)))
-			return `Requirement ${requirement} has no cited tool result or Evidence: Todo note; run a check that proves it and record the result on the matching Todo as "Evidence: ...".`
-		const unknownTodoId = check.todoIds.find((todoId) => !todoIds.has(todoId))
-		if (unknownTodoId !== undefined)
-			return `Requirement ${requirement} cites Todo ${unknownTodoId}, which is not in the current list; reconcile the requirement with the current Todos.`
-	}
-	return undefined
-}
 
-function renderTodoState(todos: readonly TodoItem[]): string | undefined {
-	const variants = [
-		todos,
-		todos.map(({ id, status, content, activeForm, note }) => ({
-			id,
-			status,
-			content: content.slice(0, 200),
-			...(activeForm ? { activeForm: activeForm.slice(0, 200) } : {}),
-			...(note ? { note: note.slice(0, 200) } : {}),
-		})),
-		todos.map(({ id, status }) => ({ id, status })),
-	]
-	for (const variant of variants) {
-		const rendered = JSON.stringify(variant)
-		if (rendered.length <= MAX_TODO_STATE_CHARS) return rendered
-	}
-	return undefined
-}
-
-function renderFermentV2Lessons(lessons: readonly FermentV2Lesson[] | undefined): {
-	text: string
-	evidenceIds: ReadonlySet<string>
-} {
-	const entries = (lessons ?? []).slice(-MAX_FERMENT_V2_LESSONS).map((lesson) => {
-		const id = `l${lesson.todoId}`
-		const evidence = lesson.kind === "evidence"
 		return {
-			id,
-			kind: lesson.kind,
-			text: `${evidence ? `[${id}] ` : ""}[lesson todo ${lesson.todoId} ${lesson.kind}] ${lesson.text.slice(0, MAX_FERMENT_V2_LESSON_CHARS)}`,
+			verdict: validated.verdict,
+			reason: validated.reason,
+			model: modelRef,
+			usage: verifierUsage(),
+			diagnostics: diagnostics(),
+			...(validated.acceptedFinalAnswer ? { acceptedFinalAnswer: validated.acceptedFinalAnswer } : {}),
+			...baseResultFields(),
 		}
-	})
-	return {
-		text: entries.map((entry) => entry.text).join("\n\n"),
-		evidenceIds: new Set(entries.filter((entry) => entry.kind === "evidence").map((entry) => entry.id)),
+	}
+
+	function defaultSpawn(spawnInput: FermentV2VerifierSpawnInput): Promise<FermentV2VerifierAgentRun | undefined> {
+		return spawnFermentV2VerifierAgent(pi, ctx, spawnInput.prompt, {
+			model: spawnInput.model,
+			cwd: spawnInput.cwd,
+			extensionFactories: spawnInput.extensionFactories,
+			signal: spawnInput.signal,
+			maxDuration: spawnInput.maxDuration,
+		})
+	}
+
+	/**
+	 * Resume the verifier session with the transient retry policy: transient
+	 * provider errors are retried with backoff like the spawn, while timeouts
+	 * and cancellations never retry. Returns the final run (an error run when
+	 * the failure is not transient) or undefined when the run cannot continue.
+	 *
+	 * `baselineToolCalls` is the child record's cumulative tool-call count when
+	 * the initial run ended; a resume returns that same record's cumulative
+	 * count (the manager never resets it), so only the delta is counted.
+	 */
+	async function resumeWithRetries(
+		id: string,
+		prompt: string,
+		signal: AbortSignal,
+		baselineToolCalls: number,
+	): Promise<FermentV2VerifierAgentRun | undefined> {
+		const resume = deps?.resume ?? defaultResume
+		let cumulativeToolCalls = baselineToolCalls
+		for (let attempt = 0; ; attempt++) {
+			// Never resume again once the run was cancelled or timed out —
+			// including after a backoff whose signal aborted mid-wait.
+			if (input.signal?.aborted || signal.aborted) return undefined
+			providerRequestCount++
+			const run = await resume(id, prompt, signal)
+			if (!run) return undefined
+			if (run.toolCalls > cumulativeToolCalls) {
+				toolCalls += run.toolCalls - cumulativeToolCalls
+				cumulativeToolCalls = run.toolCalls
+			}
+			turns += run.turns
+			if (run.status === "error") {
+				// An aborted signal (timeout or cancellation) surfaces as an error
+				// only in flight; it is never retried.
+				if (input.signal?.aborted || signal.aborted) return run
+				const classified = classifyLLMGatewayError(run.error ?? "")
+				if (
+					classified &&
+					TRANSIENT_FAILURE_REASONS.has(classified.reason) &&
+					attempt < VERIFIER_RETRY_DELAYS_MS.length
+				) {
+					await sleep(VERIFIER_RETRY_DELAYS_MS[attempt], signal)
+					continue
+				}
+				return run
+			}
+			if (run.status === "aborted" || run.status === "stopped") return undefined
+			if (input.signal?.aborted || signal.aborted) return undefined
+			return run
+		}
+	}
+
+	function defaultResume(
+		id: string,
+		prompt: string,
+		signal: AbortSignal,
+	): Promise<FermentV2VerifierAgentRun | undefined> {
+		return resumeFermentV2VerifierAgent(id, prompt, { signal })
 	}
 }
 
 /**
- * Walks back from the newest message and keeps whole units that fit, so a session
- * holding megabytes of tool output is never materialized in full just to keep its
- * recent evidence.
+ * Integrity could not be enforced or established after a run whose before-run
+ * snapshot exists: the working tree's post-run state is unknown, so a `met`
+ * verdict is discarded with an explicit recovery note; every other verdict
+ * stands (its continuation does not certify the tree).
  */
-function renderRecentTranscript(messages: ReadonlyArray<AgentEndEvent["messages"][number]>): {
-	text: string
-	evidenceIds: ReadonlySet<string>
-} {
-	const { units, linkedToolResultIndexes, callLabelsById } = buildTranscriptUnits(messages)
-	const keptIndexes = new Set<number>()
-	const kept: RenderedTranscriptEntry[] = []
-	const oversizedEvidenceUnits: RenderedTranscriptEntry[][] = []
-	let length = 0
-	let skippedUnit = false
-	for (let unitIndex = units.length - 1; unitIndex >= 0; unitIndex--) {
-		const entries = units[unitIndex]
-			.map((index) => renderTranscriptEntry(messages[index], index, linkedToolResultIndexes, callLabelsById))
-			.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-		if (entries.length === 0) continue
-		const unitText = entries.map(({ prefix, content }) => prefix + content).join("\n\n")
-		const separatorLength = kept.length > 0 ? 2 : 0
-		if (length + separatorLength + unitText.length <= MAX_TRANSCRIPT_CHARS) {
-			if (skippedUnit && !entries.some((entry) => entry.evidence)) continue
-			for (const entry of entries) {
-				if (keptIndexes.has(entry.index)) continue
-				keptIndexes.add(entry.index)
-				kept.push(entry)
-			}
-			length += separatorLength + unitText.length
-			continue
-		}
-		if (!entries.some((entry) => entry.evidence)) {
-			skippedUnit = true
-			continue
-		}
-		oversizedEvidenceUnits.push(entries)
-		skippedUnit = true
-	}
-	for (const entries of oversizedEvidenceUnits) {
-		const separatorLength = kept.length > 0 ? 2 : 0
-		const clipped = clipTranscriptUnit(entries, MAX_TRANSCRIPT_CHARS - length - separatorLength)
-		if (clipped.length === 0) continue
-		kept.push(...clipped)
-		break
-	}
-	const ordered = kept.sort((a, b) => a.index - b.index)
+function discardMetOnEnforcementFailure(
+	result: FermentV2EvaluationResult,
+	detail: string,
+	diagnostics: (failureType?: FermentV2EvaluatorFailureType, httpStatusCode?: number) => FermentV2EvaluatorDiagnostics,
+	baseResultFields: () => Record<string, unknown>,
+): FermentV2EvaluationResult {
+	if (result.verdict !== "met") return result
 	return {
-		text: ordered.map(({ prefix, content }) => prefix + content).join("\n\n"),
-		evidenceIds: new Set(ordered.filter((entry) => entry.evidence).map((entry) => entry.id)),
+		verdict: "unavailable",
+		reason: `Verifier workspace integrity ${detail}, so its completion verdict was discarded. The working tree may still contain verifier changes; inspect it before continuing.`,
+		...(result.model ? { model: result.model } : {}),
+		...(result.usage ? { usage: result.usage } : {}),
+		diagnostics: diagnostics("guard_violation"),
+		...baseResultFields(),
 	}
 }
 
-function clipTranscriptUnit(entries: readonly RenderedTranscriptEntry[], limit: number): RenderedTranscriptEntry[] {
-	const separatorChars = Math.max(0, entries.length - 1) * 2
-	const prefixChars = entries.reduce((total, entry) => total + entry.prefix.length, 0)
-	let remainingChars = limit - separatorChars - prefixChars
-	if (remainingChars < entries.length) return []
-
-	const clipped: RenderedTranscriptEntry[] = []
-	for (const [index, entry] of entries.entries()) {
-		const entriesLeft = entries.length - index
-		const contentChars = Math.floor(remainingChars / entriesLeft)
-		const content = clipTranscriptContent(entry.content, contentChars)
-		remainingChars -= content.length
-		clipped.push({ ...entry, content })
-	}
-	return clipped
-}
-
-function clipTranscriptContent(content: string, limit: number): string {
-	if (content.length <= limit) return content
-	const marker = "\n…\n"
-	if (limit <= marker.length) return content.slice(-limit)
-	const remaining = limit - marker.length
-	const headLength = Math.ceil(remaining / 2)
-	return content.slice(0, headLength) + marker + content.slice(-(remaining - headLength))
-}
-
-function buildTranscriptUnits(messages: ReadonlyArray<AgentEndEvent["messages"][number]>): {
-	units: number[][]
-	linkedToolResultIndexes: ReadonlySet<number>
-	callLabelsById: ReadonlyMap<string, string>
-} {
-	const resultsByCallId = new Map<string, number[]>()
-	messages.forEach((message, index) => {
-		const toolCallId = toolResultCallId(message)
-		if (!toolCallId) return
-		const indexes = resultsByCallId.get(toolCallId) ?? []
-		indexes.push(index)
-		resultsByCallId.set(toolCallId, indexes)
-	})
-
-	const assigned = new Set<number>()
-	const linkedToolResultIndexes = new Set<number>()
-	const callLabelsById = new Map<string, string>()
-	const units: number[][] = []
-	for (let index = 0; index < messages.length; index++) {
-		if (assigned.has(index)) continue
-		const callIds = toolCallIds(messages[index])
-		callIds.forEach((callId, callIndex) => {
-			callLabelsById.set(callId, `c${index + 1}.${callIndex + 1}`)
-		})
-		const unit = new Set([index])
-		for (const callId of callIds) {
-			for (const resultIndex of resultsByCallId.get(callId) ?? []) {
-				unit.add(resultIndex)
-				linkedToolResultIndexes.add(resultIndex)
-			}
+/** Discard a `met` verdict on guard violation; keep every other verdict and attach the integrity outcome. */
+function applyIntegrity(
+	result: FermentV2EvaluationResult,
+	integrity: IntegrityResult,
+	diagnostics: (failureType?: FermentV2EvaluatorFailureType, httpStatusCode?: number) => FermentV2EvaluatorDiagnostics,
+	baseResultFields: () => Record<string, unknown>,
+): FermentV2EvaluationResult {
+	if (!integrity.violated) {
+		if (integrity.unenforced) {
+			// A before-run snapshot exists, so `unenforced` means the post-run
+			// snapshot failed — an enforcement failure, not a non-git workspace.
+			return discardMetOnEnforcementFailure(
+				result,
+				"could not be established after the run",
+				diagnostics,
+				baseResultFields,
+			)
 		}
-		const indexes = [...unit].sort((a, b) => a - b)
-		for (const assignedIndex of indexes) assigned.add(assignedIndex)
-		units.push(indexes)
+		return { ...result, integrity }
 	}
-	return {
-		units: units.sort((a, b) => (a.at(-1) ?? 0) - (b.at(-1) ?? 0)),
-		linkedToolResultIndexes,
-		callLabelsById,
+	if (result.verdict === "met") {
+		const restored = [...integrity.restored, ...integrity.removed].sort()
+		const recovery = integrity.postRunSnapshot ? ` Post-run snapshot: ${integrity.postRunSnapshot}.` : ""
+		return {
+			verdict: "unavailable",
+			reason: `The verifier modified the working tree, so its completion verdict was discarded. Restored files: ${restored.length ? restored.join(", ") : "(none)"}.${recovery}`,
+			...(result.model ? { model: result.model } : {}),
+			...(result.usage ? { usage: result.usage } : {}),
+			diagnostics: diagnostics("guard_violation"),
+			...baseResultFields(),
+			integrity,
+		}
 	}
-}
-
-function renderTranscriptEntry(
-	message: AgentEndEvent["messages"][number],
-	index: number,
-	linkedToolResultIndexes: ReadonlySet<number>,
-	callLabelsById: ReadonlyMap<string, string>,
-): RenderedTranscriptEntry | undefined {
-	const rendered = renderMessage(message, callLabelsById)
-	if (!rendered) return undefined
-	const id = `m${index + 1}`
-	const evidence = linkedToolResultIndexes.has(index)
-	return {
-		index,
-		id,
-		prefix: `${evidence ? `[${id}] ` : ""}${rendered.prefix}`,
-		content: rendered.content,
-		evidence,
-	}
-}
-
-function toolResultCallId(message: AgentEndEvent["messages"][number]): string | undefined {
-	const record = message as unknown as Record<string, unknown>
-	if (record.role !== "toolResult" || typeof record.toolCallId !== "string" || !record.toolCallId.trim()) {
-		return undefined
-	}
-	return record.toolCallId
-}
-
-function toolCallIds(message: AgentEndEvent["messages"][number]): string[] {
-	const content = (message as unknown as Record<string, unknown>).content
-	if (!Array.isArray(content)) return []
-	return content.flatMap((part) =>
-		isRecord(part) && part.type === "toolCall" && typeof part.id === "string" && part.id.trim() ? [part.id] : [],
-	)
-}
-
-function renderMessage(
-	message: AgentEndEvent["messages"][number],
-	callLabelsById: ReadonlyMap<string, string> = new Map(),
-): { prefix: string; content: string } | undefined {
-	const record = message as unknown as Record<string, unknown>
-	const role = typeof record.role === "string" ? record.role : "message"
-	const toolName = typeof record.toolName === "string" ? ` ${record.toolName}` : ""
-	const callLabel = callLabelsById.get(toolResultCallId(message) ?? "")
-	const resultLink = role === "toolResult" && callLabel ? ` for ${callLabel}` : ""
-	const content = contentText(record.content, callLabelsById)
-	if (!content) return undefined
-	const normalizedContent = content.trimEnd()
-	if (!normalizedContent.trim()) return { prefix: `[${role}${toolName}${resultLink}]`, content: "" }
-	return { prefix: `[${role}${toolName}${resultLink}] `, content: normalizedContent }
-}
-
-function contentText(content: unknown, callLabelsById: ReadonlyMap<string, string>): string {
-	if (typeof content === "string") return content
-	if (!Array.isArray(content)) return ""
-	return content
-		.map((part) => {
-			if (!isRecord(part)) return ""
-			if (part.type === "thinking") return ""
-			if (typeof part.text === "string") return part.text
-			if (part.type === "toolCall" && typeof part.name === "string") {
-				const callLabel = typeof part.id === "string" ? callLabelsById.get(part.id) : undefined
-				return `tool ${callLabel ? `${callLabel} ` : ""}${part.name} ${JSON.stringify(part.arguments ?? {})}`
-			}
-			return ""
-		})
-		.filter(Boolean)
-		.join("\n")
+	return { ...result, integrity }
 }

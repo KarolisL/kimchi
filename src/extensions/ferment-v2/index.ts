@@ -10,7 +10,7 @@ import type {
 import { buildSessionContext } from "@earendil-works/pi-coding-agent"
 import { type Static, Type } from "typebox"
 import { isAgentWorker } from "../agent-worker-context.js"
-import { formatCount } from "../format.js"
+import { formatCount, formatDuration } from "../format.js"
 import { ASSISTANT_OUTPUT_WITHHELD } from "../orchestration/continuation-nudge.js"
 import { getPermissionMode, setPermissionMode } from "../permissions/mode-controller.js"
 import { PERMISSION_EVENTS } from "../permissions/permissions-events.js"
@@ -27,6 +27,7 @@ import {
 	FERMENT_V2_COMMAND_COMPLETIONS,
 	formatFermentV2Status,
 	formatFermentV2Summary,
+	formatFermentV2VerifyingStatus,
 	parseFermentV2Command,
 } from "./command.js"
 import {
@@ -79,6 +80,7 @@ import {
 	markFermentV2EvaluatorModelWarned,
 	putFermentV2Entry,
 	recordFermentV2Evaluation,
+	recordFermentV2VerifierUsage,
 	replaceFermentV2,
 	restoreFermentV2,
 	setFermentV2ConsecutiveErrorTurns,
@@ -292,6 +294,10 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			providerRequestCount: diagnostics.providerRequestCount,
 			timeoutCount: diagnostics.timeoutCount,
 			correctionCount: diagnostics.correctionCount,
+			...(diagnostics.toolCalls !== undefined ? { toolCalls: diagnostics.toolCalls } : {}),
+			...(diagnostics.turns !== undefined ? { turns: diagnostics.turns } : {}),
+			...(result.integrity?.restored.length ? { restoredFiles: result.integrity.restored } : {}),
+			...(result.integrity?.removed.length ? { removedFiles: result.integrity.removed } : {}),
 			...(override?.failureType || diagnostics.failureType
 				? { failureType: override?.failureType ?? diagnostics.failureType }
 				: {}),
@@ -521,6 +527,56 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 
 	function syncRunStatus(fermentV2: FermentV2State): void {
 		currentContext?.ui.setStatus("ferment-v2", formatFermentV2Status(fermentV2, evaluationAbort !== undefined))
+	}
+
+	// ---- Verifier run status line -------------------------------------------
+	// While the executing verifier runs, the ferment status segment shows the
+	// verifier model, elapsed time, and the warning that the integrity guard
+	// may revert concurrent file edits. It ticks once per second and always
+	// yields back to the regular status line when the run settles.
+	let verifyingStatusTimer: ReturnType<typeof setInterval> | undefined
+	let verifyingStartedAtMs = 0
+	let verifyingModelRef: string | undefined
+
+	function updateVerifyingStatus(): void {
+		currentContext?.ui.setStatus(
+			"ferment-v2",
+			formatFermentV2VerifyingStatus(verifyingModelRef, Date.now() - verifyingStartedAtMs),
+		)
+	}
+
+	function startVerifyingStatus(): void {
+		verifyingStartedAtMs = Date.now()
+		verifyingModelRef = undefined
+		updateVerifyingStatus()
+		verifyingStatusTimer = setInterval(updateVerifyingStatus, 1_000)
+	}
+
+	function stopVerifyingStatus(): void {
+		if (verifyingStatusTimer) clearInterval(verifyingStatusTimer)
+		verifyingStatusTimer = undefined
+		verifyingModelRef = undefined
+	}
+
+	/** Toast the verifier verdict: model, duration, tokens; plus the guard-violation recovery note when the verifier touched the working tree. */
+	function notifyVerifierVerdict(ctx: ExtensionContext, result: FermentV2EvaluationResult): void {
+		const parts = [
+			result.model,
+			formatDuration(result.diagnostics.durationMs),
+			result.usage ? `${formatCount(result.usage.totalTokens)} tokens` : undefined,
+		].filter(Boolean)
+		if (result.verdict === "met") {
+			ctx.ui.notify(`Ferment V2 verifier accepted the completion (${parts.join(" · ")}).`, "info")
+		} else if (result.verdict === "continue") {
+			ctx.ui.notify(`Ferment V2 verifier: continue (${parts.join(" · ")}).`, "info")
+		}
+		if (result.integrity?.violated && result.verdict !== "unavailable") {
+			const touched = [...result.integrity.restored, ...result.integrity.removed].sort()
+			ctx.ui.notify(
+				`Verifier workspace changes reverted${touched.length ? `: ${touched.join(", ")}` : ""}${result.integrity.postRunSnapshot ? `. Post-run snapshot: ${result.integrity.postRunSnapshot}` : ""}.`,
+				"warning",
+			)
+		}
 	}
 
 	function displayName(fermentV2: SessionFermentV2 | undefined): string {
@@ -897,7 +953,7 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 		const startFingerprint = turnStartFingerprint
 		const abort = new AbortController()
 		evaluationAbort = abort
-		syncRunStatus(currentFermentV2)
+		startVerifyingStatus()
 		const target = {
 			sessionId: conversation.sessionId,
 			fermentV2Id: conversation.fermentV2Id,
@@ -905,15 +961,24 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			status: fermentV2.status,
 		}
 		const count = (fermentV2.evaluationCount ?? 0) + 1
+		const claim = matchesFermentV2(completionClaim, fermentV2, conversation.sessionId) ? completionClaim : undefined
+		const previousGap = fermentV2.lastEvaluation?.verdict === "continue" ? fermentV2.lastEvaluation.reason : undefined
 		const evaluation = evaluateFermentV2(
 			{
 				objective: fermentV2.objective,
+				cwd: ctx.cwd,
 				messages: conversation.messages,
 				todos: todoState?.todos ?? [],
-				lessons: fermentV2Lessons,
+				...(claim?.completionConfidence ? { completionConfidence: claim.completionConfidence } : {}),
+				...(previousGap ? { previousGap } : {}),
+				onVerifierStart: (info) => {
+					verifyingModelRef = info.model
+					updateVerifyingStatus()
+				},
 				signal: abort.signal,
 			},
 			ctx,
+			pi,
 		).then((result) => {
 			// Record the invocation snapshot before validity gates or a waiting user mutation can discard it.
 			emitFermentV2Evaluation(
@@ -929,19 +994,71 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 			() => undefined,
 		)
 		evaluationSettled = settled
+		let result: FermentV2EvaluationResult
 		try {
-			return {
-				conversation,
-				hadSubstantiveToolUse,
-				startFingerprint,
-				abort,
-				result: await evaluation,
-			}
+			result = await evaluation
 		} finally {
 			if (evaluationAbort === abort) evaluationAbort = undefined
 			if (evaluationSettled === settled) evaluationSettled = undefined
+			stopVerifyingStatus()
 			syncRunStatus(currentFermentV2)
 		}
+		// Verifier tokens, cost, and wall-clock time are settled exactly once,
+		// here — as soon as the run settles and before any verdict-validity gate —
+		// so pausing, editing, or steering during verification cannot discard
+		// already-consumed verifier usage.
+		await settleVerifierAccounting(ctx, conversation, result)
+		return {
+			conversation,
+			hadSubstantiveToolUse,
+			startFingerprint,
+			abort,
+			result,
+		}
+	}
+
+	/**
+	 * Settle one verifier run's usage against the ferment that ran it, exactly
+	 * once, when the run settles — before any verdict-validity gate. Runs inside
+	 * the session's mutation chain so a concurrent pause/edit cannot lose the
+	 * accounting; the ferment is matched by id only, since its status or
+	 * revision may legitimately have moved on during the run. When the
+	 * accounting crosses the token budget, the budget outcome is emitted here
+	 * and no further work is scheduled for this Ferment V2 (the in-flight run
+	 * has already finished; this is where the budget catches up).
+	 */
+	async function settleVerifierAccounting(
+		ctx: ExtensionContext,
+		conversation: CapturedFermentV2Conversation,
+		result: FermentV2EvaluationResult,
+	): Promise<void> {
+		await serializeFermentV2Mutation(conversation.sessionId, () => {
+			const current = currentFermentV2
+			if (!current || current.id !== conversation.fermentV2Id) return
+			const now = timestamp()
+			let accounted = current
+			if (result.usage && (result.usage.totalTokens > 0 || result.diagnostics.durationMs > 0)) {
+				accounted = addFermentV2Accounting(
+					current,
+					current.id,
+					result.usage.totalTokens,
+					result.diagnostics.durationMs,
+					now,
+				)
+			}
+			if (result.usage) {
+				accounted = recordFermentV2VerifierUsage(accounted, accounted.id, result.usage, now)
+			}
+			if (accounted !== current) commitFermentV2(accounted)
+			if (current.status === "active" && accounted.status === "budget_limited") {
+				emitFermentV2Lifecycle(FERMENT_V2_EVENTS.BUDGET_LIMITED, accounted, { reason: "token_budget" })
+				invalidateContinuation()
+				ctx.ui.notify(
+					`${displayName(accounted)} stopped after reaching its ${formatCount(accounted.tokenBudget ?? 0)} token budget.`,
+					"warning",
+				)
+			}
+		})
 	}
 
 	function canEvaluateFermentV2(
@@ -2090,6 +2207,10 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 				evaluatedAt: now,
 			}
 			let evaluated = recordFermentV2Evaluation(fermentV2, fermentV2.id, fermentV2.revision, evaluation, now)
+			// Verifier tokens and wall-clock time were already settled when the run
+			// settled — before the validity gates above — so they survive even when a
+			// verdict is abandoned; the budget transition was handled there as well.
+			notifyVerifierVerdict(ctx, result)
 			// One-time-per-ferment warning when the evaluator runs on the implementer's own model.
 			if ((result.sameModelAsImplementer || result.modelFallback) && !fermentV2.evaluatorModelWarned) {
 				ctx.ui.notify(
@@ -2425,6 +2546,7 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 		if (ctx.sessionManager.getSessionId() !== currentSessionId) return
 		unregisterTodoCommandMutationHandler?.()
 		unregisterTodoCommandMutationHandler = undefined
+		stopVerifyingStatus()
 		void abortEvaluation()
 		resolveSessionWaiters(currentSessionId)
 		currentSessionId = undefined

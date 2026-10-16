@@ -8,6 +8,7 @@ import {
 	markFermentV2EvaluatorModelWarned,
 	putFermentV2Entry,
 	recordFermentV2Evaluation,
+	recordFermentV2VerifierUsage,
 	replaceFermentV2,
 	restoreFermentV2,
 	setFermentV2ConsecutiveErrorTurns,
@@ -170,6 +171,65 @@ describe("Ferment V2 reducer", () => {
 		expect(() => addFermentV2Accounting(accounted, "ferment-v2-b", 1, 1, T2)).toThrow(
 			/current Ferment V2 is ferment-v2-a/,
 		)
+	})
+
+	it("accumulates verifier usage per run while rejecting another Ferment V2 ID", () => {
+		const fermentV2 = createFermentV2(undefined, "old", "ferment-v2-a", T1)
+		const first = recordFermentV2VerifierUsage(
+			fermentV2,
+			"ferment-v2-a",
+			{
+				input: 10,
+				output: 5,
+				cacheRead: 2,
+				cacheWrite: 1,
+				totalTokens: 18,
+				costUsd: 0.33,
+			},
+			T2,
+		)
+		const second = recordFermentV2VerifierUsage(
+			first,
+			"ferment-v2-a",
+			{
+				input: 1,
+				output: 2,
+				cacheRead: 3,
+				cacheWrite: 4,
+				totalTokens: 10,
+				costUsd: 0.1,
+			},
+			T3,
+		)
+
+		expect(second.verifierUsage).toMatchObject({
+			runs: 2,
+			input: 11,
+			output: 7,
+			cacheRead: 5,
+			cacheWrite: 5,
+			totalTokens: 28,
+		})
+		expect(second.verifierUsage?.costUsd).toBeCloseTo(0.43, 10)
+		expect(second.updatedAt).toBe(T3)
+		// Verifier usage is tracked separately from the ferment's token accounting.
+		expect(second.tokensUsed).toBe(0)
+		expect(restoreFermentV2([putFermentV2Entry(second)])).toEqual(second)
+		expect(() =>
+			recordFermentV2VerifierUsage(
+				second,
+				"ferment-v2-b",
+				{
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					costUsd: 0,
+				},
+				T3,
+			),
+		).toThrow(/current Ferment V2 is ferment-v2-a/)
 	})
 
 	it("re-applies the budget check when resuming a Ferment V2 that is already over budget", () => {
