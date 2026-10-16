@@ -41,11 +41,12 @@ function createMockApi() {
 	return { handlers, api: api as unknown as Parameters<typeof startupUpdateExtension>[0] }
 }
 
-function makeCtx(opts: { hasUI: boolean }) {
+function makeCtx(opts: { hasUI: boolean; mode?: string }) {
 	const setStatus = vi.fn()
 	const notify = vi.fn()
 	const ctx = {
 		hasUI: opts.hasUI,
+		mode: opts.mode ?? "tui",
 		ui: {
 			setStatus,
 			notify,
@@ -304,5 +305,178 @@ describe("startupUpdateExtension", () => {
 			expect(stderrSpy).toHaveBeenCalledOnce()
 			expect(stderrSpy.mock.calls[0][0]).toContain("disk full")
 		})
+	})
+})
+
+describe("update notice env (KIMCHI_UPDATE_NOTICE + KIMCHI_NO_UPDATE_CHECK)", () => {
+	let prevNotice: string | undefined
+	let prevDisabled: string | undefined
+
+	beforeEach(() => {
+		prevNotice = process.env.KIMCHI_UPDATE_NOTICE
+		prevDisabled = process.env.KIMCHI_NO_UPDATE_CHECK
+		// The outer describe's beforeEach doesn't reach this top-level
+		// describe, and the shell that launches the harness exports
+		// KIMCHI_NO_UPDATE_CHECK=1 — reset every mock (implementations leak
+		// from the outer tests otherwise) and start each test from a clean
+		// env slate so ambient values can't flip a branch.
+		checkForUpdateMock.mockReset()
+		getVersionMock.mockReset()
+		isHomebrewInstallMock.mockReset()
+		loadAutoUpdateSettingMock.mockReset()
+		loadAutoUpdateNoticeShownMock.mockReset()
+		markAutoUpdateNoticeShownMock.mockReset()
+		isHomebrewInstallMock.mockReturnValue(false)
+		loadAutoUpdateSettingMock.mockReturnValue(false)
+		loadAutoUpdateNoticeShownMock.mockReturnValue(false)
+		delete process.env.KIMCHI_UPDATE_NOTICE
+		delete process.env.KIMCHI_NO_UPDATE_CHECK
+	})
+
+	afterEach(() => {
+		if (prevNotice === undefined) delete process.env.KIMCHI_UPDATE_NOTICE
+		else process.env.KIMCHI_UPDATE_NOTICE = prevNotice
+		if (prevDisabled === undefined) delete process.env.KIMCHI_NO_UPDATE_CHECK
+		else process.env.KIMCHI_NO_UPDATE_CHECK = prevDisabled
+	})
+
+	it("shows the notice-only message when outdated", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("1.14.0")
+		checkForUpdateMock.mockResolvedValue({
+			hasUpdate: true,
+			latestVersion: "v1.16.0",
+			currentVersion: "1.14.0",
+		})
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus, notify } = makeCtx({ hasUI: true })
+		await handler({}, ctx)
+
+		expect(checkForUpdateMock).toHaveBeenCalledOnce()
+		expect(checkForUpdateMock.mock.calls[0][0]).toMatchObject({
+			currentVersion: "1.14.0",
+			skipCache: false,
+			ignoreUpdateCheckDisabled: true,
+		})
+		// The notice renders once via notify; the status line stays untouched.
+		expect(setStatus).not.toHaveBeenCalled()
+		expect(notify).toHaveBeenCalledOnce()
+		// Exactly one "v" per version — the approved wording.
+		const [msg, level] = notify.mock.calls[0]
+		expect(msg).toBe("A new Kimchi version is available: v1.16.0 (current v1.14.0).")
+		expect(level).toBe("info")
+	})
+
+	it("normalizes versions without a v prefix and never doubles an existing one", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("v1.14.0")
+		checkForUpdateMock.mockResolvedValue({
+			hasUpdate: true,
+			latestVersion: "1.16.0",
+			currentVersion: "v1.14.0",
+		})
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, notify } = makeCtx({ hasUI: true })
+		await handler({}, ctx)
+
+		expect(notify.mock.calls[0][0]).toBe("A new Kimchi version is available: v1.16.0 (current v1.14.0).")
+	})
+
+	it("shows no notice when already on the latest version", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("v1.16.0")
+		checkForUpdateMock.mockResolvedValue({ hasUpdate: false })
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus, notify } = makeCtx({ hasUI: true })
+		await handler({}, ctx)
+
+		expect(checkForUpdateMock).toHaveBeenCalledOnce()
+		expect(setStatus).not.toHaveBeenCalled()
+		expect(notify).not.toHaveBeenCalled()
+	})
+
+	it("stays silent when the check fails", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("1.14.0")
+		checkForUpdateMock.mockRejectedValue(new Error("github unreachable"))
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus, notify } = makeCtx({ hasUI: true })
+		await expect(handler({}, ctx)).resolves.toBeUndefined()
+		expect(setStatus).not.toHaveBeenCalled()
+		expect(notify).not.toHaveBeenCalled()
+	})
+
+	it("never runs outside the TUI (ACP/RPC/JSON/print exclusion)", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("1.14.0")
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus, notify } = makeCtx({ hasUI: true, mode: "rpc" })
+		await handler({}, ctx)
+
+		expect(checkForUpdateMock).not.toHaveBeenCalled()
+		expect(setStatus).not.toHaveBeenCalled()
+		expect(notify).not.toHaveBeenCalled()
+	})
+
+	it("falls through to the existing path when only KIMCHI_NO_UPDATE_CHECK is set", async () => {
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		getVersionMock.mockReturnValue("1.14.0")
+		checkForUpdateMock.mockResolvedValue({ hasUpdate: true, latestVersion: "v1.16.0" })
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus } = makeCtx({ hasUI: true })
+		await handler({}, ctx)
+
+		// The no-network guarantee for this case lives in checkForUpdate's
+		// short-circuit (workflow.test.ts); the extension keeps its existing
+		// path, whose message points at `kimchi update`.
+		expect(checkForUpdateMock).toHaveBeenCalledOnce()
+		expect(checkForUpdateMock.mock.calls[0][0].ignoreUpdateCheckDisabled).toBeUndefined()
+		const [, msg] = setStatus.mock.calls[0]
+		expect(msg).toContain("kimchi update")
+	})
+
+	it("falls through to the existing path when only KIMCHI_UPDATE_NOTICE is set", async () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		getVersionMock.mockReturnValue("1.14.0")
+		checkForUpdateMock.mockResolvedValue({ hasUpdate: true, latestVersion: "v1.16.0" })
+		const { handlers, api } = createMockApi()
+		startupUpdateExtension(api)
+		const handler = handlers.get("session_start")
+		if (!handler) throw new Error("no session_start handler")
+
+		const { ctx, setStatus } = makeCtx({ hasUI: true })
+		await handler({}, ctx)
+
+		const [, msg] = setStatus.mock.calls[0]
+		expect(msg).toContain("kimchi update")
 	})
 })

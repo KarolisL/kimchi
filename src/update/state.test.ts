@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
-import { isStale, isUpdateCheckDisabled, loadRepoState, saveRepoState } from "./state.js"
+import { isStale, isUpdateCheckDisabled, isUpdateNoticeEnabled, loadRepoState, saveRepoState } from "./state.js"
 
 describe("update state cache", () => {
 	let tmp: string
@@ -207,5 +207,31 @@ describe("isUpdateCheckDisabled", () => {
 		expect(isUpdateCheckDisabled()).toBe(true)
 		process.env.KIMCHI_NO_UPDATE_CHECK = "true"
 		expect(isUpdateCheckDisabled()).toBe(true)
+	})
+})
+
+describe("isUpdateNoticeEnabled", () => {
+	let prev: string | undefined
+	beforeEach(() => {
+		prev = process.env.KIMCHI_UPDATE_NOTICE
+		delete process.env.KIMCHI_UPDATE_NOTICE
+	})
+	afterEach(() => {
+		if (prev === undefined) delete process.env.KIMCHI_UPDATE_NOTICE
+		else process.env.KIMCHI_UPDATE_NOTICE = prev
+	})
+
+	it("returns false when unset", () => {
+		expect(isUpdateNoticeEnabled()).toBe(false)
+	})
+	it("returns false for empty string (matches KIMCHI_NO_UPDATE_CHECK conventions)", () => {
+		process.env.KIMCHI_UPDATE_NOTICE = ""
+		expect(isUpdateNoticeEnabled()).toBe(false)
+	})
+	it("returns true for any non-empty value", () => {
+		process.env.KIMCHI_UPDATE_NOTICE = "1"
+		expect(isUpdateNoticeEnabled()).toBe(true)
+		process.env.KIMCHI_UPDATE_NOTICE = "true"
+		expect(isUpdateNoticeEnabled()).toBe(true)
 	})
 })

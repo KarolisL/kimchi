@@ -64,4 +64,10 @@ describe("printMergedHelp", () => {
 		expect(output).toContain("kimchi hello")
 		expect(output).toContain("(from @fake/help)")
 	})
+
+	it("lists the update-notice env var", async () => {
+		await printMergedHelp()
+		const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n")
+		expect(output).toContain("KIMCHI_UPDATE_NOTICE")
+	})
 })

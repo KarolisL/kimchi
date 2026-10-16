@@ -92,3 +92,12 @@ export function isUpdateCheckDisabled(): boolean {
 	const v = process.env.KIMCHI_NO_UPDATE_CHECK
 	return v !== undefined && v !== ""
 }
+
+/** Honors $KIMCHI_UPDATE_NOTICE=<anything-truthy>. Opt-in for host apps that pin
+ *  the harness (KIMCHI_NO_UPDATE_CHECK) but still want a notice-only "new version
+ *  available" message in the TUI. Never triggers a download or install on its
+ *  own — see checkForUpdate's ignoreUpdateCheckDisabled. */
+export function isUpdateNoticeEnabled(): boolean {
+	const v = process.env.KIMCHI_UPDATE_NOTICE
+	return v !== undefined && v !== ""
+}

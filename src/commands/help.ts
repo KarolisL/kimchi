@@ -41,6 +41,11 @@ const KIMCHI_ENV: FlagDoc[] = [
 	},
 	{ name: "KIMCHI_TAGS", description: "Comma-separated `key:value` tags applied to every LLM request" },
 	{ name: "KIMCHI_NO_UPDATE_CHECK", description: "Disable the background self-update probe" },
+	{
+		name: "KIMCHI_UPDATE_NOTICE",
+		description:
+			"With KIMCHI_NO_UPDATE_CHECK, still show a 'new version available' notice in the TUI (check only, never updates)",
+	},
 ]
 
 function printSection(rows: FlagDoc[], pad: number): void {

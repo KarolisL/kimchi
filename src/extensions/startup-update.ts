@@ -1,10 +1,24 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { isHomebrewInstall } from "../update/paths.js"
 import { loadAutoUpdateNoticeShown, loadAutoUpdateSetting, markAutoUpdateNoticeShown } from "../update/settings.js"
+import { isUpdateCheckDisabled, isUpdateNoticeEnabled } from "../update/state.js"
 import { checkForUpdate, parseCanarySha7 } from "../update/workflow.js"
 import { getVersion } from "../utils.js"
 
 const UPDATE_STATUS_KEY = "update-available"
+
+/** Force exactly one leading "v" onto a version-like string: "1.16.0" and
+ *  "v1.16.0" both render as "v1.16.0", never "vv…". Non-semver build strings
+ *  (dev, unknown) pass through untouched. */
+function withVPrefix(version: string): string {
+	return /^\d/.test(version) ? `v${version}` : version
+}
+
+/** One-line notice for host-pinned installs (KIMCHI_UPDATE_NOTICE). Deliberately
+ *  does not suggest `kimchi update` — the host app manages this copy. */
+function updateNoticeText(latestVersion: string, currentVersion: string): string {
+	return `A new Kimchi version is available: ${withVPrefix(latestVersion)} (current ${withVPrefix(currentVersion)}).`
+}
 
 /**
  * Startup-time check for new kimchi versions. Uses cache (24h) and displays
@@ -27,6 +41,28 @@ export default function startupUpdateExtension(pi: ExtensionAPI) {
 		// Canary users opted into the canary track; don't nag them about
 		// stable. Currency on canary is checked by `kimchi update --canary`.
 		if (parseCanarySha7(current) !== null) return
+
+		// Notice-only path for host apps that pin the binary: KIMCHI_NO_UPDATE_CHECK
+		// keeps the self-updater off, but the host opts into telling the user a
+		// newer stable exists (KIMCHI_UPDATE_NOTICE). Read-only check — never a
+		// download or install. TUI only: the host may talk to us over ACP, and
+		// the notice must never leak into protocol output.
+		if (isUpdateNoticeEnabled() && isUpdateCheckDisabled()) {
+			if (ctx.mode !== "tui") return
+			try {
+				const result = await checkForUpdate({
+					currentVersion: current,
+					skipCache: false,
+					ignoreUpdateCheckDisabled: true,
+				})
+				if (result.hasUpdate) {
+					ctx.ui.notify(updateNoticeText(result.latestVersion, result.currentVersion), "info")
+				}
+			} catch {
+				// Silently ignore errors - don't block harness launch
+			}
+			return
+		}
 
 		try {
 			const autoUpdateEnabled = loadAutoUpdateSetting()

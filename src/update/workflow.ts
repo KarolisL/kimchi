@@ -38,6 +38,11 @@ export interface CheckOptions {
 	/** Abort signal forwarded to the default GitHubClient (ignored when an
 	 *  explicit `client` is passed). */
 	signal?: AbortSignal
+	/** Run this read-only check even when $KIMCHI_NO_UPDATE_CHECK is set.
+	 *  For notice-only callers ($KIMCHI_UPDATE_NOTICE): the caller promises
+	 *  to never applyUpdate from this result — the flag only lifts the
+	 *  disabled short-circuit below, never the download/install paths. */
+	ignoreUpdateCheckDisabled?: boolean
 }
 
 /** Strip the "Canary " title prefix to recover the embedded version string. */
@@ -79,7 +84,7 @@ export async function checkForUpdate(opts: CheckOptions): Promise<CheckResult> {
 	const repo = opts.repo ?? KIMCHI_REPO
 	const client = opts.client ?? new GitHubClient({ signal: opts.signal })
 
-	if (isUpdateCheckDisabled()) {
+	if (isUpdateCheckDisabled() && !opts.ignoreUpdateCheckDisabled) {
 		return {
 			currentVersion: opts.currentVersion,
 			latestVersion: opts.currentVersion,

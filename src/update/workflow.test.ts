@@ -93,6 +93,80 @@ describe("checkForUpdate version comparison", () => {
 	})
 })
 
+describe("checkForUpdate: KIMCHI_NO_UPDATE_CHECK short-circuit", () => {
+	let tmp: string
+	let prevHome: string | undefined
+	let prevXdg: string | undefined
+	let prevDisabled: string | undefined
+
+	beforeEach(() => {
+		tmp = mkdtempSync(join(tmpdir(), "kimchi-workflow-disabled-test-"))
+		prevHome = process.env.HOME
+		prevXdg = process.env.XDG_CACHE_HOME
+		prevDisabled = process.env.KIMCHI_NO_UPDATE_CHECK
+		// The shell that launches the harness exports KIMCHI_NO_UPDATE_CHECK=1;
+		// each test below states its own env explicitly.
+		delete process.env.KIMCHI_NO_UPDATE_CHECK
+		process.env.XDG_CACHE_HOME = tmp
+	})
+
+	afterEach(() => {
+		if (prevHome === undefined) delete process.env.HOME
+		else process.env.HOME = prevHome
+		if (prevXdg === undefined) delete process.env.XDG_CACHE_HOME
+		else process.env.XDG_CACHE_HOME = prevXdg
+		if (prevDisabled === undefined) delete process.env.KIMCHI_NO_UPDATE_CHECK
+		else process.env.KIMCHI_NO_UPDATE_CHECK = prevDisabled
+		rmSync(tmp, { recursive: true, force: true })
+	})
+
+	it("short-circuits to no-update without touching the client when the env var is set", async () => {
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		const latestRelease = vi.fn()
+		const client = { latestRelease } as unknown as GitHubClient
+		const result = await checkForUpdate({ repo: REPO, currentVersion: "0.1.0", client })
+		expect(latestRelease).not.toHaveBeenCalled()
+		expect(result.hasUpdate).toBe(false)
+		expect(result.latestVersion).toBe("0.1.0")
+	})
+
+	it("performs the check when ignoreUpdateCheckDisabled is set (notice-only callers)", async () => {
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		const client = fakeClient({ tagName: "v0.2.0", htmlUrl: "https://example/release" })
+		const result = await checkForUpdate({
+			repo: REPO,
+			currentVersion: "0.1.0",
+			client,
+			ignoreUpdateCheckDisabled: true,
+		})
+		expect(result.hasUpdate).toBe(true)
+		expect(result.latestVersion).toBe("v0.2.0")
+	})
+
+	it("reports already-current when the bypassed check finds the latest version", async () => {
+		process.env.KIMCHI_NO_UPDATE_CHECK = "1"
+		const client = fakeClient({ tagName: "v0.2.0", htmlUrl: "https://example/release" })
+		const result = await checkForUpdate({
+			repo: REPO,
+			currentVersion: "0.2.0",
+			client,
+			ignoreUpdateCheckDisabled: true,
+		})
+		expect(result.hasUpdate).toBe(false)
+	})
+
+	it("stays a normal check when the env var is unset, even with the flag set", async () => {
+		const client = fakeClient({ tagName: "v0.2.0", htmlUrl: "https://example/release" })
+		const result = await checkForUpdate({
+			repo: REPO,
+			currentVersion: "0.1.0",
+			client,
+			ignoreUpdateCheckDisabled: true,
+		})
+		expect(result.hasUpdate).toBe(true)
+	})
+})
+
 describe("checkForUpdate explicit tag", () => {
 	let tmp: string
 	let prevHome: string | undefined
