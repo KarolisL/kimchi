@@ -69,6 +69,14 @@ Invalid submissions fail with two distinct errors:
 
 ## Reason vocabulary
 
+Every settled response is rateable **regardless of which model ran the turn**
+— Auto (routed virtual), or a concrete model. The model only changes what is
+collected alongside the sentiment:
+
+- The Auto-specific predefined entries below appear only for Auto turns;
+- on non-Auto turns the telemetry's `routingModelId` is simply absent
+  (`autoModelUsed: false`, no routed pick to report).
+
 The TUI's predefined lists live in
 [`src/extensions/feedback/dialog.ts`](../src/extensions/feedback/dialog.ts)
 (`POSITIVE_REASONS` / `NEGATIVE_REASONS`). Clients that want a dropdown
