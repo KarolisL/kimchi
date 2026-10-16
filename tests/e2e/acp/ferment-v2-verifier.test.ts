@@ -48,6 +48,7 @@ it("runs the executing verifier after a completion claim and completes the Ferme
 		checks: [
 			{
 				kind: "work",
+				method: "command",
 				requirement: "Create and verify acp-ferment.txt containing exactly done",
 				status: "pass",
 				failureMode: "the file could contain different data; the read confirms the exact content",

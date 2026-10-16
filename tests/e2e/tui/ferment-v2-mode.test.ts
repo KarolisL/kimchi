@@ -91,7 +91,7 @@ test("experimental Ferment V2 leaves Plan mode, writes, and completes", async ({
 				// The verifier session: one executing bash check (stamped [e1]), then a met verdict citing it.
 				verifierBashCheck("verifier-plan-mode-check", `cat ${outputFile}`),
 				verifierVerdict(
-					'{"verdict":"met","reason":"The file exists with the exact required content.","checks":[{"kind":"work","requirement":"Create and verify plan-mode-ferment.txt containing exactly done","status":"pass","failureMode":"the file could contain different data; the read confirms the exact content","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The file exists with the exact required content.","checks":[{"kind":"work","method":"command","requirement":"Create and verify plan-mode-ferment.txt containing exactly done","status":"pass","failureMode":"the file could contain different data; the read confirms the exact content","evidence":["e1"]}]}',
 				),
 				{
 					stream: ["Creating the requested file."],
@@ -228,7 +228,7 @@ test("experimental Ferment V2 continues after automatic compaction and then comp
 	const metEvaluationResponse: FakeResponseScript[] = [
 		verifierBashCheck("verifier-compaction-check", "pwd"),
 		verifierVerdict(
-			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","requirement":"Implement feature A","status":"pass","failureMode":"the feature could be unverified; the executed check confirms it","evidence":["e1"]}]}',
+			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","method":"command","requirement":"Implement feature A","status":"pass","failureMode":"the feature could be unverified; the executed check confirms it","evidence":["e1"]}]}',
 		),
 	]
 	const finalAnswerResponse: FakeResponseScript = { stream: ["Feature A is complete."] }
@@ -301,7 +301,7 @@ test("experimental Ferment V2 continues after manual compaction interrupts a tur
 			responses: [
 				verifierBashCheck("verifier-manual-compaction-check", "pwd"),
 				verifierVerdict(
-					'{"verdict":"met","reason":"The resumed turn completed the verified work.","checks":[{"kind":"work","requirement":"Finish after manual compaction","status":"pass","failureMode":"the resumed work could be incomplete; the executed check confirms completion","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The resumed turn completed the verified work.","checks":[{"kind":"work","method":"command","requirement":"Finish after manual compaction","status":"pass","failureMode":"the resumed work could be incomplete; the executed check confirms completion","evidence":["e1"]}]}',
 				),
 				{
 					stream: ["Creating the manual-compaction Todo."],
@@ -553,7 +553,7 @@ test("experimental Ferment V2 evaluates an explicit completion claim without ext
 				// Verifier run 2: an executing bash check, then a cited met verdict.
 				verifierBashCheck("verifier-claim-check-2", "pwd"),
 				verifierVerdict(
-					'{"verdict":"met","reason":"The verified work and concise synthesis satisfy the objective.","checks":[{"kind":"work","requirement":"Finish the task","status":"pass","failureMode":"the result could omit the synthesis; the executed check records the verified work","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The verified work and concise synthesis satisfy the objective.","checks":[{"kind":"work","method":"command","requirement":"Finish the task","status":"pass","failureMode":"the result could omit the synthesis; the executed check records the verified work","evidence":["e1"]}]}',
 				),
 				{
 					stream: ["Creating the task Todo."],
@@ -668,7 +668,7 @@ test("experimental Ferment V2 reveals the final answer only after evaluation acc
 				// Verifier run 2: bash check, then a cited met verdict.
 				verifierBashCheck("verifier-gate-check-2", "pwd"),
 				verifierVerdict(
-					'{"verdict":"met","reason":"The verified work satisfies the objective.","checks":[{"kind":"work","requirement":"Finish behind the evaluator gate","status":"pass","failureMode":"the result could be unverified; the executed check records verification","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The verified work satisfies the objective.","checks":[{"kind":"work","method":"command","requirement":"Finish behind the evaluator gate","status":"pass","failureMode":"the result could be unverified; the executed check records verification","evidence":["e1"]}]}',
 				),
 				{
 					thinking: [visibleThinking],
@@ -874,7 +874,7 @@ test("experimental Ferment V2 pauses when an accepted final answer cannot be del
 			responses: [
 				verifierBashCheck("verifier-delivery-check", "pwd"),
 				verifierVerdict(
-					'{"verdict":"met","reason":"The verified work satisfies the objective.","checks":[{"kind":"work","requirement":"Finish before delivery","status":"pass","failureMode":"the work could be unverified; the executed check records verification","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The verified work satisfies the objective.","checks":[{"kind":"work","method":"command","requirement":"Finish before delivery","status":"pass","failureMode":"the work could be unverified; the executed check records verification","evidence":["e1"]}]}',
 				),
 				{
 					stream: ["Creating the delivery Todo."],

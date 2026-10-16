@@ -36,11 +36,13 @@ describe("DEFAULT_AGENTS", () => {
 		expect(plan.builtinToolNames).not.toContain("edit")
 	})
 
-	it("Ferment V2 Verifier persona is hidden, read-only, extension-free and unbounded", () => {
+	it("Ferment V2 Verifier persona is hidden, write-confined, extension-free and unbounded", () => {
 		const verifier = DEFAULT_AGENTS.get(AGENT_FERMENT_VERIFIER) as NonNullable<ReturnType<typeof DEFAULT_AGENTS.get>>
-		expect(verifier.builtinToolNames).toEqual(["read", "bash", "grep", "find", "ls"])
+		// write creates probes and baseline test copies; the host guard confines it
+		// to new repository files and the disposable baseline worktree.
+		expect(verifier.builtinToolNames).toEqual(["read", "bash", "grep", "find", "ls", "write"])
 		expect(verifier.disallowedTools).toContain("edit")
-		expect(verifier.disallowedTools).toContain("write")
+		expect(verifier.disallowedTools).not.toContain("write")
 		expect(verifier.extensions).toBe(false)
 		expect(verifier.skills).toBe(false)
 		expect(verifier.thinking).toBe("low")

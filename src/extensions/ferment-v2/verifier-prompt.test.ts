@@ -197,7 +197,25 @@ describe("buildVerifierTaskPrompt", () => {
 		expect(prompt).toContain("inconclusive")
 		expect(prompt).toContain("editable install")
 		expect(prompt).toContain("generated files")
-		expect(prompt).toContain("nested node_modules")
+		expect(prompt).toContain("nested ones up to three levels deep) are already linked")
+		expect(prompt).toContain("never delete or replace them")
+	})
+
+	it("asks for a baseline_test run of every flagged pre-existing test file, naming the full baseline commit", () => {
+		const prompt = buildVerifierTaskPrompt({
+			objective: "Fix the bug",
+			cwd: "/workspace",
+			facts: {
+				basis: "baseline",
+				workspace: workspace({
+					testInventoryFlags: [{ id: "f1", kind: "test_file_modified", path: "src/a.test.ts" }],
+				}),
+			},
+			todos: [],
+		})
+		expect(prompt).toContain('a "baseline_test" check that ran its baseline version')
+		expect(prompt).toContain("git show baseline-1234567890:<path>")
+		expect(prompt).toContain("the implementer's tests are context only")
 	})
 
 	it("explains a missing baseline worktree when a ferment baseline exists", () => {

@@ -23,6 +23,7 @@ import type { FermentV2Baseline, FermentV2EvaluatorUsage } from "./types.js"
 import {
 	enforceWorkspaceIntegrity,
 	type IntegrityResult,
+	type VerifierEvidence,
 	type VerifierGuard,
 	type VerifierGuardOptions,
 } from "./verifier-guard.js"
@@ -101,9 +102,12 @@ function guardWithEvidence(
 	usage: FermentV2EvaluatorUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costUsd: 0 },
 ): VerifierGuard {
 	const evidence = new Map(
-		ids.map((id) => [id, { id, toolName: "bash", input: {}, isError: false, excerpt: `result ${id}` }]),
+		ids.map((id) => [
+			id,
+			{ id, toolName: "bash", input: { command: `check ${id}` }, isError: false, excerpt: `result ${id}` },
+		]),
 	)
-	return { extension: () => {}, evidence, usage }
+	return { extension: () => {}, evidence, createdFiles: new Set<string>(), usage }
 }
 
 function makeRun(overrides: Partial<FermentV2VerifierAgentRun> = {}): FermentV2VerifierAgentRun {
@@ -145,7 +149,7 @@ function reservedWorktree(path = "/tmp/baseline-wt") {
 }
 
 const MET_ALL_GOOD =
-	'{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}'
+	'{"verdict":"met","reason":"all good","checks":[{"kind":"work","category":"behavior","method":"command","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}'
 
 function workspaceFactsWithFlags(
 	flags: readonly TestInventoryFlag[],
@@ -281,7 +285,7 @@ describe("Ferment V2 executing verifier", () => {
 
 	it("accepts a met verdict whose every check cites stamped evidence", async () => {
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"untested path","evidence":["e1"]}]}',
+			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","method":"existing_test","requirement":"ship it","status":"pass","failureMode":"untested path","evidence":["e1"]}]}',
 		})
 		expect(result).toMatchObject({ verdict: "met", reason: "all good", model: "judge/independent" })
 		if (result.verdict === "met") {
@@ -357,9 +361,115 @@ describe("Ferment V2 executing verifier", () => {
 			]),
 		)
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"],"flags":["f1","f2"]}]}',
+			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","method":"baseline_test","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"],"flags":["f1","f2"]}]}',
 		})
 		expect(result).toMatchObject({ verdict: "met", reason: "all good" })
+	})
+
+	describe("independent verification (procedure rules)", () => {
+		const met = (check: Record<string, unknown>) =>
+			JSON.stringify({
+				verdict: "met",
+				reason: "all good",
+				checks: [
+					{ kind: "work", requirement: "ship it", status: "pass", failureMode: "fm", evidence: ["e1"], ...check },
+				],
+			})
+
+		it("sends a behaviour pass resting on the implementer's tests back to the verifier as a procedure correction", async () => {
+			const resume = vi.fn(async (_id: string, _prompt: string) =>
+				makeRun({ text: met({ category: "behavior", method: "probe" }) }),
+			)
+			const guard = guardWithEvidence(["e1"])
+			const evidence = guard.evidence as Map<string, VerifierEvidence>
+			evidence.set("e1", {
+				...evidence.get("e1"),
+				input: { command: "npx vitest run test/ship.probe.test.ts" },
+			} as VerifierEvidence)
+			const createdFiles = guard.createdFiles as Set<string>
+			createdFiles.add("/workspace/test/ship.probe.test.ts")
+			const result = await evaluate({
+				text: met({ category: "behavior", method: "implementer_test" }),
+				deps: { resume, createGuard: () => guard },
+			})
+			expect(resume).toHaveBeenCalledOnce()
+			const prompt = resume.mock.calls[0]?.[1] ?? ""
+			expect(prompt).toContain("verification incomplete")
+			expect(prompt).toContain("implementer's own tests are context, not proof")
+			expect(prompt).toContain("write and run the probes")
+			expect(result).toMatchObject({ verdict: "met" })
+		})
+
+		it("reports unavailable/procedure_incomplete when the corrected verdict is still not independent", async () => {
+			const resume = vi.fn(async () => makeRun({ text: met({}) }))
+			const result = await evaluate({ text: met({ method: "inspection" }), deps: { resume } })
+			expect(result.verdict).toBe("unavailable")
+			if (result.verdict === "unavailable") {
+				expect(result.diagnostics.failureType).toBe("procedure_incomplete")
+				expect(result.reason).toContain("unlabelled evidence")
+			}
+		})
+
+		it("requires a probe check to cite a run of a file the verifier created", async () => {
+			const resume = vi.fn(async (_id: string, _prompt: string) => makeRun({ text: met({ method: "probe" }) }))
+			const result = await evaluate({ text: met({ method: "probe" }), deps: { resume } })
+			expect(resume.mock.calls[0]?.[1]).toContain('labelled "probe" but cites no run of a probe file you created')
+			expect(result.verdict).toBe("unavailable")
+		})
+
+		it("accepts constraint and delivery passes on inspection", async () => {
+			const text = JSON.stringify({
+				verdict: "met",
+				reason: "all good",
+				checks: [
+					{
+						kind: "work",
+						category: "behavior",
+						method: "existing_test",
+						requirement: "ship it",
+						status: "pass",
+						failureMode: "fm",
+						evidence: ["e1"],
+					},
+					{
+						kind: "work",
+						category: "constraint",
+						method: "inspection",
+						requirement: "lives in src/ship.ts",
+						status: "pass",
+						failureMode: "fm",
+						evidence: ["e1"],
+					},
+					{
+						kind: "work",
+						category: "delivery",
+						method: "inspection",
+						requirement: "committed on a branch",
+						status: "pass",
+						failureMode: "fm",
+						evidence: ["e1"],
+					},
+				],
+			})
+			expect(await evaluate({ text })).toMatchObject({ verdict: "met" })
+		})
+
+		it("requires a baseline_test check for every modified, deleted, or renamed pre-existing test file", async () => {
+			gatherWorkspaceFactsMock.mockResolvedValue(
+				workspaceFactsWithFlags([
+					{ id: "f1", kind: "test_file_modified", path: "src/a.test.ts" },
+					{ id: "f2", kind: "skip_marker_added", path: "src/b.test.ts" },
+				]),
+			)
+			const resume = vi.fn(async (_id: string, _prompt: string) =>
+				makeRun({ text: met({ method: "baseline_test", flags: ["f1", "f2"] }) }),
+			)
+			const result = await evaluate({ text: met({ method: "command", flags: ["f1", "f2"] }), deps: { resume } })
+			const prompt = resume.mock.calls[0]?.[1] ?? ""
+			expect(prompt).toContain("Flag f1 (test file modified: src/a.test.ts) has no baseline_test check")
+			expect(prompt).toContain("git show <baseline>:src/a.test.ts")
+			expect(result).toMatchObject({ verdict: "met" })
+		})
 	})
 
 	it("gathers facts against HEAD when the ferment has no baseline", async () => {
@@ -588,6 +698,7 @@ describe("Ferment V2 executing verifier", () => {
 				createGuard: () => ({
 					extension: () => {},
 					evidence: new Map([["e1", { id: "e1", toolName: "read", input: {}, isError: false, excerpt: "" }]]),
+					createdFiles: new Set<string>(),
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costUsd: 0 },
 				}),
 			},
@@ -613,6 +724,7 @@ describe("Ferment V2 executing verifier", () => {
 							},
 						],
 					]),
+					createdFiles: new Set<string>(),
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costUsd: 0 },
 				}),
 			},
@@ -919,7 +1031,7 @@ describe("Ferment V2 executing verifier", () => {
 			postRunSnapshot: "after-snap",
 		})
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
+			text: MET_ALL_GOOD,
 		})
 		expect(result.verdict).toBe("unavailable")
 		if (result.verdict === "unavailable") {
@@ -968,7 +1080,7 @@ describe("Ferment V2 executing verifier", () => {
 	it("discards a met verdict when integrity enforcement throws, with a recovery note", async () => {
 		enforceIntegrityMock.mockRejectedValue(new Error("restore failed"))
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
+			text: MET_ALL_GOOD,
 		})
 		expect(result.verdict).toBe("unavailable")
 		if (result.verdict === "unavailable") {
@@ -988,7 +1100,7 @@ describe("Ferment V2 executing verifier", () => {
 	it("discards a met verdict when the post-run snapshot fails, with a recovery note", async () => {
 		enforceIntegrityMock.mockResolvedValue({ ...noViolation(), unenforced: true })
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"all good","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
+			text: MET_ALL_GOOD,
 		})
 		expect(result.verdict).toBe("unavailable")
 		if (result.verdict === "unavailable") {
@@ -1001,7 +1113,7 @@ describe("Ferment V2 executing verifier", () => {
 		gitProbeMock.mockResolvedValue("outside_git")
 		snapshotMock.mockResolvedValue(undefined)
 		const result = await evaluate({
-			text: '{"verdict":"met","reason":"ok","checks":[{"kind":"work","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
+			text: '{"verdict":"met","reason":"ok","checks":[{"kind":"work","method":"command","requirement":"ship it","status":"pass","failureMode":"fm","evidence":["e1"]}]}',
 		})
 		expect(result).toMatchObject({ verdict: "met" })
 		expect(enforceIntegrityMock).not.toHaveBeenCalled()
@@ -1144,6 +1256,7 @@ describe("Ferment V2 executing verifier", () => {
 		const guard: VerifierGuard = {
 			extension: guardExtension,
 			evidence: new Map([["e1", { id: "e1", toolName: "bash", input: {}, isError: false, excerpt: "result e1" }]]),
+			createdFiles: new Set<string>(),
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costUsd: 0 },
 		}
 		await evaluate({ deps: { spawn, createGuard: () => guard } })
@@ -1151,8 +1264,13 @@ describe("Ferment V2 executing verifier", () => {
 		// The persona disables extensions, so redaction and permissions ride
 		// along as inline factories — redaction before the guard, so the stamped
 		// content and the evidence excerpts recorded for verdict reasons are
-		// already redacted; permissions gate verifier bash by the session mode.
-		expect(input?.extensionFactories).toEqual([piiRedactionExtension, permissionsExtension, guardExtension])
+		// already redacted; permissions (with the verifier's write pre-approval)
+		// gate verifier tool calls by the session mode.
+		expect(input?.extensionFactories).toHaveLength(3)
+		expect(input?.extensionFactories?.[0]).toBe(piiRedactionExtension)
+		expect(typeof input?.extensionFactories?.[1]).toBe("function")
+		expect(input?.extensionFactories?.[1]).not.toBe(permissionsExtension)
+		expect(input?.extensionFactories?.[2]).toBe(guardExtension)
 	})
 
 	it("reports the timeout cap as the wall-clock limit when configured", async () => {

@@ -14,6 +14,10 @@
  * - the baseline worktree, when one is reserved, is checked out on the first
  *   tool call that references its path (a run that never uses it costs no
  *   checkout); a failed checkout blocks that call with a reason;
+ * - `write`/`edit` are confined: anything inside the disposable baseline
+ *   worktree, and only *new* files inside the repository (probes, baseline
+ *   copies of flagged tests) — an existing repository file or a path outside
+ *   both roots is blocked before it is touched;
  * - `enforceWorkspaceIntegrity` runs after the verifier (including on abort):
  *   modified/deleted pre-existing files are restored, files the verifier added
  *   are removed, and HEAD moves — branch switches and detachments, even at the
@@ -23,7 +27,8 @@
  * The snapshot/diff/restore primitives it builds on live in `workspace.ts`.
  */
 
-import { realpathSync } from "node:fs"
+import { lstatSync, realpathSync } from "node:fs"
+import { isAbsolute, relative, resolve } from "node:path"
 import type { Usage } from "@earendil-works/pi-ai"
 import type { InlineExtension } from "@earendil-works/pi-coding-agent"
 import { isRecord } from "./reducer.js"
@@ -58,11 +63,15 @@ export interface LazyBaselineWorktree {
 
 export interface VerifierGuardOptions {
 	baselineWorktree?: LazyBaselineWorktree
+	/** The repository the verifier runs in; `write` may create new files inside it. Without it, writes are confined to the worktree. */
+	cwd?: string
 }
 
 export interface VerifierGuard {
 	extension: InlineExtension
 	evidence: ReadonlyMap<string, VerifierEvidence>
+	/** Absolute paths the verifier created with a successful `write` in this run (probes, baseline test copies). */
+	createdFiles: ReadonlySet<string>
 	/**
 	 * Verifier usage accumulated per assistant `message_end` and per
 	 * `session_compact` event, including cost. Event-based accumulation
@@ -89,14 +98,46 @@ function inputMentions(value: unknown, paths: readonly string[]): boolean {
 	return false
 }
 
-/** The reserved path and its symlink-resolved form (macOS keeps the temp dir under /private). */
-function worktreePathForms(path: string): string[] {
+/** A path and its symlink-resolved form (macOS keeps the temp dir under /private). */
+function pathForms(path: string): string[] {
 	try {
 		const resolved = realpathSync(path)
 		return resolved === path ? [path] : [path, resolved]
 	} catch {
 		return [path]
 	}
+}
+
+function isInsideAny(path: string, roots: readonly string[]): boolean {
+	return roots.some((root) => {
+		const rel = relative(root, path)
+		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+	})
+}
+
+function pathExists(path: string): boolean {
+	try {
+		lstatSync(path)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/**
+ * Whether the verifier may write `rawPath` (relative paths resolve against
+ * `cwd`): anything inside the disposable baseline worktree, and new files —
+ * nothing that exists yet — inside the repository. Shared by the guard (which
+ * blocks every other write) and the permissions pre-approval (so these writes
+ * never wait on the classifier).
+ */
+export function isVerifierWritablePath(rawPath: unknown, roots: { cwd?: string; worktree?: string }): boolean {
+	if (typeof rawPath !== "string" || !rawPath.trim()) return false
+	const base = roots.cwd ?? roots.worktree
+	if (!base) return false
+	const target = resolve(base, rawPath)
+	if (roots.worktree && isInsideAny(target, pathForms(roots.worktree))) return true
+	return roots.cwd !== undefined && isInsideAny(target, pathForms(roots.cwd)) && !pathExists(target)
 }
 
 /**
@@ -108,8 +149,10 @@ function worktreePathForms(path: string): string[] {
  */
 export function createVerifierGuard(options: VerifierGuardOptions = {}): VerifierGuard {
 	const worktree = options.baselineWorktree
-	const worktreePaths = worktree ? worktreePathForms(worktree.path) : []
+	const worktreePaths = worktree ? pathForms(worktree.path) : []
+	const writableRoots = { cwd: options.cwd, worktree: worktree?.path }
 	const evidence = new Map<string, VerifierEvidence>()
+	const createdFiles = new Set<string>()
 	const usage: FermentV2EvaluatorUsage = {
 		input: 0,
 		output: 0,
@@ -140,7 +183,23 @@ export function createVerifierGuard(options: VerifierGuardOptions = {}): Verifie
 				}
 			})
 		}
+		// Registered after the worktree hook, so a write into the worktree sees it
+		// checked out (an overwrite there is fine; it is disposable).
+		pi.on("tool_call", (event) => {
+			if (event.toolName !== "write" && event.toolName !== "edit") return undefined
+			const path = isRecord(event.input) ? event.input.path : undefined
+			if (isVerifierWritablePath(path, writableRoots)) return undefined
+			return {
+				block: true,
+				reason:
+					"Verifier writes are limited to NEW files inside the repository (probes, baseline copies of flagged tests) and to files inside the baseline worktree. Never modify an existing repository file — write a new file next to it instead.",
+			}
+		})
 		pi.on("tool_result", (event) => {
+			if (event.toolName === "write" && !event.isError && typeof event.input.path === "string") {
+				const base = options.cwd ?? worktree?.path
+				if (base) createdFiles.add(resolve(base, event.input.path))
+			}
 			const id = `e${nextEvidenceId++}`
 			evidence.set(id, {
 				id,
@@ -166,7 +225,7 @@ export function createVerifierGuard(options: VerifierGuardOptions = {}): Verifie
 		})
 	}
 
-	return { extension, evidence, usage }
+	return { extension, evidence, createdFiles, usage }
 }
 
 /**

@@ -88,7 +88,7 @@ function formatFactsSection(facts: FermentV2VerifierFacts): string {
 	if (workspace.testInventoryFlags.length > 0) {
 		lines.push(
 			[
-				"Test-inventory flags (host-detected changes to the pre-existing test suite; a met verdict requires every flag ID addressed by some check's flags array):",
+				`Test-inventory flags (host-detected changes to the pre-existing test suite; a met verdict requires every flag ID addressed by some check's flags array, and every modified, deleted, or renamed test file a "baseline_test" check that ran its baseline version — git show ${workspace.baseline}:<path>):`,
 				...workspace.testInventoryFlags.map(formatTestInventoryFlag),
 			].join("\n"),
 		)
@@ -110,7 +110,7 @@ function formatBaselineWorktreeSection(path: string): string {
 			"- Attribute test failures: run the same failing test in the baseline worktree — a failure that also fails there is pre-existing, not caused by the implementer's changes; a failure that passes there is a regression.",
 			"- Vacuous-test check: copy the implementer's new or changed test files into the baseline worktree, then run them there — they must FAIL there. A new test that passes without the implementer's changes does not verify the change. Distinguish how they fail: an assertion failure is the strong evidence; a test that only fails with a setup or import error (a module that did not exist at baseline, a missing fixture) is weaker, and a test that cannot run at all is inconclusive — treat it as unverified and look for an assertion-level failure instead.",
 			"The worktree is disposable and always deleted after this run: you may copy the implementer's new or changed test files into it and run whatever setup those tests need (installs, generators, configuration), but keep the pre-change production code intact — never edit, add, or delete its source files, and never commit anything inside the worktree.",
-			"Known traps: a Python editable install (pip -e) points at the main tree, not the worktree — reinstall inside the worktree or treat its baseline results as unreliable; generated files (build output, snapshots, lockfile-derived artifacts) may be stale or absent — regenerate them inside the worktree when cheap; only the repository root's node_modules is shared — a nested node_modules inside a subdirectory is not linked.",
+			"Known traps: a Python editable install (pip -e) points at the main tree, not the worktree — reinstall inside the worktree or treat its baseline results as unreliable; generated files (build output, snapshots, lockfile-derived artifacts) may be stale or absent — regenerate them inside the worktree when cheap; node_modules directories of the main tree (the root one and nested ones up to three levels deep) are already linked into the worktree — deeper ones are not; never delete or replace them.",
 		].join("\n"),
 	].join("\n")
 }
@@ -168,7 +168,7 @@ export function buildVerifierTaskPrompt(input: FermentV2VerifierTaskInput): stri
 	const hasFlags = "workspace" in input.facts && input.facts.workspace.testInventoryFlags.length > 0
 	sections.push(
 		[
-			"Now execute your verification procedure: derive the requirements from the objective, run your checks in the working tree,",
+			"Now execute your verification procedure: derive the requirements and their edges from the objective, verify every behaviour independently — your own probes, pre-existing tests, or direct commands; the implementer's tests are context only —",
 			"and end with exactly one JSON object matching the output contract. Cite only [eN] evidence IDs stamped on your tool results.",
 			...(hasFlags
 				? [

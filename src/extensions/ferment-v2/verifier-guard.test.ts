@@ -16,7 +16,12 @@ import { join } from "node:path"
 import { promisify } from "node:util"
 import { describe, expect, it, vi } from "vitest"
 import { createExtensionApi } from "../__mocks__/extension-api.js"
-import { createVerifierGuard, enforceWorkspaceIntegrity, type VerifierGuard } from "./verifier-guard.js"
+import {
+	createVerifierGuard,
+	enforceWorkspaceIntegrity,
+	isVerifierWritablePath,
+	type VerifierGuard,
+} from "./verifier-guard.js"
 import {
 	detectGitWorkspace,
 	diffSnapshots,
@@ -113,22 +118,27 @@ describe("createVerifierGuard evidence stamping", () => {
 	})
 })
 
-describe("createVerifierGuard baseline worktree", () => {
-	function toolCall(input: Record<string, unknown>, toolName = "bash") {
-		return { type: "tool_call", toolCallId: "c1", toolName, input }
-	}
+function toolCall(input: Record<string, unknown>, toolName = "bash") {
+	return { type: "tool_call", toolCallId: "c1", toolName, input }
+}
 
+/** The blocking results of one tool_call emission (handlers that let the call through return undefined). */
+async function blocks(ext: ReturnType<typeof createExtensionApi>, payload: unknown): Promise<unknown[]> {
+	return (await ext.emit("tool_call", payload)).filter((result) => result !== undefined)
+}
+
+describe("createVerifierGuard baseline worktree", () => {
 	it("checks the worktree out only when a tool call references its path", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "kimchi-verifier-lazy-wt-"))
 		try {
 			const ensure = vi.fn(async () => true)
 			const ext = bindGuard(createVerifierGuard({ baselineWorktree: { path: dir, ensure } }))
-			expect(await ext.emit("tool_call", toolCall({ command: "pnpm test" }))).toEqual([undefined])
+			expect(await blocks(ext, toolCall({ command: "pnpm test" }))).toEqual([])
 			expect(ensure).not.toHaveBeenCalled()
-			expect(await ext.emit("tool_call", toolCall({ command: `cd ${dir} && pnpm test` }))).toEqual([undefined])
-			expect(await ext.emit("tool_call", toolCall({ path: join(dir, "src", "a.ts") }, "read"))).toEqual([undefined])
+			expect(await blocks(ext, toolCall({ command: `cd ${dir} && pnpm test` }))).toEqual([])
+			expect(await blocks(ext, toolCall({ path: join(dir, "src", "a.ts") }, "read"))).toEqual([])
 			// The symlink-resolved form (macOS keeps the temp dir under /private) counts too.
-			expect(await ext.emit("tool_call", toolCall({ command: `ls ${realpathSync(dir)}` }))).toEqual([undefined])
+			expect(await blocks(ext, toolCall({ command: `ls ${realpathSync(dir)}` }))).toEqual([])
 			expect(ensure).toHaveBeenCalledTimes(3)
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
@@ -138,14 +148,67 @@ describe("createVerifierGuard baseline worktree", () => {
 	it("blocks a call that references the worktree when it cannot be created", async () => {
 		const path = "/tmp/kimchi-ferment-v2-baseline-missing"
 		const ext = bindGuard(createVerifierGuard({ baselineWorktree: { path, ensure: async () => false } }))
-		const [result] = await ext.emit("tool_call", toolCall({ command: `cd ${path} && pnpm test` }))
+		const [result] = await blocks(ext, toolCall({ command: `cd ${path} && pnpm test` }))
 		expect(result).toMatchObject({ block: true })
 		expect((result as { reason: string }).reason).toContain("could not be created")
 	})
 
-	it("does not intercept tool calls without a reserved worktree", async () => {
+	it("does not intercept non-write tool calls without a reserved worktree", async () => {
 		const ext = bindGuard(createVerifierGuard())
-		expect(await ext.emit("tool_call", toolCall({ command: "ls /tmp" }))).toEqual([])
+		expect(await blocks(ext, toolCall({ command: "ls /tmp" }))).toEqual([])
+	})
+})
+
+describe("createVerifierGuard write confinement", () => {
+	it("allows new repository files and anything in the worktree, blocks existing repository files and outside paths", async () => {
+		const repo = mkdtempSync(join(tmpdir(), "kimchi-verifier-writes-"))
+		const worktree = mkdtempSync(join(tmpdir(), "kimchi-ferment-v2-baseline-writes-"))
+		try {
+			writeFileSync(join(repo, "existing.ts"), "original\n")
+			writeFileSync(join(worktree, "existing.ts"), "baseline\n")
+			const ext = bindGuard(
+				createVerifierGuard({ cwd: repo, baselineWorktree: { path: worktree, ensure: async () => true } }),
+			)
+			const write = (path: string) => blocks(ext, toolCall({ path, content: "probe" }, "write"))
+
+			expect(await write("test/probe.test.ts")).toEqual([])
+			expect(await write(join(worktree, "existing.ts"))).toEqual([])
+			expect(await write(join(worktree, "new.test.ts"))).toEqual([])
+			for (const path of ["existing.ts", join(repo, "existing.ts"), "/etc/kimchi-probe", "../escape.ts"]) {
+				const [result] = await write(path)
+				expect(result, path).toMatchObject({ block: true })
+				expect((result as { reason: string }).reason).toContain("NEW files inside the repository")
+			}
+			const [edit] = await blocks(ext, toolCall({ path: "existing.ts", oldText: "a", newText: "b" }, "edit"))
+			expect(edit).toMatchObject({ block: true })
+		} finally {
+			rmSync(repo, { recursive: true, force: true })
+			rmSync(worktree, { recursive: true, force: true })
+		}
+	})
+
+	it("records files created by successful writes, resolved against the repository", async () => {
+		const guard = createVerifierGuard({ cwd: "/repo" })
+		const ext = bindGuard(guard)
+		const result = (path: string, isError: boolean) => ({
+			type: "tool_result",
+			toolCallId: "w",
+			toolName: "write",
+			input: { path, content: "probe" },
+			content: [{ type: "text", text: "ok" }],
+			isError,
+		})
+		await ext.emit("tool_result", result("test/probe.test.ts", false))
+		await ext.emit("tool_result", result("test/failed.test.ts", true))
+		expect([...guard.createdFiles]).toEqual(["/repo/test/probe.test.ts"])
+	})
+})
+
+describe("isVerifierWritablePath", () => {
+	it("rejects non-string and empty paths and writes without any root", () => {
+		expect(isVerifierWritablePath(undefined, { cwd: "/repo" })).toBe(false)
+		expect(isVerifierWritablePath("  ", { cwd: "/repo" })).toBe(false)
+		expect(isVerifierWritablePath("a.ts", {})).toBe(false)
 	})
 })
 

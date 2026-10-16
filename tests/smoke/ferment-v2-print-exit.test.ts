@@ -315,7 +315,7 @@ it("verifies an objective file headlessly with --print and writes the JSON repor
 			responses: [
 				verifierBashCheck("verify-entry-check"),
 				verifierResponse(
-					'{"verdict":"met","reason":"The README exists.","checks":[{"kind":"work","requirement":"the README exists","status":"pass","failureMode":"the README could be missing","evidence":["e1"]}]}',
+					'{"verdict":"met","reason":"The README exists.","checks":[{"kind":"work","method":"command","requirement":"the README exists","status":"pass","failureMode":"the README could be missing","evidence":["e1"]}]}',
 				),
 			],
 		},
@@ -401,7 +401,7 @@ function resumedActiveFermentV2CompletionResponses(): FakeResponseScript[] {
 		},
 		verifierBashCheck("verifier-met-check"),
 		verifierResponse(
-			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","requirement":"feature A is complete","status":"pass","failureMode":"the feature could be unverified; the executed check records verification","evidence":["e1"]}]}',
+			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","method":"command","requirement":"feature A is complete","status":"pass","failureMode":"the feature could be unverified; the executed check records verification","evidence":["e1"]}]}',
 		),
 		{
 			match: (request) => JSON.stringify(request.body).includes("Give the user only the final answer"),
@@ -561,7 +561,7 @@ function fermentV2Responses(
 		},
 		verifierBashCheck("verifier-met-check"),
 		verifierResponse(
-			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","requirement":"feature A is complete","status":"pass","failureMode":"the feature could be unverified; the executed check records verification","evidence":["e1"]}]}',
+			'{"verdict":"met","reason":"The implemented feature is verified.","checks":[{"kind":"work","method":"command","requirement":"feature A is complete","status":"pass","failureMode":"the feature could be unverified; the executed check records verification","evidence":["e1"]}]}',
 		),
 		finalAnswer,
 	]

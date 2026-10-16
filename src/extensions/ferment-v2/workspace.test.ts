@@ -751,6 +751,31 @@ describe("reserveBaselineWorktree", () => {
 		expect(readFileSync(join(repo, "tracked.txt"), "utf-8")).toBe("changed\n")
 	})
 
+	it("shares nested package node_modules with the worktree, up to three levels deep", async () => {
+		const repo = await makeRepo()
+		mkdirSync(join(repo, "backend"))
+		mkdirSync(join(repo, "packages", "core"), { recursive: true })
+		mkdirSync(join(repo, "a", "b", "c", "d"), { recursive: true })
+		for (const dir of ["backend", "packages/core", "a/b/c/d"]) writeFileSync(join(repo, dir, "index.ts"), "x\n")
+		writeFileSync(join(repo, ".gitignore"), "node_modules\n")
+		await commitAll(repo, "initial")
+		for (const dir of ["backend", "packages/core", "a/b/c/d"]) {
+			mkdirSync(join(repo, dir, "node_modules"))
+			writeFileSync(join(repo, dir, "node_modules", "marker.txt"), `${dir}\n`)
+		}
+		const baseline = await snapshotWorkspace(repo)
+
+		const worktree = await checkedOutWorktree(repo, baseline?.commit ?? "")
+
+		const wt = worktree?.path ?? ""
+		expect(readFileSync(join(wt, "backend", "node_modules", "marker.txt"), "utf-8")).toBe("backend\n")
+		expect(readFileSync(join(wt, "packages", "core", "node_modules", "marker.txt"), "utf-8")).toBe("packages/core\n")
+		// Deeper than three levels below the root is not linked.
+		expect(existsSync(join(wt, "a", "b", "c", "d", "node_modules"))).toBe(false)
+		await worktree?.dispose()
+		expect(existsSync(join(repo, "backend", "node_modules", "marker.txt"))).toBe(true)
+	})
+
 	it("shares the repository root's node_modules with the worktree", async () => {
 		const repo = await makeRepo()
 		writeFileSync(join(repo, "a.txt"), "a\n")

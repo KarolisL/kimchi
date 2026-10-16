@@ -32,6 +32,7 @@
 import { execFile as execFileCallback } from "node:child_process"
 import {
 	copyFileSync,
+	type Dirent,
 	existsSync,
 	mkdtempSync,
 	readdirSync,
@@ -847,14 +848,13 @@ export function reserveBaselineWorktree(cwd: string, baseline: string): Baseline
 			} catch {}
 			return false
 		}
-		// Share the root node_modules when present: without it, project commands
-		// inside the worktree would need a fresh install.
+		// Share the main tree's node_modules — the root one and nested package
+		// ones (monorepos, backend/ + frontend/ layouts): without them, project
+		// commands inside the worktree would need a fresh install, and the
+		// verifier's own symlink attempts are classifier-gated.
 		try {
 			const root = (await git.run(["rev-parse", "--show-toplevel"], { signal })).trim()
-			const modules = join(root, "node_modules")
-			if (root && existsSync(modules) && !existsSync(join(dir, "node_modules"))) {
-				symlinkSync(modules, join(dir, "node_modules"))
-			}
+			if (root) linkNodeModules(root, dir)
 		} catch {
 			// Best-effort: the verifier is told the worktree may lack dependencies.
 		}
@@ -884,6 +884,43 @@ export function reserveBaselineWorktree(cwd: string, baseline: string): Baseline
 			rmSync(dir, { recursive: true, force: true })
 		},
 	}
+}
+
+/** How deep below the repository root nested `node_modules` directories are linked into the worktree. */
+const NODE_MODULES_LINK_DEPTH = 3
+
+/**
+ * Symlink every `node_modules` directory of the main tree — the root one and
+ * nested ones up to NODE_MODULES_LINK_DEPTH levels below it — into the same
+ * place in the worktree, when that place exists there and has none yet.
+ * Hidden directories and `node_modules` contents are not descended into.
+ */
+export function linkNodeModules(mainRoot: string, worktreeRoot: string): void {
+	const visit = (relativeDir: string, depth: number): void => {
+		let entries: Dirent[]
+		try {
+			entries = readdirSync(join(mainRoot, relativeDir), { withFileTypes: true })
+		} catch {
+			return
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() || entry.name.startsWith(".")) continue
+			const child = relativeDir ? join(relativeDir, entry.name) : entry.name
+			if (entry.name === "node_modules") {
+				const target = join(worktreeRoot, child)
+				if (existsSync(join(worktreeRoot, relativeDir)) && !existsSync(target)) {
+					try {
+						symlinkSync(join(mainRoot, child), target)
+					} catch {
+						// Best-effort per directory.
+					}
+				}
+				continue
+			}
+			if (depth < NODE_MODULES_LINK_DEPTH) visit(child, depth + 1)
+		}
+	}
+	visit("", 0)
 }
 
 /** Absolute path with symlinks resolved (macOS keeps /tmp under /private), falling back to lexical resolution. */
