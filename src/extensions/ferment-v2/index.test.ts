@@ -1098,6 +1098,53 @@ describe("Ferment V2 extension", () => {
 		expect(modelWarnings).toHaveLength(1)
 	})
 
+	it("runs the headless --verify entry without creating Ferment V2 state", async () => {
+		writeFileSync(join(cwd, "objective.md"), "Ship feature A.\n")
+		evaluateFermentV2Mock.mockResolvedValueOnce({
+			verdict: "met",
+			reason: "Verified.",
+			model: "test/evaluator",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+		})
+
+		await harness.command("--verify --objective-file objective.md --out reports/verify.json")
+
+		expect(harness.currentFermentV2()).toBeUndefined()
+		expect(evaluateFermentV2Mock).toHaveBeenCalledOnce()
+		// Transcript-free: no proposed answer source, no Todos, no previous gap.
+		const input = evaluateFermentV2Mock.mock.calls[0]?.[0]
+		expect(input).toMatchObject({ objective: "Ship feature A.\n", cwd, messages: [], todos: [] })
+		expect(input?.previousGap).toBeUndefined()
+		expect(JSON.parse(readFileSync(join(cwd, "reports", "verify.json"), "utf-8"))).toMatchObject({
+			schemaVersion: 1,
+			verdict: "met",
+			reason: "Verified.",
+		})
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Ferment V2 verify: met"), "info")
+	})
+
+	it("refuses --verify while a Ferment V2 verifier is running in the same tree", async () => {
+		writeFileSync(join(cwd, "objective.md"), "Ship feature A.\n")
+		await harness.command("ship feature A")
+		await harness.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() })
+		const { release, settled } = await holdEvaluation(harness)
+
+		await harness.command("--verify --objective-file objective.md --out verify.json")
+
+		expect(harness.ui.notify).toHaveBeenCalledWith(expect.stringContaining("already running"), "warning")
+		expect(existsSync(join(cwd, "verify.json"))).toBe(false)
+		expect(evaluateFermentV2Mock).toHaveBeenCalledOnce()
+		release({
+			verdict: "continue",
+			reason: "More work is required.",
+			model: "test/evaluator",
+			usage: EVALUATOR_USAGE,
+			diagnostics: EVALUATOR_DIAGNOSTICS,
+		})
+		await settled
+	})
+
 	it("notifies once per ferment when the verifier ran without the integrity guard", async () => {
 		const unenforced = { violated: false, restored: [], removed: [], headMoved: false, unenforced: true }
 		await harness.command("ship feature A")

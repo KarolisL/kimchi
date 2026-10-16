@@ -178,6 +178,15 @@ Verdicts have these effects:
 - `impossible`: persist `blocked` with the evaluator reason.
 - `unavailable`: persist the evaluation and pause. Timeouts receive the one retry described above; malformed or truncated JSON receives one correction attempt; other failures pause immediately.
 
+### Headless verification (`--verify`)
+
+`/ferment-v2 --verify --objective-file <path> [--baseline <rev>] --out <path>` runs the verifier once, outside any ferment, so a benchmark harness can measure it on frozen cases (apply a patch, run the verifier, compare with ground truth) — for example `kimchi -p "/ferment-v2 --verify --objective-file obj.md --baseline HEAD --out report.json"`. It is selected only when the arguments start with `--verify` (an objective such as `verify the login flow` stays an objective), is not offered in completions, and accepts quoted values for paths with spaces.
+
+- The objective is read from `--objective-file`; paths resolve against the session cwd.
+- The baseline is `--baseline` resolved to a commit (an unknown revision is an error), else HEAD; without a resolvable HEAD (outside git, unborn branch) the verifier runs without a baseline and is told so.
+- The run is transcript-free — no proposed answer, Todos, completion confidence, or previous gap — and never creates or mutates ferment state. Integrity, evidence rules, permissions, and the lazy baseline worktree behave exactly as for a ferment run. It is refused while a ferment verifier is running in the same session, because two runs in one tree would revert each other's checks.
+- The report written to `--out` (parent directories created) is JSON with `schemaVersion: 1`, `objectiveFile`, `baseline` (commit or `null`), `verdict`, `reason`, `checks` (as the verifier returned them), `model`, `sameModelAsImplementer`, `modelFallback`, `usage`, `diagnostics` (including `failureType` for `unavailable`), `facts`, and `integrity`. A failure before or around the run (unreadable objective, unknown baseline) writes `{ schemaVersion, objectiveFile, error }` instead, so a harness can tell harness errors from verdicts.
+
 ## Gates and stop conditions
 
 Evaluation and continuation require an active current revision, no pending user message or user mutation, all V2 and Todo tools, and a non-stale session context. A pending user message or mutation invalidates the verdict; a completed evaluator response remains accounted in its child session even when the verdict is discarded. Missing tools abandon evaluation and release a waiting headless command.
@@ -208,7 +217,7 @@ Ferment V1 remains the default-enabled, cross-session project mode. It persists 
 
 ## Implementation references
 
-- [V2 extension](../src/extensions/ferment-v2/index.ts), [reducer](../src/extensions/ferment-v2/reducer.ts), [prompt](../src/extensions/ferment-v2/prompt.ts), [evaluator (verifier core)](../src/extensions/ferment-v2/evaluator.ts), [verifier guard](../src/extensions/ferment-v2/verifier-guard.ts), [verifier prompt](../src/extensions/ferment-v2/verifier-prompt.ts), [workspace (baseline, facts, worktree)](../src/extensions/ferment-v2/workspace.ts), and [types](../src/extensions/ferment-v2/types.ts)
+- [V2 extension](../src/extensions/ferment-v2/index.ts), [reducer](../src/extensions/ferment-v2/reducer.ts), [prompt](../src/extensions/ferment-v2/prompt.ts), [evaluator (verifier core)](../src/extensions/ferment-v2/evaluator.ts), [verifier guard](../src/extensions/ferment-v2/verifier-guard.ts), [verifier prompt](../src/extensions/ferment-v2/verifier-prompt.ts), [workspace (baseline, facts, worktree)](../src/extensions/ferment-v2/workspace.ts), [headless verify entry](../src/extensions/ferment-v2/verify.ts), and [types](../src/extensions/ferment-v2/types.ts)
 - [Verifier persona](../src/extensions/agents/personas/default-agents.ts) and [spawn helpers](../src/extensions/agents/index.ts)
 - [V2 unit tests](../src/extensions/ferment-v2/index.test.ts), [evaluator tests](../src/extensions/ferment-v2/evaluator.test.ts), [guard tests](../src/extensions/ferment-v2/verifier-guard.test.ts), [workspace tests](../src/extensions/ferment-v2/workspace.test.ts), and [verifier prompt tests](../src/extensions/ferment-v2/verifier-prompt.test.ts)
 - [V2 TUI flow](../tests/e2e/tui/ferment-v2-mode.test.ts) and [headless smoke coverage](../tests/smoke/ferment-v2-print-exit.test.ts)

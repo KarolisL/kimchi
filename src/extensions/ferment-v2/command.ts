@@ -10,8 +10,13 @@ export type FermentV2Command =
 	| { action: "pause" }
 	| { action: "resume" }
 	| { action: "clear" }
+	| { action: "verify"; objectiveFile: string; out: string; baseline?: string }
 
+/** Visible completions; the headless `--verify` entry is deliberately not listed. */
 export const FERMENT_V2_COMMAND_COMPLETIONS = ["edit", "pause", "resume", "clear"] as const
+
+const VERIFY_USAGE = `Usage: /${FERMENT_V2_COMMAND_NAME} --verify --objective-file <path> [--baseline <rev>] --out <path>`
+const VERIFY_FLAGS = ["objective-file", "out", "baseline"] as const
 
 export function formatFermentV2Status(fermentV2: SessionFermentV2 | undefined, evaluating = false): string | undefined {
 	if (!fermentV2) return undefined
@@ -34,6 +39,9 @@ export function formatFermentV2VerifyingStatus(model: string | undefined, elapse
 export function parseFermentV2Command(args: string): FermentV2Command {
 	const trimmed = args.trim()
 	if (!trimmed) return { action: "show" }
+	// Only a leading `--verify` flag selects the headless entry, so an objective
+	// such as "verify the login flow" stays an objective.
+	if (/^--verify(?:\s|$)/i.test(trimmed)) return parseVerifyCommand(trimmed.slice("--verify".length))
 	const [first, ...rest] = trimmed.split(/\s+/)
 	const action = first.toLowerCase()
 	if (action === "edit") {
@@ -104,6 +112,47 @@ function fermentV2Commands(fermentV2: SessionFermentV2): string {
 		return `/${FERMENT_V2_COMMAND_NAME} edit, /${FERMENT_V2_COMMAND_NAME} resume, /${FERMENT_V2_COMMAND_NAME} clear`
 	}
 	return `/${FERMENT_V2_COMMAND_NAME} <objective>, /${FERMENT_V2_COMMAND_NAME} clear`
+}
+
+/**
+ * Split arguments on whitespace, shell-style: a token is a run of unquoted
+ * and single- or double-quoted segments (`--out="a b.json"`, `"a b".json`),
+ * with the quotes removed — so paths with spaces can be passed.
+ */
+function tokenizeArguments(input: string): string[] {
+	const tokens: string[] = []
+	for (const match of input.matchAll(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)) {
+		tokens.push(
+			match[0].replace(/"([^"]*)"|'([^']*)'/g, (_quoted, double: string | undefined, single: string | undefined) => {
+				return double ?? single ?? ""
+			}),
+		)
+	}
+	return tokens
+}
+
+function parseVerifyCommand(input: string): FermentV2Command {
+	const values: Partial<Record<(typeof VERIFY_FLAGS)[number], string>> = {}
+	const tokens = tokenizeArguments(input)
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]
+		const match = /^--([a-z-]+)(?:=(.*))?$/.exec(token)
+		const name = VERIFY_FLAGS.find((flag) => flag === match?.[1])
+		if (!match || !name) throw new Error(`Unknown --verify argument "${token}". ${VERIFY_USAGE}`)
+		const value = match[2] ?? tokens[++i]
+		if (!value || value.startsWith("--")) throw new Error(`--${name} needs a value. ${VERIFY_USAGE}`)
+		if (values[name] !== undefined) throw new Error(`--${name} was given more than once. ${VERIFY_USAGE}`)
+		values[name] = value
+	}
+	const objectiveFile = values["objective-file"]
+	if (!objectiveFile) throw new Error(`--objective-file is required. ${VERIFY_USAGE}`)
+	if (!values.out) throw new Error(`--out is required. ${VERIFY_USAGE}`)
+	return {
+		action: "verify",
+		objectiveFile,
+		out: values.out,
+		...(values.baseline ? { baseline: values.baseline } : {}),
+	}
 }
 
 function parseTokenBudget(input: string): { objective: string; tokenBudget?: number } {

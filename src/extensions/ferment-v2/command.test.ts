@@ -46,6 +46,37 @@ describe("Ferment V2 command", () => {
 		expect(FERMENT_V2_COMMAND_COMPLETIONS).toEqual(["edit", "pause", "resume", "clear"])
 	})
 
+	it("parses the headless --verify entry and keeps verify-like objectives as objectives", () => {
+		expect(parseFermentV2Command("--verify --objective-file obj.md --out report.json")).toEqual({
+			action: "verify",
+			objectiveFile: "obj.md",
+			out: "report.json",
+		})
+		expect(
+			parseFermentV2Command('--verify --objective-file="my obj.md" --baseline HEAD~1 --out "out dir/r.json"'),
+		).toEqual({ action: "verify", objectiveFile: "my obj.md", out: "out dir/r.json", baseline: "HEAD~1" })
+		expect(parseFermentV2Command("verify the login flow")).toEqual({
+			action: "set",
+			objective: "verify the login flow",
+		})
+		expect(parseFermentV2Command("ship it --verify")).toEqual({ action: "set", objective: "ship it --verify" })
+	})
+
+	it("rejects incomplete, repeated, or unknown --verify arguments with the usage", () => {
+		expect(() => parseFermentV2Command("--verify")).toThrow("Usage: /ferment-v2 --verify --objective-file")
+		expect(() => parseFermentV2Command("--verify --out r.json")).toThrow("--objective-file is required")
+		expect(() => parseFermentV2Command("--verify --objective-file o.md")).toThrow("--out is required")
+		expect(() => parseFermentV2Command("--verify --objective-file --out r.json")).toThrow(
+			"--objective-file needs a value",
+		)
+		expect(() => parseFermentV2Command("--verify --objective-file o.md --out a --out b")).toThrow(
+			"--out was given more than once",
+		)
+		expect(() => parseFermentV2Command("--verify --objective-file o.md --out r.json --tokens 5k")).toThrow(
+			'Unknown --verify argument "--tokens"',
+		)
+	})
+
 	it("formats the empty state and every Ferment V2 status", () => {
 		expect(formatFermentV2Summary(undefined)).toContain("No Ferment V2 is currently set")
 		for (const status of ["active", "paused", "blocked", "budget_limited", "complete"] satisfies FermentV2Status[]) {

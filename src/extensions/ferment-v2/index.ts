@@ -25,6 +25,7 @@ import { holdWorkedDuration } from "../tool-rendering.js"
 import { holdWorkedForMessage, holdWorkingIndicator } from "../ui.js"
 import {
 	FERMENT_V2_COMMAND_COMPLETIONS,
+	type FermentV2Command,
 	formatFermentV2Status,
 	formatFermentV2Summary,
 	formatFermentV2VerifyingStatus,
@@ -110,6 +111,7 @@ import {
 	type SessionFermentV2,
 } from "./types.js"
 import { formatFermentV2EvaluatorModelWarning } from "./verifier-model.js"
+import { runFermentV2Verify } from "./verify.js"
 import { pruneStaleBaselineWorktrees, snapshotWorkspace } from "./workspace.js"
 
 type FermentV2MutationContext = ExtensionContext & Partial<Pick<ExtensionCommandContext, "waitForIdle">>
@@ -1284,6 +1286,26 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 		return "started"
 	}
 
+	/**
+	 * Headless `--verify`: run the verifier on an objective file and write a JSON
+	 * report, without creating or touching ferment state. Refused while a ferment
+	 * verifier runs — two runs in one tree would revert each other's checks.
+	 */
+	async function handleVerifyFermentV2(
+		command: Extract<FermentV2Command, { action: "verify" }>,
+		ctx: ExtensionCommandContext,
+	): Promise<void> {
+		if (evaluationAbort) {
+			throw new Error("A Ferment V2 verification is already running; retry --verify after it settles.")
+		}
+		const report = await runFermentV2Verify(command, ctx, pi)
+		if ("error" in report) {
+			ctx.ui.notify(`Ferment V2 verify failed: ${report.error}`, "warning")
+			return
+		}
+		ctx.ui.notify(`Ferment V2 verify: ${report.verdict} — report written to ${command.out}`, "info")
+	}
+
 	async function handleEditFermentV2(objective: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
 		const sessionId = bindSession(ctx)
 		const captured = currentFermentV2
@@ -1640,7 +1662,8 @@ export default function fermentV2Extension(pi: ExtensionAPI): void {
 					ctx.ui.notify(formatFermentV2Summary(currentFermentV2, liveElapsedMs()), "info")
 					return
 				}
-				if (command.action === "set") await handleSetFermentV2(command.objective, command.tokenBudget, ctx)
+				if (command.action === "verify") await handleVerifyFermentV2(command, ctx)
+				else if (command.action === "set") await handleSetFermentV2(command.objective, command.tokenBudget, ctx)
 				else if (command.action === "edit") await handleEditFermentV2(command.objective, ctx)
 				else if (command.action === "pause") await handlePauseFermentV2(ctx)
 				else if (command.action === "resume") await handleResumeFermentV2(ctx)

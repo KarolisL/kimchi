@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -305,6 +305,56 @@ it("exits --print cleanly after the Ferment V2 token budget is reached", { timeo
 			expect(fake.requests.filter((request) => request.url.startsWith("/openai/v1/chat/completions"))).toHaveLength(2)
 			expect(`${result.stdout}\n${result.stderr}`, failure).not.toContain("This extension ctx is stale")
 			expect(`${result.stdout}\n${result.stderr}`, failure).not.toContain("Extension error")
+		},
+	)
+})
+
+it("verifies an objective file headlessly with --print and writes the JSON report", { timeout: 25_000 }, async () => {
+	await withFermentV2PrintFixture(
+		{
+			responses: [
+				verifierBashCheck("verify-entry-check"),
+				verifierResponse(
+					'{"verdict":"met","reason":"The README exists.","checks":[{"kind":"work","requirement":"the README exists","status":"pass","failureMode":"the README could be missing","evidence":["e1"]}]}',
+				),
+			],
+		},
+		async ({ fake, homeDir, workDir, sessionPath }) => {
+			const git = (...args: string[]) => execFileSync("git", args, { cwd: workDir, encoding: "utf-8" }).trim()
+			git("init", "-q")
+			git("config", "user.email", "test@example.com")
+			git("config", "user.name", "Test")
+			writeFileSync(join(workDir, "README.md"), "# Project\n")
+			git("add", "-A")
+			git("commit", "-q", "-m", "initial")
+			const head = git("rev-parse", "HEAD")
+			writeFileSync(join(workDir, "objective.md"), "The README must exist.\n")
+
+			const result = await runFermentV2Print(
+				homeDir,
+				workDir,
+				sessionPath,
+				"/ferment-v2 --verify --objective-file objective.md --out reports/verify.json",
+			)
+			const failure = `timedOut=${result.timedOut} code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}`
+
+			expect(result.timedOut, failure).toBe(false)
+			expect(result.code, failure).toBe(0)
+			const report = JSON.parse(readFileSync(join(workDir, "reports", "verify.json"), "utf-8"))
+			expect(report, failure).toMatchObject({
+				schemaVersion: 1,
+				baseline: head,
+				verdict: "met",
+				reason: "The README exists.",
+				checks: [{ requirement: "the README exists", status: "pass", evidence: ["e1"] }],
+				facts: { basis: "baseline", workspace: { changedFiles: [{ status: "A", path: "objective.md" }] } },
+				integrity: { violated: false },
+			})
+			// Headless and stateless: no ferment was created and only the verifier talked to the model.
+			expect(readFermentV2Journal(sessionPath), failure).toEqual([])
+			const chatRequests = fake.requests.filter((request) => request.url.startsWith("/openai/v1/chat/completions"))
+			expect(chatRequests, failure).toHaveLength(2)
+			expect(chatRequests.every(isFermentV2VerifierRequest), failure).toBe(true)
 		},
 	)
 })

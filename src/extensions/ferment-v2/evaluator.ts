@@ -105,6 +105,10 @@ export type FermentV2EvaluationResult =
 			unusableEvaluatorRefs?: readonly string[]
 			/** Workspace integrity outcome of this verifier run. */
 			integrity?: IntegrityResult
+			/** The verifier's checks behind the verdict (as returned, before host downgrades). */
+			checks?: readonly FermentV2VerifierCheck[]
+			/** The host-gathered facts the verifier was given. */
+			facts?: FermentV2VerifierFacts
 	  }
 	| {
 			verdict: "unavailable"
@@ -117,6 +121,8 @@ export type FermentV2EvaluationResult =
 			unusableEvaluatorRefs?: readonly string[]
 			/** Workspace integrity outcome of this verifier run. */
 			integrity?: IntegrityResult
+			/** The host-gathered facts the verifier was given, when the run got that far. */
+			facts?: FermentV2VerifierFacts
 	  }
 
 export interface FermentV2EvaluationInput {
@@ -166,7 +172,7 @@ export interface FermentV2VerifierDeps {
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
-interface FermentV2VerifierCheck {
+export interface FermentV2VerifierCheck {
 	kind?: "work" | "final_answer"
 	requirement: string
 	status: "pass" | "fail" | "unverifiable"
@@ -576,6 +582,7 @@ export async function evaluateFermentV2(
 	let turns = 0
 	let guard: VerifierGuard | undefined
 	let worktree: BaselineWorktree | undefined
+	let gatheredFacts: FermentV2VerifierFacts | undefined
 	let modelRef: string | undefined
 	let sameModelAsImplementer: boolean | undefined
 	let modelFallback: "session" | undefined
@@ -600,6 +607,7 @@ export async function evaluateFermentV2(
 		...(sameModelAsImplementer ? { sameModelAsImplementer } : {}),
 		...(modelFallback ? { modelFallback } : {}),
 		...(unusableEvaluatorRefs?.length ? { unusableEvaluatorRefs } : {}),
+		...(gatheredFacts ? { facts: gatheredFacts } : {}),
 	})
 
 	// The verifier's usage is accumulated by its in-session guard per assistant
@@ -724,6 +732,7 @@ export async function evaluateFermentV2(
 			keptProbes: input.keptProbes ?? [],
 			signal: input.signal,
 		})
+		gatheredFacts = facts
 
 		const proposedAnswer = latestFinalAnswerDraft(input.messages)
 		let prompt = buildVerifierTaskPrompt({
@@ -825,6 +834,7 @@ export async function evaluateFermentV2(
 		const testInventoryFlags = "workspace" in facts ? facts.workspace.testInventoryFlags : []
 
 		const parsed = parseFermentV2EvaluatorOutput(verifierRun.text)
+		let checks = parsed?.checks
 		let validated = parsed
 			? validateParsedVerdict(parsed, guard.evidence, proposedAnswer, testInventoryFlags)
 			: ({ kind: "correct", reason: "no valid JSON verdict was returned.", failureType: "invalid_output" } as const)
@@ -855,6 +865,7 @@ export async function evaluateFermentV2(
 				)
 			}
 			const reparsed = parseFermentV2EvaluatorOutput(corrected.text)
+			checks = reparsed?.checks
 			validated = reparsed
 				? validateParsedVerdict(reparsed, guard.evidence, proposedAnswer, testInventoryFlags)
 				: ({
@@ -874,6 +885,7 @@ export async function evaluateFermentV2(
 			usage: verifierUsage(),
 			diagnostics: diagnostics(),
 			...(validated.acceptedFinalAnswer ? { acceptedFinalAnswer: validated.acceptedFinalAnswer } : {}),
+			...(checks ? { checks } : {}),
 			...baseResultFields(),
 		}
 	}
