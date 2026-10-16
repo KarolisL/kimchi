@@ -7,6 +7,7 @@ import {
 	isHardBlockedBash,
 	isReadOnlyBashCommand,
 	isReadOnlyTool,
+	mcpToolReadOnlyByAnnotation,
 	rememberedScopeTokens,
 	splitCompoundCommand,
 	splitLeadingEnv,
@@ -61,6 +62,9 @@ describe("classifyTool", () => {
 	it("classifies mcp read tools by trailing segment", () => {
 		expect(classifyTool("mcp__castai_prod_eu__list_clusters")).toBe("readOnly")
 		expect(classifyTool("mcp__castai_prod_eu__get_cluster_details")).toBe("readOnly")
+		// `fetch` was a read-only prefix in the adapter-era qualification
+		// (read-only.ts) and must survive the native migration.
+		expect(classifyTool("mcp__atlassian__fetch")).toBe("readOnly")
 	})
 
 	it("treats unknown-named tools as unknown", () => {
@@ -734,5 +738,33 @@ describe("bashSegmentForms", () => {
 	it("returns [] for empty / backtick-poisoned commands", () => {
 		expect(bashSegmentForms("")).toEqual([])
 		expect(bashSegmentForms("echo `id`")).toEqual([])
+	})
+})
+
+describe("mcpToolReadOnlyByAnnotation", () => {
+	const fakePi = (tools: { name: string; annotations?: { readOnlyHint?: boolean } }[]) => ({
+		getAllTools: () => tools,
+	})
+
+	it("returns the annotation verdict for a registered MCP tool", () => {
+		const pi = fakePi([{ name: "mcp__srv__echo", annotations: { readOnlyHint: true } }])
+		expect(mcpToolReadOnlyByAnnotation(pi, "mcp__srv__echo")).toBe(true)
+		expect(mcpToolReadOnlyByAnnotation(pi, "mcp__srv__other")).toBe(undefined)
+	})
+
+	it("a read-only-sounding name without the annotation does not pass the gate", () => {
+		const pi = fakePi([{ name: "mcp__srv__fetch_and_apply", annotations: { readOnlyHint: false } }])
+		expect(mcpToolReadOnlyByAnnotation(pi, "mcp__srv__fetch_and_apply")).toBe(false)
+	})
+
+	it("missing annotations on a registered tool fail closed", () => {
+		const pi = fakePi([{ name: "mcp__srv__get_stuff" }])
+		expect(mcpToolReadOnlyByAnnotation(pi, "mcp__srv__get_stuff")).toBe(false)
+	})
+
+	it("unregistered names and non-MCP names are not its call", () => {
+		const pi = fakePi([])
+		expect(mcpToolReadOnlyByAnnotation(pi, "mcp__srv__echo")).toBe(undefined)
+		expect(mcpToolReadOnlyByAnnotation(pi, "read")).toBe(undefined)
 	})
 })

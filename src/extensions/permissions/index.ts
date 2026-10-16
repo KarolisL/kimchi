@@ -112,6 +112,7 @@ import {
 	isHardBlockedBash,
 	isReadOnlyBashCommand,
 	isReadOnlyTool,
+	mcpToolReadOnlyByAnnotation,
 	splitCompoundCommand,
 } from "./taxonomy.js"
 import { emitOutcomeDecision, emitToolDecision, ruleSourceDetail } from "./tool-decision-emitter.js"
@@ -335,6 +336,7 @@ export default function permissionsExtension(pi: ExtensionAPI): void {
 		return (
 			PLAN_MODE_TOOL_SET.has(name.toLowerCase()) ||
 			ToolProfileManager.isProviderReadOnlyTool(pi, name) ||
+			mcpToolReadOnlyByAnnotation(pi, name) === true ||
 			isReadOnlyTool(name)
 		)
 	}
@@ -1404,7 +1406,14 @@ export default function permissionsExtension(pi: ExtensionAPI): void {
 				emitToolDecision(pi, event, mode, "accept", "questionnaire_promotion")
 				return undefined
 			}
-			if (isReadOnlyTool(toolName)) {
+			// Read-only auto-accept. For MCP tools the server's own readOnlyHint
+			// annotation is authoritative when the tool is registered: a
+			// read-only-sounding name never auto-accepts without it (defense
+			// against a mutating tool named `fetch_and_apply`/`get_…`). The name
+			// heuristic only covers MCP tools that are not yet registered
+			// (e.g. their server is still connecting).
+			const mcpReadOnly = mcpToolReadOnlyByAnnotation(pi, toolName)
+			if (mcpReadOnly !== undefined ? mcpReadOnly : isReadOnlyTool(toolName)) {
 				emitToolDecision(pi, event, mode, "accept", "readonly")
 				return undefined
 			}

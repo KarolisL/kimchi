@@ -1,3 +1,4 @@
+import type { ToolInfo } from "@earendil-works/pi-coding-agent"
 import { type ControlOperator, type ParseEntry, parse as parseShell } from "shell-quote"
 import type { ToolCategory } from "./types.js"
 
@@ -32,7 +33,31 @@ const STATIC_CATEGORIES: Record<string, ToolCategory> = {
 	workflow_submit_questions: "readOnly",
 }
 
-const READ_ONLY_NAME_HINT = /^(read|get|list|search|query|describe|find|grep|ls|loki_|view|show)/i
+/*
+ * Read-only classification by name. For MCP tools this is only the FALLBACK:
+ * a registered MCP tool's `readOnlyHint` annotation (supplied by the server
+ * itself, surfaced through pi's tool registry) is authoritative — a
+ * `fetch_and_apply`-style name never auto-accepts without the server
+ * vouching read-only, and a read-only-named tool without the annotation
+ * prompts. The name heuristic below only applies to MCP tools that are not
+ * (yet) registered, e.g. while their server is still connecting.
+ */
+const READ_ONLY_NAME_HINT = /^(read|get|list|search|query|describe|find|grep|ls|loki_|view|show|fetch)/i
+
+/**
+ * The annotation gate for MCP tools: `true`/`false` when the tool is
+ * registered and the server's `readOnlyHint` decides, `undefined` when the
+ * name is not a registered MCP tool (callers fall back to the name heuristic).
+ */
+export function mcpToolReadOnlyByAnnotation(
+	pi: { getAllTools(): readonly Pick<ToolInfo, "name" | "annotations">[] },
+	toolName: string,
+): boolean | undefined {
+	if (!toolName.startsWith("mcp__")) return undefined
+	const tool = pi.getAllTools().find((entry) => entry.name === toolName)
+	if (!tool) return undefined
+	return tool.annotations?.readOnlyHint === true
+}
 
 // Verbs at the start of an underscore-separated segment that signal a read-only
 // operation on namespaced MCP direct tools like `jetbrains_get_all_open_file_paths`
@@ -53,6 +78,7 @@ const READ_ONLY_VERB_SEGMENTS = new Set([
 	"show",
 	"preview",
 	"inspect",
+	"fetch",
 ])
 
 function hasReadOnlyVerbSegment(toolName: string): boolean {
