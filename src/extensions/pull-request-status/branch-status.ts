@@ -1,4 +1,4 @@
-/** The checked-out branch and its PR or MR, shown before a work records a commit. */
+/** The checked-out branch and its PR or MR, independent of recorded-work associations. */
 
 import { object } from "../work-attribution/summary.js"
 import { api, command, pages, repositoryIdentity, requestJSON } from "./provider-api.js"
@@ -33,7 +33,7 @@ export async function lookupBranchPullRequest(
 	try {
 		const remote = await repositoryIdentity(cwd, signal, deadline, new Map(), branch)
 		// Default branches are shared, so a branch-name match cannot identify the current work.
-		if (remote.defaultBranch !== branch) {
+		if (remote.defaultBranch && remote.defaultBranch !== branch) {
 			const url = api(remote, remote.provider === "github" ? "pulls" : "merge_requests")
 			url.search = new URLSearchParams(
 				remote.provider === "github"

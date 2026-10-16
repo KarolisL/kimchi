@@ -157,12 +157,14 @@ function replies(handler: (url: URL, options: RequestInit) => unknown = () => []
 		const value = github
 			? {
 					id: 42,
+					default_branch: "main",
 					full_name: github[1],
 					html_url: `https://${url.host === "api.github.com" ? "github.com" : url.host}/${github[1]}`,
 				}
 			: gitlab
 				? {
 						id: 42,
+						default_branch: "main",
 						path_with_namespace: decodeURIComponent(gitlab[1]),
 						web_url: `${url.origin}/${decodeURIComponent(gitlab[1])}`,
 					}
@@ -618,7 +620,7 @@ describe("repository and branch selection", () => {
 		["empty", ""],
 		["null", null],
 		["non-string", 42],
-	] as const)("still looks up the branch PR when default_branch metadata is %s", async (_case, value) => {
+	] as const)("hides the branch PR when default_branch metadata is %s", async (_case, value) => {
 		useProvider("github")
 		http.mockImplementation(async (url) => {
 			if (url.pathname === "/repos/team/repo")
@@ -631,7 +633,8 @@ describe("repository and branch selection", () => {
 			return Response.json([pull()])
 		})
 		const result = await lookupBranchPullRequest(repository, new AbortController().signal)
-		expect(result).toMatchObject({ branch: "feature", pullRequest: { number: 7 } })
+		expect(result).toEqual({ branch: "feature", pullRequest: undefined })
+		expect(http).toHaveBeenCalledOnce()
 	})
 	it.each(providers)("shows the current %s branch without creating attribution records", async (provider) => {
 		useProvider(provider)
@@ -640,13 +643,40 @@ describe("repository and branch selection", () => {
 		expect(result).toMatchObject({ branch: "feature", pullRequest: { provider, number: 7, state: "open" } })
 		expect(existsSync(agentDir)).toBe(false)
 	})
+	it.each(providers)("never trims the checked-out %s branch into another branch's PR", async (provider) => {
+		useProvider(provider)
+		const branch = "feature\u00a0"
+		remote(
+			provider === "github" ? "https://github.com/team/repo.git" : "https://gitlab.com/team/subgroup/repo.git",
+			`${branch}\n`,
+		)
+		replies((url) => {
+			const source =
+				provider === "github"
+					? url.searchParams.get("head")?.slice("team:".length)
+					: url.searchParams.get("source_branch")
+			return source === "feature" ? (provider === "github" ? [pull()] : [mr()]) : []
+		})
+		expect(await lookupBranchPullRequest(repository, new AbortController().signal)).toEqual({
+			branch,
+			pullRequest: undefined,
+		})
+		const url = http.mock.calls.at(-1)?.[0]
+		expect(url?.searchParams.get(provider === "github" ? "head" : "source_branch")).toBe(
+			provider === "github" ? `team:${branch}` : branch,
+		)
+	})
 	it("resolves the renamed repository before using an exact numeric branch filter", async () => {
 		remote("https://github.com/old/repo.git", "1320")
 		http.mockImplementation(async (url) => {
 			if (url.pathname === "/repos/old/repo")
 				return new Response(null, { status: 301, headers: { location: "/repos/renamed/repo" } })
 			if (url.pathname === "/repos/renamed/repo")
-				return Response.json({ full_name: "renamed/repo", html_url: "https://github.com/renamed/repo" })
+				return Response.json({
+					full_name: "renamed/repo",
+					html_url: "https://github.com/renamed/repo",
+					default_branch: "main",
+				})
 			expect(url.pathname).toBe("/repos/renamed/repo/pulls")
 			expect(url.searchParams.get("head")).toBe("renamed:1320")
 			return Response.json([

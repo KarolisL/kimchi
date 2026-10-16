@@ -79,7 +79,13 @@ export function command(
 			},
 			(error, stdout) => {
 				if (signal.aborted) reject(signal.reason)
-				else done(error ? undefined : stdout.trim() || undefined)
+				else if (error) done(undefined)
+				else {
+					// Unicode whitespace is valid in Git refs; trimming it can select a different branch.
+					const output =
+						command === "git" && args.includes("symbolic-ref") ? stdout.replace(/\r?\n$/, "") : stdout.trim()
+					done(output || undefined)
+				}
 			},
 		)
 	})
