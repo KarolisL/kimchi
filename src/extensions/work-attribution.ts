@@ -44,7 +44,11 @@ import {
 	pinWorkContinuation,
 	readContinuationHistory,
 } from "./work-attribution/links.js"
-import { subscribeCostReconciliation, subscribeFileReconciliation } from "./work-attribution/reconcile-supervisor.js"
+import {
+	requestWorkReconciliation,
+	subscribeCostReconciliation,
+	subscribeFileReconciliation,
+} from "./work-attribution/reconcile-supervisor.js"
 import { prepareBillingTag } from "./work-attribution/request-tags.js"
 import { COST_PER_PR_RESOURCE_ID } from "./work-attribution/resource.js"
 import {
@@ -1075,6 +1079,8 @@ export function createWorkAttributionExtension(
 					if (/^(link|unlink)(?:\s|$)/.test(value)) {
 						notify(ctx, await correctWorkLink(ctx, value))
 						notifyWorkChanged()
+						// A correction changes what the next reports say; refresh them at once, not on the rebuild interval.
+						requestWorkReconciliation()
 						return
 					}
 					if (value === "new") setWorkId(ctx)

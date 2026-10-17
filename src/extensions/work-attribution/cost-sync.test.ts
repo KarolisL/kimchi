@@ -23,7 +23,7 @@ import { appendWorkRecord, getWorkId } from "../work-attribution.js"
 import { captureBillingSource, requestTagSelector } from "./billing-source.js"
 import { readWorkBrowser } from "./browser.js"
 import { costDetailLines, workCostDetails, workCostTotals } from "./cost-details.js"
-import { readWorkCostReport, reconcileWorkCosts } from "./cost-sync.js"
+import { readWorkCostReport, reconcileWorkCosts, requestWorkCostRebuild } from "./cost-sync.js"
 import * as costs from "./costs.js"
 import { calculatePullRequestCosts, decimalNanos, roundedUsd } from "./costs.js"
 import { PRICED_TAG_LIMIT } from "./request-tags.js"
@@ -637,6 +637,8 @@ describe("automatic exact work cost lookup", () => {
 			"3 requests untagged: tag limit (Kimchi adds model and phase tags; keep at most 7 in /tags).",
 		)
 		untagged("body-uninspectable")
+		// The rebuild interval keeps this pass on the last calculation; past it, the new record is included.
+		vi.setSystemTime(new Date("2026-10-01T12:06:00.000Z"))
 		await sync()
 		expect(workCostDetails(dir, workId)).toContain(
 			"4 requests untagged: 1 body uninspectable, 3 tag limit (Kimchi adds model and phase tags; keep at most 7 in /tags).",
@@ -716,6 +718,8 @@ describe("automatic exact work cost lookup", () => {
 			"Prices: 2/2 requests priced, $3.00. PR assignments: 0 unresolved, 1 inferred, 0 shared.",
 		)
 		appendWorkRecord(implementation.ctx, { ...link, revision: 2, status: "revoked" })
+		// Like the /work correction command, an explicit request refreshes the calculation at once.
+		requestWorkCostRebuild(dir)
 		await sync()
 		const revoked = report(implementation.workId)
 		expect(revoked.pullRequests[0]).toMatchObject({
@@ -2204,8 +2208,12 @@ describe("idle cost passes", () => {
 		await sync()
 		expect(workCostDetails(dir, workId)).toEqual(shown)
 		expect(calculate).not.toHaveBeenCalled()
-		// Any append changes the journals' fingerprint.
+		// Any append changes the journals' fingerprint; within the rebuild interval the calculation waits.
 		appendWorkRecord(ctx, { type: "request_response", requestId, billingSource: source, response: { status: 200 } })
+		await sync()
+		expect(read).not.toHaveBeenCalled()
+		// Past the interval, the appended record is included at the next pass.
+		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 6 * 60_000)
 		await sync()
 		expect(read).toHaveBeenCalledOnce()
 		expect(calculate).toHaveBeenCalledOnce()
@@ -2360,5 +2368,61 @@ describe("empty billing settlement", () => {
 		await reloaded.reconcileWorkCosts(dir, new AbortController().signal)
 		expect(fetchMock).not.toHaveBeenCalled()
 		expect(report(workId).pullRequests[0].totalCostUsd).toBe("0.123456789")
+	})
+})
+
+describe("cost pass recompute cadence", () => {
+	it("reuses the last calculation when a journal changed within the rebuild interval", async () => {
+		const { ctx, requestId, source } = tagged()
+		await sync()
+		const reads = vi.spyOn(summary, "readWorkRecordsAsync")
+		// A record no billing lookup waits for changes the fingerprint without changing any price.
+		appendWorkRecord(ctx, { type: "request_response", requestId, billingSource: source, response: { status: 200 } })
+		await sync()
+		expect(reads).not.toHaveBeenCalled()
+		// Past the interval, the same journals are read and the calculation rebuilt.
+		vi.setSystemTime(new Date("2026-10-01T12:06:00.000Z"))
+		await sync()
+		expect(reads).toHaveBeenCalledOnce()
+	})
+	it("rebuilds at once when reconciliation was requested", async () => {
+		const { ctx, requestId, source } = tagged()
+		await sync()
+		const reads = vi.spyOn(summary, "readWorkRecordsAsync")
+		appendWorkRecord(ctx, { type: "request_response", requestId, billingSource: source, response: { status: 200 } })
+		requestWorkCostRebuild(dir)
+		await sync()
+		expect(reads).toHaveBeenCalledOnce()
+	})
+	it("publishes nothing new when a later pass finds no changed records", async () => {
+		const { workId } = tagged()
+		await sync()
+		const costs = join(dir, "work", workId, "costs.json")
+		const totals = join(dir, "work", workId, "cost-totals.json")
+		const written = { costs: readFileSync(costs, "utf8"), totals: readFileSync(totals, "utf8") }
+		const touched = { costs: statSync(costs).mtimeMs, totals: statSync(totals).mtimeMs }
+		// Past every refresh window, with unchanged journals.
+		vi.setSystemTime(new Date("2026-10-01T12:30:00.000Z"))
+		await sync()
+		expect(readFileSync(costs, "utf8")).toBe(written.costs)
+		expect(readFileSync(totals, "utf8")).toBe(written.totals)
+		expect(statSync(costs).mtimeMs).toBe(touched.costs)
+		expect(statSync(totals).mtimeMs).toBe(touched.totals)
+	})
+	it("leaves an unchanged work's report alone while another component changes", async () => {
+		const first = tagged("first", undefined, {}, [1])
+		const second = tagged("second", undefined, {}, [2])
+		await sync()
+		const untouched = readFileSync(join(dir, "work", second.workId, "costs.json"), "utf8")
+		const touched = statSync(join(dir, "work", first.workId, "costs.json")).mtimeMs
+		// A later request in the first work changes only its own component's report.
+		vi.setSystemTime(new Date("2026-10-01T12:04:00.000Z"))
+		const added = tagged("first", undefined, { startedAt: "2026-10-01T12:01:00Z" }, [1])
+		requestWorkCostRebuild(dir)
+		await sync()
+		expect(readFileSync(join(dir, "work", second.workId, "costs.json"), "utf8")).toBe(untouched)
+		expect(statSync(join(dir, "work", first.workId, "costs.json")).mtimeMs).toBeGreaterThan(touched)
+		expect(report(first.workId).requests).toHaveLength(2)
+		expect(report(added.workId).requests).toHaveLength(2)
 	})
 })
