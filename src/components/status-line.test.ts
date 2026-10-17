@@ -11,13 +11,16 @@ import * as MULTI_MODEL from "../extensions/multi-model.js"
 import * as TAGS from "../extensions/tags.js"
 import type { Ferment } from "../ferment/types.js"
 import {
+	branchAssistantUsageTotals,
 	buildContextCompact,
 	buildControlsLineSegments,
 	buildModelAbbrev,
 	buildPhaseCompact,
 	buildScriptPayload,
 	buildStatusLineSegments,
+	entriesAssistantUsageTotals,
 	renderFittedLine,
+	type SegmentId,
 	SHORTCUT_TAIL,
 	StatusLine,
 	StatusLineScript,
@@ -77,7 +80,7 @@ function createMockContext(opts?: MockContextOpts): ExtensionContext {
 	const modelId = opts?.modelId ?? "claude-opus-4-6"
 	const entries = (opts?.assistantMessages ?? []).map((u) => ({
 		type: "message" as const,
-		message: { role: "assistant", usage: { input: u.input, output: u.output } },
+		message: { role: "assistant", usage: { input: u.input, output: u.output, cost: { total: 0 } } },
 	}))
 	return {
 		model: { id: modelId, name: modelId, provider: opts?.modelProvider ?? "kimchi-dev" },
@@ -313,6 +316,110 @@ const compactCtx = {
 	accent: (s: string) => s,
 	semantic: (name: string, s: string) => `[${name}:${s}]`,
 }
+
+describe("usage-totals memoization", () => {
+	/** A mock whose sessionManager carries the O(1) walk-identity fields
+	 *  (fileEntries, leafId) so the memoization path is exercised. */
+	function createCachingMockContext(assistantUsages: Array<{ input: number; output: number }>): ExtensionContext {
+		const entries = assistantUsages.map((u, i) => ({
+			id: `e${i}`,
+			type: "message" as const,
+			message: { role: "assistant", usage: { input: u.input, output: u.output, cost: { total: 0.01 } } },
+		}))
+		// Single source of truth: the branch/entry accessors derive from
+		// fileEntries (minus the header) so appending in a test is visible to
+		// the accessors, like the real append-only journal.
+		const fileEntries: unknown[] = ["header", ...entries]
+		const derive = () => fileEntries.filter((e) => e !== "header") as typeof entries
+		const branch = vi.fn(derive)
+		const allEntries = vi.fn(derive)
+		const sm = {
+			getBranch: branch,
+			getEntries: allEntries,
+			fileEntries,
+			leafId: "e0",
+			getLeafId(): string | null {
+				return this.leafId as string | null
+			},
+			getSessionId: vi.fn(() => "test-session"),
+			getSessionName: vi.fn(() => "test"),
+			getSessionFile: vi.fn(() => "/test/session.md"),
+		}
+		return {
+			model: { id: "m", name: "m" },
+			cwd: "/test",
+			getContextUsage: vi.fn(() => ({ tokens: 0, percent: 0, contextWindow: 100000 })),
+			sessionManager: sm,
+		} as unknown as ExtensionContext
+	}
+
+	it("repeated totals skip the branch walk; growth and branch switches re-walk", () => {
+		const ctx = createCachingMockContext([
+			{ input: 100, output: 50 },
+			{ input: 200, output: 80 },
+		])
+		const first = branchAssistantUsageTotals(ctx)
+		expect(first.totalInput).toBe(300)
+		expect(first.totalOutput).toBe(130)
+		expect(first.lastTurn).toEqual({ input: 200, output: 80 })
+		expect(first.costUsd).toBeCloseTo(0.02)
+
+		// Cache hit: no second branch walk.
+		const getBranch = ctx.sessionManager.getBranch as ReturnType<typeof vi.fn>
+		const callsAfterFirst = getBranch.mock.calls.length
+		expect(branchAssistantUsageTotals(ctx)).toEqual(first)
+		expect(getBranch.mock.calls.length).toBe(callsAfterFirst)
+
+		// Appending an entry (journal growth) invalidates.
+		;(ctx.sessionManager as unknown as { fileEntries: unknown[] }).fileEntries.push({
+			id: "e2",
+			type: "message",
+			message: { role: "assistant", usage: { input: 1, output: 1, cost: { total: 0.01 } } },
+		})
+		const second = branchAssistantUsageTotals(ctx)
+		expect(second.totalInput).toBe(301)
+		expect(second.lastTurn).toEqual({ input: 1, output: 1 })
+		expect(getBranch.mock.calls.length).toBe(callsAfterFirst + 1)
+
+		// Same journal, different leaf (branch switch): re-walk.
+		;(ctx.sessionManager as unknown as { leafId: unknown }).leafId = "e1"
+		branchAssistantUsageTotals(ctx)
+		expect(getBranch.mock.calls.length).toBe(callsAfterFirst + 2)
+	})
+
+	it("a sessionManager without the identity fields still computes correct totals (no cache)", () => {
+		const ctx = createMockContext({ assistantMessages: [{ input: 10, output: 5 }] })
+		// createMockContext's sessionManager has no fileEntries/leafId: the
+		// defensive path walks directly.
+		const totals = branchAssistantUsageTotals(ctx)
+		expect(totals.totalInput).toBe(0) // its getBranch returns []
+	})
+
+	it("the pinned usage segment sums the full journal without re-walking per render", () => {
+		pinnedElements = ["usage"]
+		const ctx = createCachingMockContext([
+			{ input: 1000, output: 500 },
+			{ input: 20_000, output: 9000 },
+		])
+		// Integration: the pinned segment renders the full-journal totals.
+		const build = () =>
+			buildStatusLineSegments(
+				{ ctx, theme: createMockTheme(), statusLineData: createMockStatusLineData() },
+				new Set<SegmentId>(["usage"]),
+			)
+		expect(stripAnsi(build().find((s) => s.id === "usage")?.text ?? "")).toBe("↑21k ↓9.5k")
+
+		// Memoization (other status-line consumers also call getEntries, so
+		// count only the totals accessor's own re-walks): a second read with an
+		// unchanged journal performs no additional walk.
+		const getEntries = ctx.sessionManager.getEntries as ReturnType<typeof vi.fn>
+		const baseline = getEntries.mock.calls.length
+		expect(entriesAssistantUsageTotals(ctx).totalInput).toBe(21_000)
+		expect(entriesAssistantUsageTotals(ctx).totalOutput).toBe(9500)
+		// The segment build above already seeded the cache: no new walks.
+		expect(getEntries.mock.calls.length).toBe(baseline)
+	})
+})
 
 describe("compact-form builders", () => {
 	describe("buildContextCompact", () => {
