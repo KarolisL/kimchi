@@ -3,10 +3,8 @@
 
 import { randomUUID } from "node:crypto"
 import { closeSync, openSync, readdirSync, readFileSync, readSync } from "node:fs"
-import { homedir } from "node:os"
-import { isAbsolute, join, resolve } from "node:path"
+import { join } from "node:path"
 import { Readable, Writable } from "node:stream"
-import { fileURLToPath } from "node:url"
 import {
 	type SessionInfo as AcpSessionInfo,
 	type Agent,
@@ -171,6 +169,7 @@ import { createSkillWatcher, type SkillWatcher } from "./skill-watcher.js"
 import { resetAcpClientInfo, setAcpClientInfo } from "./state.js"
 import { notifyDroppedQueue, reconcileQueue } from "./steering.js"
 import { resolveAcpAppendSystemPrompt } from "./system-prompt.js"
+import { resolveToolPath } from "./tool-calls/artifacts.js"
 import { buildToolCall, buildToolCallUpdate, describeToolCall, isHiddenToolCall } from "./tool-calls/utils.js"
 import {
 	buildPathTrustInfo,
@@ -3074,26 +3073,6 @@ export function fileChangeToDiffContent(change: FileChange): ToolCallContent {
 			// files" mirror). Cast keeps the wire shape per the v1 mapping.
 			return { type: "diff", path: change.path, oldText: change.oldText ?? null } as ToolCallContent
 	}
-}
-
-// Faithful replication of pi's resolveToCwd (dist/core/tools/path-utils.js →
-// resolvePath with normalizeUnicodeSpaces + stripAtPrefix): the write tool
-// resolves args.path this way, so the pre-write read must match or a path
-// like "@notes.txt" or "~/file (with NBSP).md" would be misclassified as a
-// new file. pi-coding-agent only exports "." and "./hooks", so the helper
-// can't be imported — replicated here. Drift surfaces as an 'add' diff on an
-// overwritten file, not corruption.
-const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g
-function resolveToolPath(input: string, cwd: string): string {
-	let p = input.replace(UNICODE_SPACES, " ")
-	if (p.startsWith("@")) p = p.slice(1)
-	if (p === "~") {
-		p = homedir()
-	} else if (p.startsWith("~/") || (process.platform === "win32" && p.startsWith("~\\"))) {
-		p = join(homedir(), p.slice(2))
-	}
-	if (/^file:\/\//.test(p)) p = fileURLToPath(p)
-	return isAbsolute(p) ? resolve(p) : resolve(cwd, p)
 }
 
 // Reads the pre-write content for a `write` tool call. Returns null when the
