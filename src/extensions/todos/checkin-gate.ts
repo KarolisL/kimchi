@@ -34,7 +34,7 @@ export const CHECKIN_DELIVERED_BOUNDARY_REQUIRED = 30
  *  user_input check is never budget-limited. */
 export const CHECKIN_STALENESS_OPENINGS_PER_REQUEST = 2
 
-export type CheckinReason = "user_input" | "staleness"
+export type CheckinReason = "user_input" | "staleness" | "plan_submission"
 
 export interface CheckinPending {
 	scope: TodoScope
@@ -121,8 +121,17 @@ export function getRelevantCheckinScopes(sessionId: string): TodoScope[] {
 
 /** Mark scopes as requiring reconciliation against `inputRevision`.
  *  Pending checks coalesce per scope; a newer revision supersedes an older
- *  one (confirmation against the older revision cannot unlock work). */
-export function markUserInputPending(sessionId: string, scopes: readonly TodoScope[], inputRevision: number): void {
+ *  one (confirmation against the older revision cannot unlock work). The
+ *  reason distinguishes the trigger for surfaces and telemetry — `user_input`
+ *  (a request boundary: new user direction) or `plan_submission` (the
+ *  submit_plan handoff: work completed while finalizing the plan is not yet
+ *  reflected) — without changing the reconciliation contract. */
+export function markUserInputPending(
+	sessionId: string,
+	scopes: readonly TodoScope[],
+	inputRevision: number,
+	reason: CheckinReason = "user_input",
+): void {
 	if (scopes.length === 0) return
 	const state = sessionState(sessionId)
 	let changed = false
@@ -131,15 +140,15 @@ export function markUserInputPending(sessionId: string, scopes: readonly TodoSco
 		const existing = state.pendingByScope.get(scopeKey)
 		if (existing) {
 			if (inputRevision >= existing.inputRevision) {
-				if (inputRevision > existing.inputRevision || !existing.reasons.has("user_input")) changed = true
+				if (inputRevision > existing.inputRevision || !existing.reasons.has(reason)) changed = true
 				existing.inputRevision = inputRevision
-				existing.reasons.add("user_input")
+				existing.reasons.add(reason)
 			}
 			continue
 		}
 		state.pendingByScope.set(scopeKey, {
 			scope,
-			reasons: new Set(["user_input"]),
+			reasons: new Set([reason]),
 			inputRevision,
 		})
 		changed = true

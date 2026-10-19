@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent"
 import { isResourceEnabled } from "../../resources/store.js"
+import { SUBMIT_PLAN_TOOL_NAME } from "../../shared/planning/tool-catalog.js"
 import { isAgentWorker } from "../agent-worker-context.js"
 import { FERMENT_V2_CUSTOM_ENTRY_TYPE } from "../ferment-v2/constants.js"
 import { restoreFermentV2 } from "../ferment-v2/reducer.js"
@@ -186,6 +187,58 @@ function checkinBlockReason(pending: readonly CheckinPending[], sessionId: strin
 		)
 	}
 	return lines.join("\n")
+}
+
+/** Hidden-steer instruction sent when a plan submission leaves the global
+ *  list structurally stale — work completed while finalizing the plan that
+ *  the list does not reflect. Delivered with the review-outcome turn
+ *  (approval, denial feedback, or any user message), so reconciliation
+ *  shares that turn before further work tools. */
+function planSubmissionCheckinText(sessionId: string, revision: number): string {
+	const lines = [
+		`Todo check-in (input revision ${revision}): the plan was submitted for review, and work completed while finalizing it may not be reflected in the list below. Before starting further work tools, reconcile the list — mark finished work completed, remove items the submitted plan supersedes — or, when the list is still accurate, confirm it with confirm_todos, passing its complete current id+status set and inputRevision ${revision}. A text-only reply needs no tool call; the check stays pending until work resumes.`,
+		"",
+		`global list (input revision ${revision}):`,
+		renderCheckinList(GLOBAL_TODO_SCOPE, sessionId),
+	]
+	return lines.join("\n")
+}
+
+/** Plan-submission boundary: submit_plan ends the turn for user review, and
+ *  no further mechanism runs before the review outcome — the closure steer
+ *  needs a final-answer turn, staleness reminders are advisory, and the
+ *  check-in gate fires on genuine user input only. An unfinished global
+ *  list that was not reconciled after the work done while finalizing the
+ *  plan (work tools completed since the last reconciliation) therefore
+ *  arms the gate here, so the review-outcome turn starts with reconciliation
+ *  before further work. Suppressed when the model already did its
+ *  bookkeeping: a list reconciled after its last completed work (e.g. the
+ *  final todo write paired with submit_plan) and fully completed lists are
+ *  left alone. */
+function armPlanSubmissionCheckin(pi: ExtensionAPI, sessionId: string, interactive: boolean): void {
+	if (!isCheckinEnforcementAvailable(pi)) return
+	if (resolveTodoScope().kind !== "global") return
+	const todos = getTodosForScope(GLOBAL_TODO_SCOPE, sessionId).filter(
+		(todo) => todo.status === TODO_STATUS.PENDING || todo.status === TODO_STATUS.IN_PROGRESS,
+	)
+	if (todos.length === 0) return
+	if (isScopeReconciledForLatestInput(GLOBAL_TODO_SCOPE, sessionId)) return
+	// Already pending (e.g. user input arrived during the review, or the
+	// staleness escalation opened earlier) — its own steer/block reason
+	// carries the instructions; don't queue a duplicate message.
+	if (
+		getPendingCheckins(sessionId).some((check) => getTodoScopeKey(check.scope) === getTodoScopeKey(GLOBAL_TODO_SCOPE))
+	)
+		return
+	const revision = getInputRevision(sessionId)
+	markUserInputPending(sessionId, [GLOBAL_TODO_SCOPE], revision, "plan_submission")
+	sendHiddenSteer(
+		pi,
+		TODO_CHECKIN_CUSTOM_TYPE,
+		planSubmissionCheckinText(sessionId, revision),
+		{ reason: "plan_submission", inputRevision: revision },
+		{ steerKind: "todo_checkin", steerReason: "plan_submission", interactive, sessionId },
+	)
 }
 
 function hiddenTodoMessage(text: string) {
@@ -421,6 +474,17 @@ export default function todosExtension(pi: ExtensionAPI): void {
 		// early-nudge adoption and never increments work or staleness
 		// counters.
 		if (event.toolName === CONFIRM_TODOS_TOOL_NAME) return
+
+		// submit_plan ends the turn for user review — the plan handoff is a
+		// request boundary for todo hygiene (see armPlanSubmissionCheckin).
+		// Like confirm_todos, the submission is neither write nor work: it
+		// never increments the counters, so a model that pairs its final todo
+		// write with submit_plan stays suppressed.
+		if (event.toolName === SUBMIT_PLAN_TOOL_NAME) {
+			armPlanSubmissionCheckin(pi, sessionId, ctx.hasUI)
+			return
+		}
+
 		// Always count non-todo tool calls for the one-shot early nudge —
 		// it tracks work done without a todo list, so it must increment even
 		// when no todos exist (opposite of the staleness counter below).

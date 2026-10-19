@@ -170,7 +170,12 @@ export function isAdhocOnlyToolName(name: string): boolean {
  * and implementation-ferment. This is the only "write-like" tool visible
  * during planning (edit, write, bash-write are all suppressed).
  */
-export const SHARED_PLANNING_TOOLS: ToolEntry[] = [{ name: "submit_plan", modes: ["adhoc"] }]
+/** Tool name of the plan-review submission tool (registered by the
+ *  permissions extension). Single source of truth for surfaces that need
+ *  to recognize the plan handoff (e.g. the todos check-in boundary). */
+export const SUBMIT_PLAN_TOOL_NAME = "submit_plan"
+
+export const SHARED_PLANNING_TOOLS: ToolEntry[] = [{ name: SUBMIT_PLAN_TOOL_NAME, modes: ["adhoc"] }]
 
 const PLANNING_CORE_TOOLS = SHARED_CORE_TOOLS.filter((tool) => tool.name !== "mcp")
 

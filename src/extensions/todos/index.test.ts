@@ -11,6 +11,7 @@ import {
 	applyWriteTodos,
 	GLOBAL_TODO_SCOPE,
 	getTodosForScope,
+	getWorkToolCalls,
 	hasEverHadTodos,
 	registerActiveTodoScopeProvider,
 } from "./store.js"
@@ -1053,5 +1054,210 @@ describe("todo check-in gate", () => {
 		applyWriteTodos({ todos: [{ id: 1, content: "task", status: "completed" }] }, "session")
 		expect(getPendingCheckins("session")).toHaveLength(0)
 		expect(await fireWork(harness, ctx, "w2")).toEqual({ block: false })
+	})
+})
+
+describe("plan-submission check-in gate", () => {
+	const fireWork = (harness: ReturnType<typeof createTodosHarness>, ctx: ExtensionContext, toolCallId: string) =>
+		harness.fire("tool_call", { type: "tool_call", toolCallId, toolName: "bash", input: {} }, ctx)
+
+	/** A successful work call: admitted, then completed. */
+	const workAndExecute = async (
+		harness: ReturnType<typeof createTodosHarness>,
+		ctx: ExtensionContext,
+		toolCallId: string,
+	) => {
+		await fireWork(harness, ctx, toolCallId)
+		await harness.fire("tool_execution_end", { toolName: "bash", isError: false }, ctx)
+	}
+
+	const submitPlan = (harness: ReturnType<typeof createTodosHarness>, ctx: ExtensionContext) =>
+		harness.fire("tool_execution_end", { toolName: "submit_plan", isError: false }, ctx)
+
+	beforeEach(() => {
+		__resetTodoStore()
+		__resetCheckinGate()
+		__resetReconciliationBookkeeping()
+		isResourceEnabledMock.mockReturnValue(true)
+	})
+
+	it("arms the gate when work completed while finalizing the plan is unreflected", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos(
+			{
+				todos: [
+					{ content: "Finalize plan", status: "in_progress" },
+					{ content: "Submit for review", status: "pending" },
+				],
+			},
+			"session",
+			{ origin: "tool", inputRevision: 0 },
+		)
+
+		// Work completed while finalizing the plan (investigation, plan edits)
+		// without a reflecting todo write.
+		await workAndExecute(harness, ctx, "w1")
+		await workAndExecute(harness, ctx, "w2")
+
+		await submitPlan(harness, ctx)
+
+		// The gate is armed with the plan_submission reason and one hidden
+		// instruction is queued for the review-outcome turn.
+		const pending = getPendingCheckins("session")
+		expect(pending).toHaveLength(1)
+		expect(pending[0]?.reasons.has("plan_submission")).toBe(true)
+		expect(pending[0]?.scope).toEqual({ kind: "global" })
+		const steers = steerCallsByReason(harness.sendMessage, "plan_submission")
+		expect(steers).toHaveLength(1)
+		const text = JSON.stringify(steers[0])
+		expect(text).toContain("the plan was submitted for review")
+		expect(text).toContain("[in_progress] #1 Finalize plan")
+		expect(text).toContain("input revision 0")
+
+		// The review-outcome turn's first work tool is blocked until reconciled.
+		const blocked = await fireWork(harness, ctx, "w3")
+		expect(blocked).toMatchObject({ block: true })
+		expect((blocked as { reason?: string }).reason).toContain("check-in pending (input revision 0)")
+
+		// A reflecting write against the current revision releases the gate.
+		applyWriteTodos(
+			{
+				todos: [
+					{ id: 1, content: "Finalize plan", status: "completed" },
+					{ id: 2, content: "Submit for review", status: "completed" },
+				],
+			},
+			"session",
+			{ origin: "tool", inputRevision: 0 },
+		)
+		expect(await fireWork(harness, ctx, "w4")).toEqual({ block: false })
+	})
+
+	it("suppresses when the final todo write is paired with the submission", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session")
+		await workAndExecute(harness, ctx, "w1")
+
+		// The model marks its finished work and submits in the same round.
+		applyWriteTodos({ todos: [{ id: 1, content: "task", status: "completed" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+		await submitPlan(harness, ctx)
+
+		expect(getPendingCheckins("session")).toHaveLength(0)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(0)
+		expect(await fireWork(harness, ctx, "w2")).toEqual({ block: false })
+	})
+
+	it("leaves a fully completed list alone", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ id: 1, content: "task", status: "completed" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+		await workAndExecute(harness, ctx, "w1")
+		await submitPlan(harness, ctx)
+
+		expect(getPendingCheckins("session")).toHaveLength(0)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(0)
+	})
+
+	it("skips failed submissions", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+		await workAndExecute(harness, ctx, "w1")
+		await harness.fire("tool_execution_end", { toolName: "submit_plan", isError: true }, ctx)
+
+		expect(getPendingCheckins("session")).toHaveLength(0)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(0)
+	})
+
+	it("submit_plan is neither write nor work: it never increments counters", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session")
+
+		await workAndExecute(harness, ctx, "w1")
+		expect(getWorkToolCalls("session")).toBe(1)
+
+		await submitPlan(harness, ctx)
+		expect(getWorkToolCalls("session")).toBe(1)
+	})
+
+	it("does not queue a duplicate message when a check is already pending", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session")
+
+		// User input arrived during the review window: the user_input check and
+		// its instruction are already in place.
+		await harness.fire("input", { type: "input", text: "One more thing", source: "interactive" }, ctx)
+		expect(steerCallsByReason(harness.sendMessage, "user_input")).toHaveLength(1)
+
+		await submitPlan(harness, ctx)
+
+		const pending = getPendingCheckins("session")
+		expect(pending).toHaveLength(1)
+		expect(pending[0]?.reasons.has("user_input")).toBe(true)
+		expect(pending[0]?.reasons.has("plan_submission")).toBe(false)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(0)
+	})
+
+	it("resource disabled: no arming, work flows", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+		await workAndExecute(harness, ctx, "w1")
+
+		isResourceEnabledMock.mockReturnValue(false)
+		await submitPlan(harness, ctx)
+
+		expect(getPendingCheckins("session")).toHaveLength(0)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(0)
+		expect(await fireWork(harness, ctx, "w2")).toEqual({ block: false })
+	})
+
+	it("re-arms on a later submission after an intermediate reconciliation", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+
+		// First submission: stale (work since the write) → armed.
+		await workAndExecute(harness, ctx, "w1")
+		await submitPlan(harness, ctx)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(1)
+
+		// The model reconciles (deny-with-feedback turn), then completes more
+		// work and submits again: armed again, second instruction queued.
+		applyWriteTodos({ todos: [{ id: 1, content: "task", status: "in_progress" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+		await workAndExecute(harness, ctx, "w2")
+		await submitPlan(harness, ctx)
+		expect(steerCallsByReason(harness.sendMessage, "plan_submission")).toHaveLength(2)
+		expect(getPendingCheckins("session")[0]?.reasons.has("plan_submission")).toBe(true)
 	})
 })

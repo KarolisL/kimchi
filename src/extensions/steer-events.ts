@@ -121,6 +121,7 @@ export type SteerReason =
 	| "step_stall"
 	| "timeout"
 	| "checkin"
+	| "plan_submission"
 	| "warn"
 	| "steer"
 	| "turn_end"

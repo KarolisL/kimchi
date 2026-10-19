@@ -1,4 +1,4 @@
-import { expect, test } from "@microsoft/tui-test"
+import { expect, Key, test } from "@microsoft/tui-test"
 import { STREAM_TIMEOUT_MS, viewText, waitForText, waitForTurnToSettle } from "./support/assertions.js"
 import type { FakeResponseScript } from "./support/fake-openai-server.js"
 import { runKimchiSession, TUI_TEST_CONFIG } from "./support/kimchi-fixture.js"
@@ -231,6 +231,72 @@ test("check-in gate: ignoring staleness reminders escalates, a wrong confirm is 
 			expect(viewText(terminal)).toContain("All checked in and verified.")
 			expect(viewText(terminal)).toContain("0/1 done · 1 active")
 			trace.step("ignored reminders → gate → mismatch → confirm → work")
+		},
+	)
+})
+
+test("plan submission: stale final list arms the check-in gate for the approval turn", async ({ terminal }) => {
+	await runKimchiSession(
+		terminal,
+		{
+			artifactName: "todo-checkin-plan-submission",
+			gitInit: true,
+			extraArgs: ["--plan=true"],
+			models: [{ slug: "basic", displayName: "Fake Basic", contextWindow: 200_000, maxTokens: 8192 }],
+			responses: [
+				// Turn 1: create the planning todo (the write reconciles).
+				tool("create_todos", { todos: [{ content: "Write the plan", status: "in_progress" }] }),
+				// Work completed while finalizing the plan, without a reflecting
+				// todo write — the list goes structurally stale.
+				bash(1),
+				bash(2),
+				// The plan is submitted for review; the turn ends in the review
+				// menu (stopReason toolUse — no closure steer, and below the
+				// staleness interval: only the submission boundary can catch the
+				// stale list).
+				tool("submit_plan", { plan: "# Plan\n\n## Goal\n\nVerify the plan-submission check-in gate.\n" }),
+				// Approval turn: the first work tool is blocked by the armed gate…
+				tool("bash", { command: "printf 'never runs\n'" }),
+				// …the model reconciles (the plan was written and submitted)…
+				tool("mark_todo", { id: 1, status: "completed" }),
+				// …and execution work proceeds.
+				tool("bash", { command: "printf 'executed\n'" }),
+				{ stream: ["Plan executed. Ready for the next task."] },
+			],
+		},
+		async (fixture, trace) => {
+			const chat = () => fixture.fake.requests.filter((request) => request.url === "/openai/v1/chat/completions")
+			terminal.submit("Plan how to add a new feature.")
+
+			// The TUI plan-review menu opens at the submission boundary.
+			await waitForText(terminal, "Plan complete. How would you like to proceed?", { timeoutMs: STREAM_TIMEOUT_MS })
+			trace.step("plan submitted; review menu open")
+
+			// Approve locally: the first option is "Execute the plan locally".
+			terminal.keyPress(Key.Enter)
+			await waitForText(terminal, "Plan executed. Ready for the next task.", { timeoutMs: STREAM_TIMEOUT_MS })
+			trace.step("approved locally; execution finished")
+
+			const history = JSON.stringify(chat())
+			// The blocked work call carried the plan-submission check-in reason.
+			expect(history).toContain("check-in pending (input revision 1)")
+			// The plan-submission instruction rode the first request after the
+			// submission boundary — the same request that carries the submit_plan
+			// tool result — so the model knew why the gate was open before its
+			// work tool ran, and the block followed the instruction.
+			const bodies = chat().map((request) => JSON.stringify(request.body))
+			const submissionTurn = bodies.findIndex((body) => body.includes("the plan was submitted for review"))
+			expect(submissionTurn).toBeGreaterThanOrEqual(0)
+			expect(bodies[submissionTurn]).toContain("Plan submitted")
+			expect(bodies.findIndex((body) => body.includes("check-in pending (input revision 1)"))).toBeGreaterThan(
+				submissionTurn,
+			)
+			// The approval turn still ran after the gate-forced reconciliation.
+			expect(bodies.some((body) => body.includes("The user approved the plan"))).toBe(true)
+			// The reconciliation the gate forced is visible in the final state.
+			terminal.submit("/todos")
+			await waitForText(terminal, "1/1 done · 0 active", { timeoutMs: STREAM_TIMEOUT_MS, full: false })
+			trace.step("stale submission → armed gate → blocked work → reconcile → execute")
 		},
 	)
 })
