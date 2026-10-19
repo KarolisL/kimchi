@@ -79,9 +79,10 @@ export interface WriteTodosParams {
 
 /** Origin of a todo store write. Determines whether the write can
  *  acknowledge user input (see todos/reconciliation.ts): real assistant
- *  and command writes reconcile their scope; background lifecycle sync
- *  (the ferment bridge) and unattributed writes do not. */
-export type TodoWriteOrigin = "tool" | "command" | "bridge"
+ *  (tool) and command writes reconcile their scope; unattributed writes —
+ *  no context passed, e.g. the ferment bridge's background lifecycle
+ *  sync — do not. */
+export type TodoWriteOrigin = "tool" | "command"
 
 /** Context attached to a store write so subscribers can tell real
  *  reconciling writes from background ones. */

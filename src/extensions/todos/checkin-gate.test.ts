@@ -11,10 +11,9 @@ import {
 	handleCheckinReplay,
 	hasEffectivePendingCheckin,
 	hasStalenessGateOpened,
+	markCheckinPending,
 	markStalenessGateOpened,
-	markUserInputPending,
 	reconcileCheckinScope,
-	reconcileCheckinScopeByConfirm,
 	recordStalenessOpening,
 	reportConfirmMismatch,
 	resetScopeEpoch,
@@ -35,9 +34,9 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("coalesces pending checks per scope with superseding revisions", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 2)
-		markUserInputPending("s", [STEP_SCOPE], 2)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 2)
+		markCheckinPending([STEP_SCOPE], "s", 2)
 
 		const pending = getPendingCheckins("s")
 		expect(pending).toHaveLength(2)
@@ -47,8 +46,8 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("adds the staleness reason to an existing pending scope without duplicates", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
-		addStalenessPending("s", GLOBAL_TODO_SCOPE, 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
+		addStalenessPending(GLOBAL_TODO_SCOPE, "s", 1)
 
 		const pending = getPendingCheckins("s")
 		expect(pending).toHaveLength(1)
@@ -56,34 +55,34 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("reconcile closes only when acknowledging at least the pending revision", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 3)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 3)
 
 		// A write admitted before newer input cannot satisfy the newer check.
-		expect(reconcileCheckinScope("s", GLOBAL_TODO_SCOPE, 2)).toBe(false)
+		expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 2)).toBe(false)
 		expect(getPendingCheckins("s")).toHaveLength(1)
 
-		expect(reconcileCheckinScope("s", GLOBAL_TODO_SCOPE, 3)).toBe(true)
+		expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 3)).toBe(true)
 		expect(getPendingCheckins("s")).toHaveLength(0)
 
 		// Reconciling again is a no-op.
-		expect(reconcileCheckinScope("s", GLOBAL_TODO_SCOPE, 4)).toBe(false)
+		expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 4)).toBe(false)
 	})
 
 	it("reconcile by confirm closes the check and resets the epoch flag", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
-		markStalenessGateOpened("s", GLOBAL_TODO_SCOPE)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
+		markStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")
 
 		const changes: string[] = []
 		const unsubscribe = subscribeCheckinGate((_sessionId, change) => changes.push(change.kind))
 		try {
-			expect(reconcileCheckinScopeByConfirm("s", GLOBAL_TODO_SCOPE, 1)).toBe(true)
+			expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 1, "confirm")).toBe(true)
 		} finally {
 			unsubscribe()
 		}
 
 		expect(changes).toEqual(["reconciled"])
 		expect(getPendingCheckins("s")).toHaveLength(0)
-		expect(hasStalenessGateOpened("s", GLOBAL_TODO_SCOPE)).toBe(false)
+		expect(hasStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")).toBe(false)
 	})
 
 	it("a confirmation without a pending check still notifies, resetting the schedule", () => {
@@ -93,7 +92,7 @@ describe("check-in gate bookkeeping", () => {
 			// No pending check: nothing closes (false), but the reconciled
 			// notification still fires — the staleness schedule must reset like
 			// it does for a write.
-			expect(reconcileCheckinScopeByConfirm("s", GLOBAL_TODO_SCOPE, 1)).toBe(false)
+			expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 1, "confirm")).toBe(false)
 		} finally {
 			unsubscribe()
 		}
@@ -101,12 +100,12 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("confirm mismatches notify without closing anything", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
 		const changes: string[] = []
 		const unsubscribe = subscribeCheckinGate((_sessionId, change) => changes.push(change.kind))
 		try {
-			reportConfirmMismatch("s", GLOBAL_TODO_SCOPE, "mismatch")
-			reportConfirmMismatch("s", GLOBAL_TODO_SCOPE, "stale_revision")
+			reportConfirmMismatch(GLOBAL_TODO_SCOPE, "s", "mismatch")
+			reportConfirmMismatch(GLOBAL_TODO_SCOPE, "s", "stale_revision")
 		} finally {
 			unsubscribe()
 		}
@@ -116,15 +115,15 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("drops pending entries for scopes that are no longer relevant", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE, STEP_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE, STEP_SCOPE], "s", 1)
 		dropIrrelevantPending("s", [GLOBAL_TODO_SCOPE])
 
 		expect(getPendingCheckins("s").map((check) => check.scope)).toEqual([GLOBAL_TODO_SCOPE])
 	})
 
 	it("isolates pending checks between sessions and disposes per session", () => {
-		markUserInputPending("a", [GLOBAL_TODO_SCOPE], 1)
-		markUserInputPending("b", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "a", 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "b", 1)
 
 		disposeCheckinGateSession("a")
 		expect(getPendingCheckins("a")).toHaveLength(0)
@@ -132,12 +131,12 @@ describe("check-in gate bookkeeping", () => {
 	})
 
 	it("staleness epoch flags are per scope and reset on writes to that scope", () => {
-		markStalenessGateOpened("s", GLOBAL_TODO_SCOPE)
-		expect(hasStalenessGateOpened("s", GLOBAL_TODO_SCOPE)).toBe(true)
-		expect(hasStalenessGateOpened("s", STEP_SCOPE)).toBe(false)
+		markStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")
+		expect(hasStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")).toBe(true)
+		expect(hasStalenessGateOpened(STEP_SCOPE, "s")).toBe(false)
 
-		resetScopeEpoch("s", GLOBAL_TODO_SCOPE)
-		expect(hasStalenessGateOpened("s", GLOBAL_TODO_SCOPE)).toBe(false)
+		resetScopeEpoch(GLOBAL_TODO_SCOPE, "s")
+		expect(hasStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")).toBe(false)
 	})
 
 	it("the opening budget caps at two per request and resets on a new request", () => {
@@ -154,29 +153,29 @@ describe("check-in gate bookkeeping", () => {
 	it("closing a pending check does not erase the opening budget", () => {
 		recordStalenessOpening("s", 1)
 		recordStalenessOpening("s", 1)
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
 
-		expect(reconcileCheckinScope("s", GLOBAL_TODO_SCOPE, 1)).toBe(true)
+		expect(reconcileCheckinScope(GLOBAL_TODO_SCOPE, "s", 1)).toBe(true)
 		expect(getPendingCheckins("s")).toHaveLength(0)
 		expect(canOpenStalenessGate("s", 1)).toBe(false)
 	})
 
 	it("replay clears pending checks, epoch flags, and budgets", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
-		markStalenessGateOpened("s", GLOBAL_TODO_SCOPE)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
+		markStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")
 		recordStalenessOpening("s", 1)
 
 		handleCheckinReplay("s")
 
 		expect(getPendingCheckins("s")).toHaveLength(0)
-		expect(hasStalenessGateOpened("s", GLOBAL_TODO_SCOPE)).toBe(false)
+		expect(hasStalenessGateOpened(GLOBAL_TODO_SCOPE, "s")).toBe(false)
 		// The budget belongs to the request revision, which replay does not
 		// advance (historical messages are not fresh input).
 		expect(canOpenStalenessGate("s", 1)).toBe(true)
 	})
 
 	it("enforcement release suppresses publication but preserves the raw checks", () => {
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
 		expect(hasEffectivePendingCheckin("s")).toBe(true)
 
 		const changes: string[] = []
@@ -206,15 +205,15 @@ describe("check-in gate bookkeeping", () => {
 		const listener = vi.fn()
 		const unsubscribe = subscribeCheckinGate(listener)
 
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
 		expect(listener).toHaveBeenCalledTimes(1)
 
 		// No-op marks (same revision, same reason) do not notify.
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 1)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 1)
 		expect(listener).toHaveBeenCalledTimes(1)
 
 		unsubscribe()
-		markUserInputPending("s", [GLOBAL_TODO_SCOPE], 2)
+		markCheckinPending([GLOBAL_TODO_SCOPE], "s", 2)
 		expect(listener).toHaveBeenCalledTimes(1)
 	})
 })

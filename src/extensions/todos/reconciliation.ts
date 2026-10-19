@@ -11,6 +11,7 @@
  * All state here is volatile: it never touches the persisted todo state
  * block (#1166 cache-stability contract) and is disposed with its session.
  */
+import { getOrCreateInnerMap } from "./nested-maps.js"
 import { getTodoScopeKey } from "./scope.js"
 import { getTodoScopeVersion, getWorkToolCalls } from "./store.js"
 import type { TodoScope } from "./types.js"
@@ -49,12 +50,7 @@ const reconciliations = new Map<string, Map<string, ScopeReconciliationRecord>>(
  *  drift can be detected: newer input, completed work, or an
  *  unacknowledged write all invalidate the record. */
 export function recordScopeReconciliation(scope: TodoScope, sessionId: string, inputRevision: number): void {
-	let byScope = reconciliations.get(sessionId)
-	if (!byScope) {
-		byScope = new Map()
-		reconciliations.set(sessionId, byScope)
-	}
-	byScope.set(getTodoScopeKey(scope), {
+	getOrCreateInnerMap(reconciliations, sessionId).set(getTodoScopeKey(scope), {
 		inputRevision,
 		listVersion: getTodoScopeVersion(scope, sessionId),
 		workSequence: getWorkToolCalls(sessionId),
@@ -109,12 +105,7 @@ export function clearScopeReconciliations(sessionId: string): void {
 const admittedInputRevisions = new Map<string, Map<string, number>>()
 
 export function recordAdmittedInputRevision(sessionId: string, toolCallId: string, revision: number): void {
-	let byCall = admittedInputRevisions.get(sessionId)
-	if (!byCall) {
-		byCall = new Map()
-		admittedInputRevisions.set(sessionId, byCall)
-	}
-	byCall.set(toolCallId, revision)
+	getOrCreateInnerMap(admittedInputRevisions, sessionId).set(toolCallId, revision)
 }
 
 export function getAdmittedInputRevision(sessionId: string, toolCallId: string): number | undefined {

@@ -1,8 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
-import { reconcileCheckinScopeByConfirm, reportConfirmMismatch } from "./checkin-gate.js"
+import { reconcileCheckinScope, reportConfirmMismatch } from "./checkin-gate.js"
 import { getAdmittedInputRevision, getInputRevision, recordScopeReconciliation } from "./reconciliation.js"
 import { validateExplicitTodoScope } from "./scope.js"
+import { renderTodoEntries } from "./state-markdown.js"
 import { applyTodoMutation, applyWriteTodos, getTodosForScope, resolveTodoScope } from "./store.js"
 import {
 	TODO_STATUSES,
@@ -382,10 +383,10 @@ const CONFIRM_TODOS_PARAMETERS = Type.Object({
 	),
 })
 
-/** Compact one-line rendering of a list for confirm_todos read-backs. */
+/** Compact one-line rendering of a list for confirm_todos read-backs,
+ *  sharing the entry format with every other check-in surface. */
 function renderTodosForConfirm(todos: readonly TodoItem[]): string {
-	if (todos.length === 0) return "(the list is empty)"
-	return todos.map((todo) => `#${todo.id} [${todo.status}] ${todo.content}`).join("; ")
+	return renderTodoEntries(todos, { empty: "(the list is empty)", separator: "; " })
 }
 
 /** Confirm that a list still matches the current plan without writing it.
@@ -410,20 +411,8 @@ async function executeConfirmTodos(
 		const currentRevision = getInputRevision(sessionId)
 		const label = formatScopeLabel(scope)
 
-		if (typeof params.inputRevision !== "number" || !Number.isInteger(params.inputRevision)) {
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: "confirm_todos requires the current input revision from the todo check-in instructions.",
-					},
-				],
-				details: null,
-			}
-		}
-
 		if (params.inputRevision !== currentRevision) {
-			reportConfirmMismatch(sessionId, scope, "stale_revision")
+			reportConfirmMismatch(scope, sessionId, "stale_revision")
 			return {
 				content: [
 					{
@@ -435,20 +424,17 @@ async function executeConfirmTodos(
 			}
 		}
 
-		const expected = Array.isArray(params.expected) ? params.expected : []
+		// Item shape (numeric id, status one of the four literals) is guaranteed
+		// by the Typebox schema; only genuine set mismatches are validated here.
 		const seen = new Set<number>()
 		const problems: string[] = []
-		for (const item of expected) {
-			const id = typeof item?.id === "number" && Number.isInteger(item.id) && item.id > 0 ? item.id : undefined
-			if (id === undefined) {
-				problems.push(`invalid id ${String(item?.id)}`)
+		for (const item of params.expected) {
+			if (!Number.isInteger(item.id) || item.id <= 0) {
+				problems.push(`invalid id ${item.id}`)
 				continue
 			}
-			if (seen.has(id)) problems.push(`duplicate id ${id}`)
-			seen.add(id)
-			if (typeof item?.status === "string" && !TODO_STATUSES.includes(item.status as TodoStatus)) {
-				problems.push(`invalid status '${String(item.status)}' for id ${id}`)
-			}
+			if (seen.has(item.id)) problems.push(`duplicate id ${item.id}`)
+			seen.add(item.id)
 		}
 		const currentIds = new Set(todos.map((todo) => todo.id))
 		for (const id of seen) {
@@ -458,11 +444,11 @@ async function executeConfirmTodos(
 			if (!seen.has(id)) problems.push(`missing id ${id}`)
 		}
 		const mismatched = todos.filter((todo) => {
-			const item = expected.find((entry) => entry?.id === todo.id)
+			const item = params.expected.find((entry) => entry.id === todo.id)
 			return !item || item.status !== todo.status
 		})
 		if (problems.length > 0 || mismatched.length > 0) {
-			reportConfirmMismatch(sessionId, scope, "mismatch")
+			reportConfirmMismatch(scope, sessionId, "mismatch")
 			const reasons = [...new Set(problems)]
 			if (mismatched.length > 0) reasons.push("status mismatches")
 			return {
@@ -480,7 +466,7 @@ async function executeConfirmTodos(
 		// write. Reconciliation is recorded for closure suppression and the
 		// gate closes via its own change notification (no synthetic write).
 		recordScopeReconciliation(scope, sessionId, currentRevision)
-		reconcileCheckinScopeByConfirm(sessionId, scope, currentRevision)
+		reconcileCheckinScope(scope, sessionId, currentRevision, "confirm")
 		return {
 			content: [
 				{

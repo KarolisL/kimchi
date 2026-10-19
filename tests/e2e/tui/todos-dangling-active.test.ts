@@ -226,7 +226,7 @@ test("check-in gate: ignoring staleness reminders escalates, a wrong confirm is 
 			expect(history).toContain("check-in pending (input revision 1)")
 			// The wrong confirmation was rejected with the actual state…
 			expect(history).toContain("status mismatches")
-			expect(history).toContain("#1 [in_progress] Long task")
+			expect(history).toContain("[in_progress] #1 Long task")
 			// …and work resumed after the matching confirmation.
 			expect(viewText(terminal)).toContain("All checked in and verified.")
 			expect(viewText(terminal)).toContain("0/1 done · 1 active")

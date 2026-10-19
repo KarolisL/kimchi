@@ -126,9 +126,9 @@ export function getRelevantCheckinScopes(sessionId: string): TodoScope[] {
  *  (a request boundary: new user direction) or `plan_submission` (the
  *  submit_plan handoff: work completed while finalizing the plan is not yet
  *  reflected) — without changing the reconciliation contract. */
-export function markUserInputPending(
-	sessionId: string,
+export function markCheckinPending(
 	scopes: readonly TodoScope[],
+	sessionId: string,
 	inputRevision: number,
 	reason: CheckinReason = "user_input",
 ): void {
@@ -159,7 +159,7 @@ export function markUserInputPending(
 /** Add the staleness reason to a scope's pending check. A scope already
  *  pending for user input gets the additional reason without a duplicate
  *  message. */
-export function addStalenessPending(sessionId: string, scope: TodoScope, inputRevision: number): void {
+export function addStalenessPending(scope: TodoScope, sessionId: string, inputRevision: number): void {
 	const state = sessionState(sessionId)
 	const scopeKey = getTodoScopeKey(scope)
 	const existing = state.pendingByScope.get(scopeKey)
@@ -179,29 +179,22 @@ export function addStalenessPending(sessionId: string, scope: TodoScope, inputRe
 /** Reconcile a scope: closes its pending check when the reconciliation
  *  acknowledges at least the pending input revision (a write admitted
  *  before newer user input cannot satisfy the newer check). Returns
- *  whether a pending check closed. */
-export function reconcileCheckinScope(sessionId: string, scope: TodoScope, inputRevision: number): boolean {
-	const state = sessionState(sessionId)
-	const scopeKey = getTodoScopeKey(scope)
-	const existing = state.pendingByScope.get(scopeKey)
-	if (!existing || existing.inputRevision > inputRevision) return false
-	state.pendingByScope.delete(scopeKey)
-	// The write-epoch flag resets with the epoch: a reconciled list may
-	// escalate again in a later epoch if it is neglected again.
-	state.stalenessOpenedEpochs.delete(scopeKey)
-	notify(sessionId, { kind: "reconciled", scope, method: "write" })
-	return true
-}
-
-/** Record a successful confirmation: like a write, but published with the
- *  `confirm` method so surfaces and telemetry can distinguish it.
+ *  whether a pending check closed.
  *
- *  A successful confirmation ALWAYS resets the scope's staleness schedule
- *  (via the reconciled subscribers), even when no check was pending —
- *  confirming an accurate list at call 23 restarts the reminder cadence
- *  just like a write would. Only a confirmation against an older revision
- *  than a pending check's is refused (stale acknowledgement). */
-export function reconcileCheckinScopeByConfirm(sessionId: string, scope: TodoScope, inputRevision: number): boolean {
+ *  The method asymmetry is deliberate: a write only publishes when a
+ *  check actually closed (its staleness resets ride the store-change
+ *  subscribers), while a confirmation always publishes — there is no
+ *  store write, so the `reconciled` notification doubles as the trigger
+ *  that resets the scope's staleness schedule even when no check was
+ *  pending. Confirming an accurate list at call 23 restarts the reminder
+ *  cadence just like a write would; only a confirmation against an older
+ *  revision than a pending check's is refused (stale acknowledgement). */
+export function reconcileCheckinScope(
+	scope: TodoScope,
+	sessionId: string,
+	inputRevision: number,
+	method: "write" | "confirm" = "write",
+): boolean {
 	const state = sessionState(sessionId)
 	const scopeKey = getTodoScopeKey(scope)
 	const existing = state.pendingByScope.get(scopeKey)
@@ -209,17 +202,21 @@ export function reconcileCheckinScopeByConfirm(sessionId: string, scope: TodoSco
 	const closed = existing !== undefined
 	if (closed) {
 		state.pendingByScope.delete(scopeKey)
+		// The write-epoch flag resets with the epoch: a reconciled list may
+		// escalate again in a later epoch if it is neglected again.
 		state.stalenessOpenedEpochs.delete(scopeKey)
 	}
-	notify(sessionId, { kind: "reconciled", scope, method: "confirm" })
+	if (closed || method === "confirm") {
+		notify(sessionId, { kind: "reconciled", scope, method })
+	}
 	return closed
 }
 
 /** Report a failed confirmation attempt (wrong expected set, or a stale
  *  input revision). Checks stay pending. */
 export function reportConfirmMismatch(
-	sessionId: string,
 	scope: TodoScope,
+	sessionId: string,
 	method: "mismatch" | "stale_revision",
 ): void {
 	notify(sessionId, { kind: "confirm_mismatch", scope, method })
@@ -288,18 +285,18 @@ export function isScopeCheckedIn(scope: TodoScope, sessionId: string): boolean {
 
 /** True when a staleness gate has already opened for this scope in the
  *  current write-epoch. */
-export function hasStalenessGateOpened(sessionId: string, scope: TodoScope): boolean {
+export function hasStalenessGateOpened(scope: TodoScope, sessionId: string): boolean {
 	return gateStates.get(sessionId)?.stalenessOpenedEpochs.has(getTodoScopeKey(scope)) ?? false
 }
 
 /** Mark that the staleness gate opened for this scope in this epoch. */
-export function markStalenessGateOpened(sessionId: string, scope: TodoScope): void {
+export function markStalenessGateOpened(scope: TodoScope, sessionId: string): void {
 	sessionState(sessionId).stalenessOpenedEpochs.add(getTodoScopeKey(scope))
 }
 
 /** Start a new staleness epoch for a scope (any write or confirmation to
  *  the list re-arms escalation). */
-export function resetScopeEpoch(sessionId: string, scope: TodoScope): void {
+export function resetScopeEpoch(scope: TodoScope, sessionId: string): void {
 	const state = gateStates.get(sessionId)
 	if (state) state.stalenessOpenedEpochs.delete(getTodoScopeKey(scope))
 }

@@ -1,6 +1,6 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { __resetCheckinGate, markUserInputPending, reconcileCheckinScope } from "../../extensions/todos/checkin-gate.js"
+import { __resetCheckinGate, markCheckinPending, reconcileCheckinScope } from "../../extensions/todos/checkin-gate.js"
 import { __resetReconciliationBookkeeping, advanceInputRevision } from "../../extensions/todos/reconciliation.js"
 import { __resetTodoStore, applyWriteTodos, restoreTodoStoreFromDetails } from "../../extensions/todos/store.js"
 import { TODO_TOOL_RESULT_SCHEMA_VERSION, type TodoItem } from "../../extensions/todos/types.js"
@@ -247,7 +247,7 @@ describe("AcpPlanTracker", () => {
 			// A gate change with unchanged todo entries still emits — the
 			// metadata is part of the deduplication key.
 			const revision = advanceInputRevision("session-a")
-			markUserInputPending("session-a", [{ kind: "global" }], revision)
+			markCheckinPending([{ kind: "global" }], "session-a", revision)
 
 			expect(notifications).toHaveLength(2)
 			expect(planUpdates(notifications).at(-1)).toEqual({
@@ -267,9 +267,9 @@ describe("AcpPlanTracker", () => {
 			tracker.start()
 			applyWriteTodos({ todos: [{ content: "work", status: "pending" }] }, "session-a")
 			advanceInputRevision("session-a")
-			markUserInputPending("session-a", [{ kind: "global" }], 1)
+			markCheckinPending([{ kind: "global" }], "session-a", 1)
 			const revision = advanceInputRevision("session-a")
-			markUserInputPending("session-a", [{ kind: "global" }], revision)
+			markCheckinPending([{ kind: "global" }], "session-a", revision)
 
 			const update = planUpdates(notifications).at(-1)
 			expect(todoCheckinOf(update)).toEqual({
@@ -283,12 +283,12 @@ describe("AcpPlanTracker", () => {
 			tracker.start()
 			applyWriteTodos({ todos: [{ content: "work", status: "pending" }] }, "session-a")
 			const revision = advanceInputRevision("session-a")
-			markUserInputPending("session-a", [{ kind: "global" }], revision)
+			markCheckinPending([{ kind: "global" }], "session-a", revision)
 			expect(todoCheckinOf(notifications.at(-1)?.update)?.pendingScopes).toEqual([{ kind: "global" }])
 
 			// Reconciliation closes the gate: the entries stay as they were and
 			// pendingScopes is explicitly empty.
-			reconcileCheckinScope("session-a", { kind: "global" }, revision)
+			reconcileCheckinScope({ kind: "global" }, "session-a", revision)
 
 			expect(todoCheckinOf(planUpdates(notifications).at(-1))).toEqual({
 				inputRevision: 1,
@@ -302,11 +302,11 @@ describe("AcpPlanTracker", () => {
 			applyWriteTodos({ todos: [{ content: "work", status: "pending" }] }, "session-a")
 
 			// Another session's gate change must not emit on this tracker.
-			markUserInputPending("session-b", [{ kind: "global" }], 1)
+			markCheckinPending([{ kind: "global" }], "session-b", 1)
 			expect(notifications).toHaveLength(1)
 
 			tracker.stop()
-			markUserInputPending("session-a", [{ kind: "global" }], 1)
+			markCheckinPending([{ kind: "global" }], "session-a", 1)
 			expect(notifications).toHaveLength(1)
 		})
 	})

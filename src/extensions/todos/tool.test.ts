@@ -79,7 +79,7 @@ describe("confirm_todos", () => {
 
 		expect(result.details).toBeNull()
 		expect(result.content[0].text).toContain("accepted input revision is now 0")
-		expect(result.content[0].text).toContain("#1 [pending] alpha")
+		expect(result.content[0].text).toContain("[pending] #1 alpha")
 	})
 
 	it("rejects wrong expected sets: missing, extra, duplicate, and mismatched statuses", async () => {
@@ -103,7 +103,7 @@ describe("confirm_todos", () => {
 		)
 		expect(wrongStatus.details).toBeNull()
 		expect(wrongStatus.content[0].text).toContain("status mismatches")
-		expect(wrongStatus.content[0].text).toContain("#2 [completed] bravo")
+		expect(wrongStatus.content[0].text).toContain("[completed] #2 bravo")
 
 		const missingId = await tools.confirm_todos.execute(
 			"confirm-2",

@@ -1,5 +1,6 @@
 import { isAgentWorker } from "../agent-worker-context.js"
 import { isStaleCtxError } from "../stale-ctx.js"
+import { getOrCreateInnerMap } from "./nested-maps.js"
 import { createEmptyTodosSliceState, reduceReplaceList } from "./reducer.js"
 import { getTodoScopeKey, normalizeTodoScope } from "./scope.js"
 import type {
@@ -36,12 +37,8 @@ export function getTodoScopeVersion(scope: TodoScope, sessionId: string): number
 }
 
 function bumpTodoScopeVersion(scope: TodoScope, sessionId: string): void {
+	const byScope = getOrCreateInnerMap(scopeWriteVersions, sessionId)
 	const scopeKey = getTodoScopeKey(scope)
-	let byScope = scopeWriteVersions.get(sessionId)
-	if (!byScope) {
-		byScope = new Map()
-		scopeWriteVersions.set(sessionId, byScope)
-	}
 	byScope.set(scopeKey, (byScope.get(scopeKey) ?? 0) + 1)
 }
 
@@ -75,12 +72,8 @@ export function getToolCallsSinceTodoWrite(scope: TodoScope, sessionId: string):
 /** Increment the staleness counter for one scope's list and return the new
  *  post-increment count. */
 export function bumpToolCallsSinceTodoWrite(scope: TodoScope, sessionId: string): number {
+	const byScope = getOrCreateInnerMap(toolCallsSinceTodoWrite, sessionId)
 	const scopeKey = getTodoScopeKey(scope)
-	let byScope = toolCallsSinceTodoWrite.get(sessionId)
-	if (!byScope) {
-		byScope = new Map()
-		toolCallsSinceTodoWrite.set(sessionId, byScope)
-	}
 	const next = (byScope.get(scopeKey) ?? 0) + 1
 	byScope.set(scopeKey, next)
 	return next

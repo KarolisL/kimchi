@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { emitSteerFired, isSteerDisabled, type SteerKind, type SteerReason } from "../steer-events.js"
 import { markHarnessSteer } from "../steer-marker.js"
 import { watchSteerOutcome } from "../steer-outcome-watcher.js"
+import { getOrCreateInnerMap } from "./nested-maps.js"
 import type { TodoScope } from "./types.js"
 
 /**
@@ -147,16 +148,11 @@ export function createIntervalSteerTracker(): {
 	const bandsBySession = new Map<string, Map<string, ScopeIntervalBands>>()
 
 	function scopeBands(sessionId: string, scopeKey: string): ScopeIntervalBands {
-		let byScope = bandsBySession.get(sessionId)
-		if (!byScope) {
-			byScope = new Map()
-			bandsBySession.set(sessionId, byScope)
-		}
-		let bands = byScope.get(scopeKey)
-		if (!bands) {
-			bands = { lastDelivered: 0 }
-			byScope.set(scopeKey, bands)
-		}
+		const byScope = getOrCreateInnerMap(bandsBySession, sessionId)
+		const existing = byScope.get(scopeKey)
+		if (existing) return existing
+		const bands: ScopeIntervalBands = { lastDelivered: 0 }
+		byScope.set(scopeKey, bands)
 		return bands
 	}
 
@@ -221,16 +217,11 @@ export function createThresholdSteerTracker(): {
 	const bandsBySession = new Map<string, Map<string, ScopeBands>>()
 
 	function scopeBands(sessionId: string, scopeKey: string): ScopeBands {
-		let byScope = bandsBySession.get(sessionId)
-		if (!byScope) {
-			byScope = new Map()
-			bandsBySession.set(sessionId, byScope)
-		}
-		let bands = byScope.get(scopeKey)
-		if (!bands) {
-			bands = { fired: new Set() }
-			byScope.set(scopeKey, bands)
-		}
+		const byScope = getOrCreateInnerMap(bandsBySession, sessionId)
+		const existing = byScope.get(scopeKey)
+		if (existing) return existing
+		const bands: ScopeBands = { fired: new Set() }
+		byScope.set(scopeKey, bands)
 		return bands
 	}
 
