@@ -40,6 +40,10 @@ export const ARTIFACT_EXTENSIONS: Record<string, string> = {
 	".gif": "image/gif",
 	".webp": "image/webp",
 	".svg": "image/svg+xml",
+	".md": "text/markdown",
+	".markdown": "text/markdown",
+	".zip": "application/zip",
+	".ics": "text/calendar",
 }
 
 // Upper bound on artifacts reported per bash result scan — a pathological

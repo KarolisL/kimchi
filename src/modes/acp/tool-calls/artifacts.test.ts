@@ -29,13 +29,20 @@ function textResult(text: string, isError = false) {
 describe("artifactsFromToolCall", () => {
 	it("keeps the bash sniff regex in sync with ARTIFACT_EXTENSIONS", () => {
 		// PATH_TOKEN inlines the extension list (regex literal); every
-		// allowlisted extension must be sniff-detectable from bash output.
+		// allowlisted extension must be detectable BOTH from bash output (regex)
+		// and from write/edit args (map lookup) — a drift in either list
+		// silently disables one path.
 		for (const ext of Object.keys(ARTIFACT_EXTENSIONS)) {
 			const out = artifactsFromToolCall("bash", {}, textResult(`wrote file${ext}`), cwd, { verifyExists: false })
 			expect(
 				out.map((a) => a.name),
-				`extension ${ext}`,
+				`bash sniff of file${ext}`,
 			).toEqual([`file${ext}`])
+			const abs = touch(`w${ext}`)
+			expect(
+				artifactsFromToolCall("write", { path: `w${ext}` }, textResult("ok"), cwd).map((a) => a.path),
+				`write detection of w${ext}`,
+			).toEqual([abs])
 		}
 	})
 
