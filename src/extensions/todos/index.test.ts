@@ -1074,11 +1074,57 @@ describe("plan-submission check-in gate", () => {
 	const submitPlan = (harness: ReturnType<typeof createTodosHarness>, ctx: ExtensionContext) =>
 		harness.fire("tool_execution_end", { toolName: "submit_plan", isError: false }, ctx)
 
+	const fireInput = (
+		harness: ReturnType<typeof createTodosHarness>,
+		ctx: ExtensionContext,
+		text = "Now do it differently",
+	) => harness.fire("input", { type: "input", text, source: "interactive" }, ctx)
+
 	beforeEach(() => {
 		__resetTodoStore()
 		__resetCheckinGate()
 		__resetReconciliationBookkeeping()
 		isResourceEnabledMock.mockReturnValue(true)
+	})
+
+	it("blocks submit_plan while a check is pending and releases it after reconciliation", async () => {
+		const harness = createTodosHarness()
+		const ctx = createContext("session", [])
+		await harness.fire("session_start", { reason: "new" }, ctx)
+		applyWriteTodos({ todos: [{ content: "task", status: "in_progress" }] }, "session", {
+			origin: "tool",
+			inputRevision: 0,
+		})
+
+		const submitCall = (toolCallId: string) =>
+			harness.fire("tool_call", { type: "tool_call", toolCallId, toolName: "submit_plan", input: {} }, ctx)
+
+		// No check pending: the submission itself is admitted.
+		expect(await submitCall("p0")).toEqual({ block: false })
+
+		// Genuine user input arms the gate; submit_plan is gated like every
+		// other non-reconciliation tool — the plan handoff must carry
+		// reconciled todos, so a stale list cannot be frozen into the review.
+		await fireInput(harness, ctx)
+		const blocked = await submitCall("p1")
+		expect(blocked).toMatchObject({ block: true })
+		expect((blocked as { reason?: string }).reason).toContain("check-in pending (input revision 1)")
+		expect((blocked as { reason?: string }).reason).toContain("submitting a plan included")
+
+		// A reflecting write against the current revision releases the gate…
+		applyWriteTodos({ todos: [{ id: 1, content: "task", status: "pending" }] }, "session", {
+			origin: "tool",
+			inputRevision: 1,
+		})
+		expect(await submitCall("p2")).toEqual({ block: false })
+
+		// …and so does a matching confirmation after newer input re-arms it.
+		await fireInput(harness, ctx, "Second thought")
+		expect(await submitCall("p3")).toMatchObject({ block: true })
+		await harness
+			.registeredTool("confirm_todos")
+			.execute("c1", { inputRevision: 2, expected: [{ id: 1, status: "pending" }] }, undefined, undefined, ctx)
+		expect(await submitCall("p4")).toEqual({ block: false })
 	})
 
 	it("arms the gate when work completed while finalizing the plan is unreflected", async () => {

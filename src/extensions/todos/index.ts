@@ -187,7 +187,7 @@ function checkinInstructionText(pending: readonly CheckinPending[], sessionId: s
  *  repeated steer messages. */
 function checkinBlockReason(pending: readonly CheckinPending[], sessionId: string, revision: number): string {
 	return [
-		`⏸ Todo check-in pending (input revision ${revision}). Reconcile the todo list with the user's latest direction and the work already done before starting further work tools: add newly requested work, remove obsolete items, revise statuses — or, if a list is still accurate, confirm it with confirm_todos, passing its complete current id+status set and inputRevision ${revision}. Finish the reconciliation tool round first; do not batch reconciliation in parallel with work tools.`,
+		`⏸ Todo check-in pending (input revision ${revision}). Reconcile the todo list with the user's latest direction and the work already done before starting further work tools: add newly requested work, remove obsolete items, revise statuses — or, if a list is still accurate, confirm it with confirm_todos, passing its complete current id+status set and inputRevision ${revision}. Finish the reconciliation tool round first; do not batch reconciliation in parallel with work tools. Every non-todo tool is gated — submitting a plan included: reconcile or confirm the list first, then proceed.`,
 		...checkinListBlocks(
 			pending.map((check) => check.scope),
 			sessionId,
@@ -347,9 +347,12 @@ export default function todosExtension(pi: ExtensionAPI): void {
 		syncTodoWidget(ctx)
 	})
 
-	// Work-tool admission gate. Todo reconciliation tools pass through;
-	// work tools are blocked while any relevant check is pending. The block
-	// reason carries current instructions on every call.
+	// Work-tool admission gate. Only reconciliation tools (todo writes,
+	// confirm_todos) pass through; every other tool is blocked while any
+	// relevant check is pending — including submit_plan, deliberately: the
+	// plan handoff must carry reconciled todos, so a stale list cannot be
+	// frozen into the user-review boundary. The block reason carries
+	// current instructions on every call.
 	pi.on("tool_call", (event, ctx) => {
 		const toolName = event.toolName
 		if (!toolName) return { block: false }
