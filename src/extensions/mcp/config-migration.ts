@@ -19,7 +19,17 @@
  * - no live `imports:` semantics (agent-discovery one-shot import flows stay);
  * - no preservation of adapter-only fields (dropped-with-report policy).
  */
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import stripJsonComments from "strip-json-comments"
@@ -461,6 +471,10 @@ const MIGRATION_LOCK = "mcp-native-migration.lock"
 export function runNativeMcpMigration(options: RunMigrationOptions): RunMigrationResult {
 	const stampPath = join(options.agentDir, MIGRATION_STAMP)
 	if (existsSync(stampPath)) return { migrated: false }
+	// Fresh installs have no agent dir yet (this runs before pi creates it);
+	// create it instead of failing the lock claim with ENOENT and deferring
+	// the migration to a later launch.
+	mkdirSync(options.agentDir, { recursive: true })
 	const lockPath = join(options.agentDir, MIGRATION_LOCK)
 	if (!claimMigration(lockPath)) return { migrated: false }
 

@@ -78,6 +78,19 @@ describe("runNativeMcpMigration", () => {
 		expect(statSync(join(agentDir, "mcp.json")).mode & 0o777).toBe(0o600)
 	})
 
+	it("creates a missing agent dir instead of failing the migration on a fresh install", () => {
+		const { root, project } = fixture()
+		const agentDir = join(root, "fresh", "agent")
+		writeJson(join(project, ".kimchi", "mcp.json"), {
+			mcpServers: { srv: { command: "srv", disabled: true } },
+		})
+		const result = runNativeMcpMigration({ agentDir, cwd: project })
+		expect(result.migrated).toBe(true)
+		expect(existsSync(join(agentDir, MIGRATION_STAMP))).toBe(true)
+		const migrated = JSON.parse(readFileSync(join(project, ".kimchi", "mcp.json"), "utf8"))
+		expect(migrated.mcpServers.srv.enabled).toBe(false)
+	})
+
 	it("translates literal bearerToken into a header and warns", () => {
 		const { agentDir, project } = fixture()
 		writeJson(join(agentDir, "mcp.json"), { mcpServers: { s: { url: "https://x", bearerToken: "abc" } } })
