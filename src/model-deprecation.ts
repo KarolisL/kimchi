@@ -25,6 +25,11 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { debuglog } from "node:util"
+
+/** Deprecation diagnostics — silent unless NODE_DEBUG=kimchi:models.
+ *  Raw console writes corrupt the interactive TUI. */
+const debug = debuglog("kimchi:models")
 
 /** Mirrors the metadata API's ModelAlternative contract ({slug, reason}). */
 export interface ModelAlternative {
@@ -61,7 +66,7 @@ function parseIsoDate(value: string | undefined, fieldName: string, slug?: strin
 	if (!value) return undefined
 	const ms = Date.parse(value)
 	if (Number.isNaN(ms)) {
-		console.warn(`[model-deprecation] ignoring invalid ${fieldName}${slug ? ` for ${slug}` : ""}: ${value}`)
+		debug(`[model-deprecation] ignoring invalid ${fieldName}${slug ? ` for ${slug}` : ""}: ${value}`)
 		return undefined
 	}
 	return ms

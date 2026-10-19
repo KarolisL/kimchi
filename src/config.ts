@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, relative, resolve } from "node:path"
+import { debuglog } from "node:util"
 import type { RetrySettings } from "@earendil-works/pi-coding-agent"
 import { writeJson } from "./config/json.js"
 import { isProjectScopeAllowed } from "./project-scope-trust.js"
@@ -22,6 +23,10 @@ import {
 	telemetryMetricsUrl,
 } from "./regions.js"
 import { getVersion } from "./utils.js"
+
+/** Config diagnostics — silent unless NODE_DEBUG=kimchi:config.
+ *  Raw console writes corrupt the interactive TUI. */
+const debug = debuglog("kimchi:config")
 
 const KIMCHI_CONFIG_PATH = resolve(homedir(), ".config", "kimchi", "config.json")
 const AGENT_CONFIG_DIR = resolve(homedir(), ".config", "kimchi", "harness")
@@ -262,7 +267,7 @@ export function resolveEffectiveApiKey(cwd: string = process.cwd()): string | un
  */
 export function readApiKeyFromConfigFile(configPath: string = KIMCHI_CONFIG_PATH): string | undefined {
 	const permWarning = checkConfigFilePermissions(configPath)
-	if (permWarning) console.warn(permWarning)
+	if (permWarning) debug(permWarning)
 	try {
 		const raw = readFileSync(configPath, "utf-8")
 		const parsed = JSON.parse(raw)
@@ -614,7 +619,7 @@ export function readTelemetryConfig(configPath?: string): TelemetryConfig {
  */
 function readProjectConfigExtras(projectPath: string): ReturnType<typeof readConfigExtras> {
 	const projectPermWarning = checkConfigFilePermissions(projectPath)
-	if (projectPermWarning) console.warn(projectPermWarning)
+	if (projectPermWarning) debug(projectPermWarning)
 	return readConfigExtras(projectPath)
 }
 
@@ -645,7 +650,7 @@ export function loadConfig(options?: { configPath?: string; cwd?: string }): Kim
 	// Read global config
 	const globalConfigPath = options?.configPath ?? KIMCHI_CONFIG_PATH
 	const globalPermWarning = checkConfigFilePermissions(globalConfigPath)
-	if (globalPermWarning) console.warn(globalPermWarning)
+	if (globalPermWarning) debug(globalPermWarning)
 	const globalExtras = readConfigExtras(globalConfigPath)
 
 	// Read project-level config — only when the project is trusted. An
@@ -805,7 +810,7 @@ function environmentLlmBaseUrl(): string | undefined {
 	if (isValidHttpUrl(trimmed)) return trimmed
 	if (!warnedInvalidLlmBaseUrl) {
 		warnedInvalidLlmBaseUrl = true
-		console.warn(
+		debug(
 			`Ignoring invalid KIMCHI_BASE_URL="${raw}" (expected an http(s) URL, e.g. https://llm.example.com). Using the configured region's endpoints instead.`,
 		)
 	}
@@ -838,7 +843,7 @@ function environmentSelfHostedUrl(): string | undefined {
 	if (normalized !== undefined || !raw?.trim()) return normalized
 	if (!warnedInvalidSelfHostedUrl) {
 		warnedInvalidSelfHostedUrl = true
-		console.warn(
+		debug(
 			`Ignoring invalid KIMCHI_SELF_HOSTED_URL="${raw}" (expected an http(s) URL, e.g. https://kimchi.example.com). Using the stored self-hosted URL instead.`,
 		)
 	}

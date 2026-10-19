@@ -2,6 +2,15 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+// Mock debuglog the same way work-attribution's tests do (#1362): capture the
+// debug logger so routing can be asserted, keeping node:util's other exports.
+const { debug } = vi.hoisted(() => ({ debug: vi.fn() }))
+vi.mock("node:util", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:util")>()),
+	debuglog: () => debug,
+}))
+
 import {
 	applyTuiEnvOverrides,
 	buildSkillPathOptions,
@@ -333,39 +342,36 @@ describe("loadConfig", () => {
 
 	it("warns once and ignores a malformed KIMCHI_BASE_URL", () => {
 		writeFileSync(configPath, JSON.stringify({ apiKey: "my-key", llmEndpoint: "https://custom.example" }))
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		vi.stubEnv("KIMCHI_BASE_URL", "https://")
 
 		const first = loadConfig({ configPath })
 		expect(first.llmEndpoint).toBe("https://custom.example")
 		expect(first.customLlmEndpoint).toBe("https://custom.example")
 
-		// Repeated resolution must not re-warn. (Other console.warn calls — e.g.
+		// Repeated resolution must not re-warn. (Other debuglog calls — e.g.
 		// the group/world-readable config warning — are unrelated and filtered out.)
 		const second = loadConfig({ configPath })
 		expect(second.llmEndpoint).toBe("https://custom.example")
-		const endpointWarns = warn.mock.calls
+		const endpointWarns = debug.mock.calls
 			.map((args) => String(args[0]))
 			.filter((msg) => msg.includes("KIMCHI_BASE_URL"))
 		expect(endpointWarns).toHaveLength(1)
 		expect(endpointWarns[0]).toContain('"https://"')
-
-		warn.mockRestore()
 	})
 
 	it("rejects a non-http KIMCHI_BASE_URL scheme", () => {
 		writeFileSync(configPath, JSON.stringify({ apiKey: "my-key" }))
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		vi.stubEnv("KIMCHI_BASE_URL", "ftp://env.example")
 		const config = loadConfig({ configPath })
 		expect(config.llmEndpoint).toBe("https://llm.kimchi.dev/openai/v1")
 		expect(config.customLlmEndpoint).toBeUndefined()
-		const endpointWarns = warn.mock.calls
+		const endpointWarns = debug.mock.calls
 			.map((args) => String(args[0]))
 			.filter((msg) => msg.includes("KIMCHI_BASE_URL"))
 		expect(endpointWarns).toHaveLength(1)
 		expect(endpointWarns[0]).toContain("ftp://env.example")
-		warn.mockRestore()
 	})
 
 	it("project llmEndpoint overrides global", () => {
@@ -906,11 +912,11 @@ describe("region config", () => {
 
 	it("loadConfig: an invalid KIMCHI_SELF_HOSTED_URL warns once and counts as unset", () => {
 		writeFileSync(configPath, JSON.stringify({ region: "self-hosted", selfHostedUrl: "https://config.example.com" }))
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		resetInvalidSelfHostedUrlWarningForTests()
 		// Only the self-hosted warning; the temp file's loose permissions warn separately.
 		const selfHostedWarnings = () =>
-			warnSpy.mock.calls.map((call) => String(call[0])).filter((message) => message.includes("KIMCHI_SELF_HOSTED_URL"))
+			debug.mock.calls.map((call) => String(call[0])).filter((message) => message.includes("KIMCHI_SELF_HOSTED_URL"))
 
 		try {
 			vi.stubEnv("KIMCHI_SELF_HOSTED_URL", "not a url")
@@ -922,7 +928,6 @@ describe("region config", () => {
 			expect(selfHostedWarnings()[0]).toContain("Ignoring invalid KIMCHI_SELF_HOSTED_URL")
 		} finally {
 			resetInvalidSelfHostedUrlWarningForTests()
-			warnSpy.mockRestore()
 		}
 	})
 
@@ -1473,43 +1478,40 @@ describe("permissions", () => {
 		expect(checkConfigFilePermissions(join(tempDir, "missing.json"))).toBeUndefined()
 	})
 
-	it("loadConfig warns when config.json is group/world-readable", () => {
+	it("loadConfig warns via debuglog when config.json is group/world-readable", () => {
 		writeFileSync(configPath, JSON.stringify({ apiKey: "leaky-key" }), { mode: 0o644 })
 		chmodSync(configPath, 0o644)
 
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		loadConfig({ configPath })
-		expect(warnSpy).toHaveBeenCalled()
-		const warning = warnSpy.mock.calls.find((c) => typeof c[0] === "string" && c[0].includes("group/world-readable"))
+		expect(debug).toHaveBeenCalled()
+		const warning = debug.mock.calls.find((c) => typeof c[0] === "string" && c[0].includes("group/world-readable"))
 		expect(warning).toBeDefined()
 		expect(warning?.[0]).toContain("chmod 600")
-		warnSpy.mockRestore()
 	})
 
 	it("loadConfig does not warn when config.json is owner-only", () => {
 		writeApiKey("safe-key", configPath)
 		expect(statSync(configPath).mode & 0o777).toBe(0o600)
 
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		loadConfig({ configPath })
-		const permWarning = warnSpy.mock.calls.find(
+		const permWarning = debug.mock.calls.find(
 			(c) => typeof c[0] === "string" && c[0].includes("group/world-readable"),
 		)
 		expect(permWarning).toBeUndefined()
-		warnSpy.mockRestore()
 	})
 
-	it("readApiKeyFromConfigFile warns when config.json is group/world-readable", () => {
+	it("readApiKeyFromConfigFile warns via debuglog when config.json is group/world-readable", () => {
 		writeFileSync(configPath, JSON.stringify({ apiKey: "leaky-key" }), { mode: 0o644 })
 		chmodSync(configPath, 0o644)
 
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		const key = readApiKeyFromConfigFile(configPath)
 		expect(key).toBe("leaky-key")
-		expect(warnSpy).toHaveBeenCalled()
-		const warning = warnSpy.mock.calls.find((c) => typeof c[0] === "string" && c[0].includes("group/world-readable"))
+		expect(debug).toHaveBeenCalled()
+		const warning = debug.mock.calls.find((c) => typeof c[0] === "string" && c[0].includes("group/world-readable"))
 		expect(warning).toBeDefined()
-		warnSpy.mockRestore()
 	})
 })
 

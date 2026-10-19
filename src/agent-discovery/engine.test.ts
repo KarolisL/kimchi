@@ -7,11 +7,20 @@ import { hasBearerAuthorizationHeader, resolveDirCandidates, selectDirCandidates
 import type { AgentDefinition, DirCandidate } from "./index.js"
 import { discoverAgent } from "./index.js"
 
+// Mock debuglog the same way work-attribution's tests do (#1362): capture the
+// debug logger so routing can be asserted, keeping node:util's other exports.
+const { debug } = vi.hoisted(() => ({ debug: vi.fn() }))
+vi.mock("node:util", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:util")>()),
+	debuglog: () => debug,
+}))
+
 describe("discoverAgent engine", () => {
 	let tempDir: string
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "kimchi-engine-test-"))
+		debug.mockClear()
 	})
 
 	afterEach(() => {
@@ -106,12 +115,10 @@ describe("discoverAgent engine", () => {
 		writeFileSync(path2, JSON.stringify({ modern: { tool: { command: "ok" } } }))
 
 		const def = makeDef({ configPaths: [path1, path2] })
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 		const result = discoverAgent(def)
 
 		expect(result.mcpServers.tool).toBeDefined()
-		expect(warnSpy).not.toHaveBeenCalled() // ENOENT is silent
-		warnSpy.mockRestore()
+		expect(debug).not.toHaveBeenCalled() // ENOENT is silent
 	})
 
 	// ---------------------------------------------------------------------------
@@ -124,12 +131,10 @@ describe("discoverAgent engine", () => {
 		writeFileSync(path2, JSON.stringify({ modern: { tool: { command: "ok" } } }))
 
 		const def = makeDef({ configPaths: [path1, path2] })
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 		const result = discoverAgent(def)
 
 		expect(result.mcpServers.tool).toBeDefined()
-		expect(warnSpy).toHaveBeenCalled()
-		warnSpy.mockRestore()
+		expect(debug).toHaveBeenCalled()
 	})
 
 	// ---------------------------------------------------------------------------
@@ -213,13 +218,11 @@ describe("discoverAgent engine", () => {
 			configPaths: [path],
 			skillsDirs: [skillsPath("nonexistent")],
 		})
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 		const result = discoverAgent(def)
 
 		expect(result.skillCount).toBe(0)
 		expect(result.skillsDir).toBeUndefined()
-		expect(warnSpy).not.toHaveBeenCalled()
-		warnSpy.mockRestore()
+		expect(debug).not.toHaveBeenCalled()
 	})
 
 	// ---------------------------------------------------------------------------
@@ -435,28 +438,21 @@ describe("discoverAgent engine", () => {
 			writeSkill(skillsDir, "good", "name: good\ndescription: Fine")
 			writeSkill(skillsDir, "broken", "name: [unclosed\ndescription: {{{")
 
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 			const result = discoverAgent(makeDef({ skillsDirs: [skillsDir] }))
-			warnSpy.mockRestore()
 
 			expect(result.skills.map((s) => s.name)).toEqual(["good"])
 		})
 
 		// S2b: the loader's diagnostics for omitted skills are surfaced, not dropped —
 		// otherwise the skill vanishes from discovery with no observable reason why.
-		it("S2b: surfaces loader diagnostics for omitted skills as warnings", () => {
+		it("S2b: surfaces loader diagnostics for omitted skills via debuglog", () => {
 			const skillsDir = join(tempDir, "skills")
 			writeSkill(skillsDir, "good", "name: good\ndescription: Fine")
 			writeSkill(skillsDir, "broken", "name: [unclosed\ndescription: {{{")
 
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-			try {
-				discoverAgent(makeDef({ skillsDirs: [skillsDir] }))
-				const warned = warnSpy.mock.calls.map((call) => call.join(" "))
-				expect(warned.some((line) => line.includes("broken"))).toBe(true)
-			} finally {
-				warnSpy.mockRestore()
-			}
+			discoverAgent(makeDef({ skillsDirs: [skillsDir] }))
+			const warned = debug.mock.calls.map((call) => call.join(" "))
+			expect(warned.some((line) => line.includes("broken"))).toBe(true)
 		})
 
 		// S3: a skill whose SKILL.md cannot be read is omitted
@@ -478,9 +474,7 @@ describe("discoverAgent engine", () => {
 			const skillsDir = join(tempDir, "skills")
 			writeSkill(skillsDir, "solo", "name: solo\ndescription: Alone")
 
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 			const result = discoverAgent(makeDef({ configPaths: [config], skillsDirs: [skillsDir] }))
-			warnSpy.mockRestore()
 
 			expect(result.mcpServers).toEqual({})
 			expect(result.skills.map((s) => s.name)).toEqual(["solo"])
@@ -604,15 +598,8 @@ describe("discoverAgent engine", () => {
 			const savedCwd = process.cwd()
 			process.chdir(tempDir)
 			try {
-				const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-				let home: ReturnType<typeof discoverAgent>
-				let all: ReturnType<typeof discoverAgent>
-				try {
-					home = discoverAgent(def, { scope: "home" })
-					all = discoverAgent(def, { scope: "all", cwd: tempDir })
-				} finally {
-					warnSpy.mockRestore()
-				}
+				const home = discoverAgent(def, { scope: "home" })
+				const all = discoverAgent(def, { scope: "all", cwd: tempDir })
 				expect(Object.keys(home.mcpServers)).toEqual([])
 				// The default (wizard) scope still reads it
 				expect(Object.keys(all.mcpServers)).toEqual(["probe"])
@@ -632,18 +619,16 @@ describe("discoverAgent engine", () => {
 				const skillsDir = join(tempDir, "locked")
 				mkdirSync(join(skillsDir, "alpha"), { recursive: true })
 				chmodSync(skillsDir, 0o000)
-				const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
 				try {
 					const discovery = discoverAgent(makeDef({ skillsDirs: [skillsDir] }), { cwd: tempDir })
 					expect(discovery.skillsDir).toBe(skillsDir)
 					expect(discovery.skillCount).toBe(-1)
 					expect(discovery.skills).toEqual([])
-					// One root cause, one warning: enumeration is skipped when the
+					// One root cause, one diagnostic: enumeration is skipped when the
 					// listing already failed — loadSkillsFromDir would hit the same
 					// EACCES and emit a second, redundant diagnostic.
-					expect(warnSpy).toHaveBeenCalledTimes(1)
+					expect(debug).toHaveBeenCalledTimes(1)
 				} finally {
-					warnSpy.mockRestore()
 					chmodSync(skillsDir, 0o700)
 				}
 			},
@@ -698,16 +683,11 @@ describe("discoverAgent engine", () => {
 			})
 
 			it("warns on a non-absolute plain-string candidate instead of silently depending on ambient cwd", () => {
-				const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-				try {
-					expect(resolveDirCandidates(["relative/dir", join(tempDir, "abs")], () => "/base")).toEqual([
-						"relative/dir",
-						join(tempDir, "abs"),
-					])
-					expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("relative/dir"))).toBe(true)
-				} finally {
-					warnSpy.mockRestore()
-				}
+				expect(resolveDirCandidates(["relative/dir", join(tempDir, "abs")], () => "/base")).toEqual([
+					"relative/dir",
+					join(tempDir, "abs"),
+				])
+				expect(debug.mock.calls.some((call) => String(call[0]).includes("relative/dir"))).toBe(true)
 			})
 
 			it("home scope keeps only absolute string candidates", () => {

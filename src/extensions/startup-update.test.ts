@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const checkForUpdateMock = vi.fn()
 const getVersionMock = vi.fn()
@@ -25,6 +25,14 @@ vi.mock("../update/settings.js", () => ({
 	saveAutoUpdateSetting: vi.fn(),
 	loadAutoUpdateNoticeShown: () => loadAutoUpdateNoticeShownMock(),
 	markAutoUpdateNoticeShown: () => markAutoUpdateNoticeShownMock(),
+}))
+
+// Mock debuglog the same way work-attribution's tests do (#1362): capture the
+// debug logger so routing can be asserted, keeping node:util's other exports.
+const { debug } = vi.hoisted(() => ({ debug: vi.fn() }))
+vi.mock("node:util", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:util")>()),
+	debuglog: () => debug,
 }))
 
 const { default: startupUpdateExtension } = await import("./startup-update.js")
@@ -249,14 +257,8 @@ describe("startupUpdateExtension", () => {
 	})
 
 	describe("auto-update settings error handling", () => {
-		let stderrSpy: ReturnType<typeof vi.spyOn>
-
 		beforeEach(() => {
-			stderrSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-		})
-
-		afterEach(() => {
-			stderrSpy.mockRestore()
+			debug.mockClear()
 		})
 
 		it("swallows errors from loadAutoUpdateSetting and returns early without setStatus", async () => {
@@ -278,8 +280,8 @@ describe("startupUpdateExtension", () => {
 			expect(setStatus).not.toHaveBeenCalled()
 			expect(notify).not.toHaveBeenCalled()
 			expect(markAutoUpdateNoticeShownMock).not.toHaveBeenCalled()
-			expect(stderrSpy).toHaveBeenCalledOnce()
-			expect(stderrSpy.mock.calls[0][0]).toContain("settings dir unwritable")
+			expect(debug).toHaveBeenCalledOnce()
+			expect(debug.mock.calls[0][0]).toContain("settings dir unwritable")
 		})
 
 		it("swallows errors from markAutoUpdateNoticeShown", async () => {
@@ -301,8 +303,8 @@ describe("startupUpdateExtension", () => {
 			// catch must swallow the error so session_start doesn't crash.
 			expect(notify).toHaveBeenCalledOnce()
 			expect(checkForUpdateMock).not.toHaveBeenCalled()
-			expect(stderrSpy).toHaveBeenCalledOnce()
-			expect(stderrSpy.mock.calls[0][0]).toContain("disk full")
+			expect(debug).toHaveBeenCalledOnce()
+			expect(debug.mock.calls[0][0]).toContain("disk full")
 		})
 	})
 })

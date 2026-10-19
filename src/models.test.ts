@@ -18,6 +18,14 @@ import {
 	updateModelsConfig,
 } from "./models.js"
 
+// Mock debuglog the same way work-attribution's tests do (#1362): capture the
+// debug logger so routing can be asserted, keeping node:util's other exports.
+const { debug } = vi.hoisted(() => ({ debug: vi.fn() }))
+vi.mock("node:util", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:util")>()),
+	debuglog: () => debug,
+}))
+
 // loadConfig() reads the launch-time global config (real HOME). Pin it without
 // a region so endpoint derivation (experimental provider, metadata defaults)
 // resolves the US URLs regardless of the developer machine's config.
@@ -734,11 +742,11 @@ describe("updateModelsConfig", () => {
 		await updateModelsConfig(modelsJsonPath, "saved-key")
 		const original = readFileSync(modelsJsonPath, "utf-8")
 		vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 401, statusText: "Unauthorized" }))
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		const result = await updateModelsConfig(modelsJsonPath, "rejected-key")
 		expect(result.models.map((model) => model.slug)).toEqual(["kimi-k2.5"])
 		expect(isCredentialStale("rejected-key", "kimchi-dev")).toBe(true)
-		expect(warn).toHaveBeenCalledWith(expect.stringContaining("401 Unauthorized"))
+		expect(debug).toHaveBeenCalledWith(expect.stringContaining("401 Unauthorized"))
 		expect(readFileSync(modelsJsonPath, "utf-8")).toBe(original)
 	})
 
@@ -751,13 +759,13 @@ describe("updateModelsConfig", () => {
 		config.providers.custom = CUSTOM_PROVIDER
 		writeFileSync(modelsJsonPath, JSON.stringify(config))
 		const original = readFileSync(modelsJsonPath, "utf-8")
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+		debug.mockClear()
 		vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 401, statusText: "Unauthorized" }))
 
 		const result = await updateModelsConfig(modelsJsonPath, "expired-kimchi-key")
 
 		expect(result.models.map((model) => model.slug)).toContain("custom-model")
-		expect(warn).toHaveBeenCalledWith(expect.stringContaining("401 Unauthorized"))
+		expect(debug).toHaveBeenCalledWith(expect.stringContaining("401 Unauthorized"))
 		expect(readFileSync(modelsJsonPath, "utf-8")).toBe(original)
 	})
 
@@ -890,8 +898,8 @@ describe("updateModelsConfig", () => {
 		expect(result.models.map((m) => m.slug)).toEqual(["kimi-k2.5"])
 	})
 
-	it("warns when all API models are sunset", async () => {
-		const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+	it("warns via debuglog when all API models are sunset", async () => {
+		debug.mockClear()
 		const sunsetModel = {
 			slug: "old-model",
 			display_name: "Old Model",
@@ -909,13 +917,12 @@ describe("updateModelsConfig", () => {
 
 		const result = await updateModelsConfig(modelsJsonPath, "test-key")
 
-		expect(consoleWarnSpy).toHaveBeenCalledWith(
+		expect(debug).toHaveBeenCalledWith(
 			expect.stringContaining("All models from the API are deprecated or sunset"),
 		)
 		expect(result.models).toHaveLength(0)
 		const config = JSON.parse(readFileSync(modelsJsonPath, "utf-8"))
 		expect(config.providers["kimchi-dev"].models).toHaveLength(0)
-		consoleWarnSpy.mockRestore()
 	})
 
 	it("throws without changing models.json when strict fresh discovery finds no active Kimchi models", async () => {
@@ -1592,8 +1599,8 @@ describe("openai Responses API routing", () => {
 		expect(models[0]?.baseUrl).toBeUndefined()
 	})
 
-	it("warns when an OpenAI slug matches neither routing table (catalog lint)", () => {
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+	it("warns via debuglog when an OpenAI slug matches neither routing table (catalog lint)", () => {
+		debug.mockClear()
 		const models = openaiProviderModels([
 			openaiModel("o5"),
 			openaiModel("gpt-3.5-turbo", { reasoning: false }),
@@ -1602,8 +1609,8 @@ describe("openai Responses API routing", () => {
 		expect(models).toHaveLength(3)
 		// Unknown slug still routes via chat completions — the lint only warns.
 		expect(models.find((m) => m.id === "o5")?.api).toBeUndefined()
-		expect(warn).toHaveBeenCalledTimes(1)
-		expect(warn.mock.calls[0]?.[0]).toContain("'o5'")
+		expect(debug).toHaveBeenCalledTimes(1)
+		expect(debug.mock.calls[0]?.[0]).toContain("'o5'")
 	})
 
 	it("does not touch non-openai providers", () => {

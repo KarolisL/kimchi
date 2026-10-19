@@ -1,7 +1,12 @@
 import { type FSWatcher, watch } from "node:fs"
 import { resolve } from "node:path"
+import { debuglog } from "node:util"
 import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent"
 import { fileSignature } from "./config/json.js"
+
+/** Watcher diagnostics — silent unless NODE_DEBUG=kimchi:settings.
+ *  Raw console writes corrupt the interactive TUI. */
+const debug = debuglog("kimchi:settings")
 
 // Pi-coding-agent doesn't expose a settings/theme_change event for extensions, so
 // we read settings through pi's own SettingsManager and watch its settings files
@@ -181,7 +186,7 @@ function fire(): void {
 		try {
 			l(current, previous)
 		} catch (err) {
-			console.warn("[settings-watcher] listener error:", err)
+			debug("[settings-watcher] listener error:", err)
 		}
 	}
 }
@@ -259,7 +264,7 @@ function startWatch(path: string, onDead: () => void): FSWatcher | undefined {
 		const w = watch(path, { persistent: false }, scheduleFire)
 		w.unref?.()
 		w.on("error", (err) => {
-			console.warn("[settings-watcher] watch error:", err)
+			debug("[settings-watcher] watch error:", err)
 			// Cleanup first: even if close() throws, the watcher must be marked
 			// dead and the cache dropped (events may have been missed while dying).
 			onDead()

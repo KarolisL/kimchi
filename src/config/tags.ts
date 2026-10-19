@@ -1,5 +1,6 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { debuglog } from "node:util"
 import { isProjectScopeAllowed } from "../project-scope-trust.js"
 import { findNearestAncestorPath } from "../utils/find-nearest-ancestor.js"
 import { readJsonCached } from "./json.js"
@@ -37,6 +38,10 @@ interface TagsConfig {
 const GLOBAL_TAGS_FILE_REL = join(".config", "kimchi", "tags.json")
 const PROJECT_TAGS_FILE_REL = join(".kimchi", "tags.json")
 
+/** Tag config diagnostics — silent unless NODE_DEBUG=kimchi:tags.
+ *  Raw console writes corrupt the interactive TUI. */
+const debug = debuglog("kimchi:tags")
+
 function errText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err)
 }
@@ -51,7 +56,7 @@ function readTagFile(path: string): string[] {
 	} catch (err) {
 		// Fail open — a broken tag config must not block the session — but
 		// surface it rather than silently ignoring it.
-		console.warn(`[tags] ignoring unreadable tag config ${path}: ${errText(err)}`)
+		debug(`[tags] ignoring unreadable tag config ${path}: ${errText(err)}`)
 		return []
 	}
 }
@@ -96,7 +101,7 @@ export function resolveDefaultTags(options?: { cwd?: string; homeDir?: string; e
 			if (projectPath) tiers.push({ tier: "project", tags: readTagFile(projectPath) })
 		}
 	} catch (err) {
-		console.warn(`[tags] project tag config discovery failed: ${errText(err)}`)
+		debug(`[tags] project tag config discovery failed: ${errText(err)}`)
 	}
 
 	const envTagList = envTags ? parseEnvTags(envTags) : []

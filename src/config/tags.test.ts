@@ -3,7 +3,16 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { resetProjectScopeTrustForTests, setProjectScopeTrusted } from "../project-scope-trust.js"
-import { resolveDefaultTags } from "./tags.js"
+
+// Mock debuglog the same way work-attribution's tests do (#1362): capture the
+// debug logger so routing can be asserted, keeping node:util's other exports.
+const { debug } = vi.hoisted(() => ({ debug: vi.fn() }))
+vi.mock("node:util", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:util")>()),
+	debuglog: () => debug,
+}))
+
+const { resolveDefaultTags } = await import("./tags.js")
 
 let root: string
 let home: string
@@ -133,17 +142,16 @@ describe("resolveDefaultTags", () => {
 		expect(tags).toEqual(["a:1", "b:2"])
 	})
 
-	it("treats a corrupt config file as absent and warns with its path", () => {
+	it("treats a corrupt config file as absent and logs its path via debuglog", () => {
 		const globalPath = join(home, ".config", "kimchi", "tags.json")
 		mkdirSync(dirname(globalPath), { recursive: true })
 		writeFileSync(globalPath, "{not valid json")
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 		writeProjectConfig(["repo:api"])
 
 		const { tags } = resolveDefaultTags({ cwd, homeDir: home })
 
 		expect(tags).toEqual(["repo:api"])
-		expect(warn).toHaveBeenCalledWith(expect.stringContaining(globalPath))
+		expect(debug).toHaveBeenCalledWith(expect.stringContaining(globalPath))
 	})
 
 	it("falls back to the other tiers when the working directory is unusable", () => {
@@ -151,16 +159,14 @@ describe("resolveDefaultTags", () => {
 		const doomed = join(root, "doomed")
 		mkdirSync(doomed)
 		const originalCwd = process.cwd()
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 		process.chdir(doomed)
 		rmSync(doomed, { recursive: true, force: true })
 		try {
 			const { tags } = resolveDefaultTags({ homeDir: home })
 			expect(tags).toEqual(["team:backend"])
-			expect(warn).toHaveBeenCalledWith(expect.stringContaining("project tag config discovery failed"))
+			expect(debug).toHaveBeenCalledWith(expect.stringContaining("project tag config discovery failed"))
 		} finally {
 			process.chdir(originalCwd)
-			warn.mockRestore()
 		}
 	})
 
