@@ -43,9 +43,7 @@ export function renderTodoEntries(
 	opts: { empty: string; separator: string; prefix?: string },
 ): string {
 	if (todos.length === 0) return opts.empty
-	return todos
-		.map((todo) => `${opts.prefix ?? ""}[${todo.status}] #${todo.id} ${todo.content}`)
-		.join(opts.separator)
+	return todos.map((todo) => `${opts.prefix ?? ""}[${todo.status}] #${todo.id} ${todo.content}`).join(opts.separator)
 }
 
 /** Render the current todo store as a markdown section. Returns `undefined`

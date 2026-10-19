@@ -45,7 +45,6 @@ import {
 } from "./reconciliation.js"
 import { getTodoScopeKey } from "./scope.js"
 import { getWriteTodosDetails, isTodoWriteToolName } from "./session.js"
-import { renderTodoEntries } from "./state-markdown.js"
 import {
 	createIntervalSteerTracker,
 	sendHiddenSteer,
@@ -54,6 +53,7 @@ import {
 	TODO_STALENESS_CUSTOM_TYPE,
 	TODO_STALENESS_INTERVAL,
 } from "./staleness-steers.js"
+import { renderTodoEntries } from "./state-markdown.js"
 import {
 	bumpToolCallsSinceTodoWrite,
 	bumpWorkToolCalls,
@@ -174,7 +174,11 @@ function checkinListBlocks(scopes: readonly TodoScope[], sessionId: string, revi
 function checkinInstructionText(pending: readonly CheckinPending[], sessionId: string, revision: number): string {
 	return [
 		`Todo check-in (input revision ${revision}): the user's latest input may change the plan. Before starting further work tools, reconcile each list below — add newly requested work, remove obsolete items, revise statuses — or, when a list is still accurate, confirm it with confirm_todos, passing its complete current id+status set and inputRevision ${revision}. A text-only reply needs no tool call; the check stays pending until work resumes.`,
-		...checkinListBlocks(pending.map((check) => check.scope), sessionId, revision),
+		...checkinListBlocks(
+			pending.map((check) => check.scope),
+			sessionId,
+			revision,
+		),
 	].join("\n")
 }
 
@@ -184,7 +188,11 @@ function checkinInstructionText(pending: readonly CheckinPending[], sessionId: s
 function checkinBlockReason(pending: readonly CheckinPending[], sessionId: string, revision: number): string {
 	return [
 		`⏸ Todo check-in pending (input revision ${revision}). Reconcile the todo list with the user's latest direction and the work already done before starting further work tools: add newly requested work, remove obsolete items, revise statuses — or, if a list is still accurate, confirm it with confirm_todos, passing its complete current id+status set and inputRevision ${revision}. Finish the reconciliation tool round first; do not batch reconciliation in parallel with work tools.`,
-		...checkinListBlocks(pending.map((check) => check.scope), sessionId, revision),
+		...checkinListBlocks(
+			pending.map((check) => check.scope),
+			sessionId,
+			revision,
+		),
 	].join("\n")
 }
 
