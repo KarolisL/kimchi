@@ -27,6 +27,7 @@ Org policy is fetched at startup and held for the session; each field has one en
 
 ## Development patterns
 
+- **Session-time logging**: Route user-visible warnings through `ctx.ui.notify(...)`; route diagnostics through `debuglog("kimchi:<area>")` from `node:util` (silent unless `NODE_DEBUG=kimchi:<area>`, e.g. `src/extensions/lsp/client.ts`, `src/extensions/dap/client.ts`). Raw `console.warn`/`log`/`error` during a session corrupts the interactive TUI frame.
 - **Auto-formatting**: `lint:fix` runs automatically after file edits (PostToolUse hook) — don't run manually
 - **Pre-commit**: `.husky/pre-commit` runs `pnpm run lint` — CI runs full `check` (lint + typecheck)
 - **README changes**: Run `./scripts/copy-resources.js --dev` after editing to propagate to dist/
