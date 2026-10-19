@@ -129,6 +129,15 @@ describe("artifactsFromToolCall", () => {
 		expect(out.length).toBe(8)
 	})
 
+	it("caps candidate evaluations per result so pathological output can't stall the scan", () => {
+		const noise = Array.from({ length: 5000 }, (_, i) => `missing${i}.pdf`).join(" ")
+		expect(artifactsFromToolCall("bash", {}, textResult(noise), cwd)).toEqual([])
+		// A real file mentioned first lands well under the candidate cap.
+		touch("real.pdf")
+		const out = artifactsFromToolCall("bash", {}, textResult(`real.pdf ${noise}`), cwd)
+		expect(out.map((a) => a.name)).toEqual(["real.pdf"])
+	})
+
 	it("never throws on malformed inputs", () => {
 		expect(artifactsFromToolCall("bash", null, undefined, cwd)).toEqual([])
 		expect(artifactsFromToolCall("bash", {}, { content: "not-an-array" }, cwd)).toEqual([])

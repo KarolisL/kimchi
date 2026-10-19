@@ -8,6 +8,12 @@
 //   - candidates must match a fixed extension allowlist,
 //   - live detection verifies the file exists on disk before reporting.
 // Detection never throws — a failure here must not disturb the turn.
+//
+// Trust assumption: artifact paths are agent-controlled output. The chip
+// grants no new capability — the agent can already print the path and ask
+// the user to open it — so the client presents a one-click convenience on
+// top of content the user's session produced (including script-capable
+// types like .html/.svg, which open in the user's own environment).
 
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
@@ -49,6 +55,11 @@ export const ARTIFACT_EXTENSIONS: Record<string, string> = {
 // Upper bound on artifacts reported per bash result scan — a pathological
 // result (e.g. directory listing) must not flood the client.
 const MAX_BASH_ARTIFACTS = 8
+
+// Upper bound on candidate tokens evaluated per result — existsSync is a
+// synchronous syscall on the server's event loop, so an unbounded match
+// stream (e.g. a loop echoing fake .pdf names) would stall the server.
+const MAX_BASH_CANDIDATES = 256
 
 // Faithful replication of pi's resolveToCwd (dist/core/tools/path-utils.js →
 // resolvePath with normalizeUnicodeSpaces + stripAtPrefix): the write tool
@@ -112,9 +123,17 @@ function isErrorResult(result: unknown): boolean {
 function bashArtifacts(result: unknown, cwd: string, opts: { verifyExists: boolean }): Artifact[] {
 	const out: Artifact[] = []
 	const seen = new Set<string>()
+	const seenTokens = new Set<string>()
+	let candidates = 0
 	for (const text of textBlocks(result)) {
 		for (const match of text.matchAll(PATH_TOKEN)) {
 			if (out.length >= MAX_BASH_ARTIFACTS) return out
+			if (++candidates > MAX_BASH_CANDIDATES) return out
+			// Dedupe on the raw token BEFORE artifactFromPath, so a token
+			// repeated many times re-pays neither resolution nor the existence
+			// syscall.
+			if (seenTokens.has(match[0])) continue
+			seenTokens.add(match[0])
 			if (match[0].includes("://")) continue
 			const artifact = artifactFromPath(match[0], cwd, opts)
 			if (!artifact || seen.has(artifact.path)) continue
