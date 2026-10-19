@@ -132,9 +132,7 @@ function enumerateSkills(skillsDir: string): DiscoveredSkill[] {
 		// diagnostics — surface them, or the skill vanishes from discovery
 		// silently and the user has no observable reason why.
 		for (const diagnostic of diagnostics) {
-			debug(
-				`Skill discovery in ${skillsDir}: ${diagnostic.message}${diagnostic.path ? ` (${diagnostic.path})` : ""}`,
-			)
+			debug(`Skill discovery in ${skillsDir}: ${diagnostic.message}${diagnostic.path ? ` (${diagnostic.path})` : ""}`)
 		}
 		return skills.map((s) => ({ name: s.name, description: s.description, path: s.filePath }))
 	} catch (err) {

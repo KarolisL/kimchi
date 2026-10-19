@@ -1496,9 +1496,7 @@ describe("permissions", () => {
 
 		debug.mockClear()
 		loadConfig({ configPath })
-		const permWarning = debug.mock.calls.find(
-			(c) => typeof c[0] === "string" && c[0].includes("group/world-readable"),
-		)
+		const permWarning = debug.mock.calls.find((c) => typeof c[0] === "string" && c[0].includes("group/world-readable"))
 		expect(permWarning).toBeUndefined()
 	})
 

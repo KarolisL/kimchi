@@ -917,9 +917,7 @@ describe("updateModelsConfig", () => {
 
 		const result = await updateModelsConfig(modelsJsonPath, "test-key")
 
-		expect(debug).toHaveBeenCalledWith(
-			expect.stringContaining("All models from the API are deprecated or sunset"),
-		)
+		expect(debug).toHaveBeenCalledWith(expect.stringContaining("All models from the API are deprecated or sunset"))
 		expect(result.models).toHaveLength(0)
 		const config = JSON.parse(readFileSync(modelsJsonPath, "utf-8"))
 		expect(config.providers["kimchi-dev"].models).toHaveLength(0)
