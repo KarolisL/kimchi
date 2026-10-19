@@ -87,7 +87,8 @@ function artifactFromPath(rawPath: string, cwd: string, opts: { verifyExists: bo
 // containing "://" (URLs) are rejected before resolution. The extension
 // list duplicates ARTIFACT_EXTENSIONS (a literal avoids RegExp-constructor
 // escaping); artifacts.test.ts asserts they stay in sync.
-const PATH_TOKEN = /[^\s"'<>`;|&*?]*\.(?:pptx|xlsx|docx|pdf|html|htm|csv|png|jpg|jpeg|gif|webp|svg)(?![\w.])/gi
+const PATH_TOKEN =
+	/[^\s"'<>`;|&*?]*\.(?:pptx|xlsx|docx|pdf|html|htm|csv|png|jpg|jpeg|gif|webp|svg|md|markdown|zip|ics)(?![\w.])/gi
 
 function textBlocks(result: unknown): string[] {
 	const r = result as { content?: unknown } | null | undefined
