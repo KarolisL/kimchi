@@ -45,6 +45,7 @@ import * as Diff from "diff"
 import type { BundledLanguage, BundledTheme } from "shiki"
 import type { TSchema } from "typebox"
 import { formatDuration } from "../extensions/format.js"
+import { onThemeChange } from "../settings-watcher.js"
 import { resolveMarkerForDisplay } from "./display-budget.js"
 import { FERMENT_V2_TOOL_NAMES } from "./ferment-v2/constants.js"
 import { TODO_TOOL_NAMES } from "./todos/tool.js"
@@ -65,6 +66,20 @@ const TOOL_RENDER_CACHE = Symbol.for("pi-claude-style-tools:tool-render-cache")
 const TOOL_CACHE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-cache-invalidation")
 const TOOL_IMAGE_EXPAND_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-read-image-expansion")
 const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render")
+const MESSAGE_RENDER_CACHE = Symbol.for("pi-claude-style-tools:message-render-cache")
+// Bumped whenever a style input shared by all cached renders changes (new
+// theme instance applied, palette reset). Compared inside cached entries.
+let renderStyleGeneration = 0
+/** The live pi theme instance (swapped on globalThis by every theme
+ *  switch, including in-memory previews and setThemeInstance paths that
+ *  never write settings). Compared by reference inside the render caches —
+ *  renderStyleGeneration alone misses those paths, with the next turn_start
+ *  palette apply as the slower backstop. */
+const PI_THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme")
+function currentThemeInstance(): unknown {
+	return (globalThis as Record<symbol, unknown>)[PI_THEME_KEY]
+}
+let themeChangeListenerRegistered = false
 const HIDDEN_TOOL_BLOCK_NAMES = new Set<string>(["write_todos", ...TODO_TOOL_NAMES, ...FERMENT_V2_TOOL_NAMES])
 const WRAP_MARK = "\uE000"
 const KITTY_IMAGE_PREFIX = "\x1b_G"
@@ -478,16 +493,28 @@ function inlineWorkedDurationText(ms: number): string {
 	return `${WORKED_DURATION_INDENT}${WORKED_LINE_FG}✻ Worked for ${formatWorkedDuration(ms)}${RESET}`
 }
 
-function patchAssistantMessageRender(): void {
+export function patchAssistantMessageRender(): void {
 	const proto = AssistantMessageComponent.prototype as any
 	if (proto[ASSISTANT_MESSAGE_PATCH_FLAG]) return
 	const originalRender = proto.render
 	if (typeof originalRender !== "function") return
-	proto.render = function patchedAssistantMessageRender(width: number) {
-		const lines: string[] = originalRender.call(this, width)
-		if (!Array.isArray(lines) || lines.length === 0) return lines
-		const message = (this as any).lastMessage as PatchedAssistantMessage
-		const durationMs = message?.[WORKED_DURATION_KEY]
+	// Settled assistant messages are immutable render inputs: the TUI
+	// re-renders the whole component tree every frame, and re-parsing the
+	// markdown of every settled message dominated CPU in long sessions.
+	// The cache is keyed ONLY by observable render inputs (width, style
+	// generation, message content identity, the content container's children
+	// array — rebuilt on every updateContent — and the thinking/visibility
+	// settings). No mutation-method patching: updateContent is replaced by
+	// other extensions (thinking-steps re-implements it and drops the
+	// isStreaming argument), so method hooks are an unreliable invalidation
+	// channel. Every streaming chunk rebuilds the content container (new
+	// children array identity), so a mid-stream render never hits the cache;
+	// stopReason being unset guards the same thing from the message side.
+	const contentFingerprint = (message: any): unknown[] => {
+		if (!Array.isArray(message?.content)) return []
+		return message.content.map((block: any) => block?.text ?? block?.thinking ?? block?.redacted ?? 0)
+	}
+	const appendWorkedDurationWidget = (lines: string[], durationMs: number | undefined): string[] => {
 		if (typeof durationMs !== "number" || durationMs <= 0) return lines
 		// The original render() appends OSC 133 zone markers to the last line
 		// (B = command end, C = command output). Strip them off, push the widget
@@ -501,6 +528,61 @@ function patchAssistantMessageRender(): void {
 		} else {
 			lines.push("", widgetLine)
 		}
+		return lines
+	}
+	const sameArray = (a: unknown[] | undefined, b: unknown[] | undefined): boolean => {
+		if (a === b) return true
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+		for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+		return true
+	}
+	proto.render = function patchedAssistantMessageRender(width: number) {
+		const component = this as any
+		const message = component.lastMessage as PatchedAssistantMessage | undefined
+		if (
+			message !== undefined &&
+			typeof message.stopReason === "string" &&
+			Array.isArray(message.content) &&
+			Array.isArray(component.contentContainer?.children)
+		) {
+			const durationMs = message[WORKED_DURATION_KEY]
+			const cached = component[MESSAGE_RENDER_CACHE]
+			if (
+				cached?.width === width &&
+				cached?.style === renderStyleGeneration &&
+				cached?.theme === currentThemeInstance() &&
+				cached?.durationMs === durationMs &&
+				cached?.children === component.contentContainer.children &&
+				cached?.content === message.content &&
+				sameArray(cached?.texts, contentFingerprint(message)) &&
+				cached?.hideThinkingBlock === component.hideThinkingBlock &&
+				cached?.hiddenThinkingLabel === component.hiddenThinkingLabel &&
+				cached?.outputPad === component.outputPad
+			) {
+				return cached.lines
+			}
+			const lines: string[] = originalRender.call(this, width)
+			if (!Array.isArray(lines) || lines.length === 0) return lines
+			appendWorkedDurationWidget(lines, durationMs)
+			component[MESSAGE_RENDER_CACHE] = {
+				width,
+				style: renderStyleGeneration,
+				theme: currentThemeInstance(),
+				durationMs,
+				children: component.contentContainer.children,
+				content: message.content,
+				texts: contentFingerprint(message),
+				hideThinkingBlock: component.hideThinkingBlock,
+				hiddenThinkingLabel: component.hiddenThinkingLabel,
+				outputPad: component.outputPad,
+				lines,
+			}
+			return lines
+		}
+		// Streaming (or pre-message): uncached, but still widget-decorated.
+		const lines: string[] = originalRender.call(this, width)
+		if (!Array.isArray(lines) || lines.length === 0) return lines
+		appendWorkedDurationWidget(lines, message?.[WORKED_DURATION_KEY])
 		return lines
 	}
 	proto[ASSISTANT_MESSAGE_PATCH_FLAG] = true
@@ -523,8 +605,23 @@ export function patchUserMessageRender(): void {
 	if (proto[USER_MESSAGE_PATCH_FLAG]) return
 	const originalRender = proto.render
 	if (typeof originalRender !== "function") return
+	// User message text is immutable after construction; rebuild() (the
+	// only mutation, via setOutputPad) replaces the content box's children
+	// array, so a children-identity check covers invalidation without
+	// method patching (same reasoning as the assistant cache above).
 	proto.render = function patchedUserMessageRender(width: number) {
-		const box = (this as any).contentBox
+		const component = this as any
+		const cached = component[MESSAGE_RENDER_CACHE]
+		if (
+			cached?.width === width &&
+			cached?.style === renderStyleGeneration &&
+			cached?.theme === currentThemeInstance() &&
+			cached?.text === component.text &&
+			cached?.children === component.contentBox?.children
+		) {
+			return cached.lines
+		}
+		const box = component.contentBox
 		if (box) {
 			// Remove the ▍ stroke and blank padding lines. paddingX=0 lets content
 			// render at full width; we prepend the prefix and truncate explicitly.
@@ -550,6 +647,14 @@ export function patchUserMessageRender(): void {
 			const pad = Math.max(0, width - visibleWidth(composed))
 			const styled = hasBg ? theme.bg("userMessageBg", composed + " ".repeat(pad)) : composed
 			lines[i] = markers + styled
+		}
+		component[MESSAGE_RENDER_CACHE] = {
+			width,
+			style: renderStyleGeneration,
+			theme: currentThemeInstance(),
+			text: component.text,
+			children: component.contentBox?.children,
+			lines,
 		}
 		return lines
 	}
@@ -1573,6 +1678,7 @@ const _claudeStyleDefaults = {
 }
 
 function resetThemePalette(): void {
+	renderStyleGeneration++
 	BORDER_COLOR = _claudeStyleDefaults.BORDER_COLOR
 	WORKED_LINE_FG = _claudeStyleDefaults.WORKED_LINE_FG
 	TOOL_RULE = _claudeStyleDefaults.TOOL_RULE
@@ -1592,6 +1698,7 @@ function applyThemePaletteIfNeeded(theme: Theme | undefined): void {
 	if (!themeAdaptiveEnabled()) return
 	if (_themePaletteCacheTheme === theme) return // already applied for this theme instance
 	_themePaletteCacheTheme = theme
+	renderStyleGeneration++
 
 	// Borders (top/bottom outlines, user-message frame, branch rule).
 	const borderMuted = safeFgAnsi(theme, "borderMuted")
@@ -3945,6 +4052,14 @@ export default function (pi: ExtensionAPI) {
 	patchAssistantMessageRender()
 	applyDiffPalette()
 	registerThinkingLabels(pi)
+	// Cached settled-message renders must not outlive a theme switch.
+	// Registered once per process (the patches above are idempotent too).
+	if (!themeChangeListenerRegistered) {
+		themeChangeListenerRegistered = true
+		onThemeChange(() => {
+			renderStyleGeneration++
+		})
+	}
 
 	// /cc-tools command — toggle tool border style at runtime
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const

@@ -91,7 +91,7 @@ function createMockContext(opts?: MockContextOpts): ExtensionContext {
 	const modelId = opts?.modelId ?? "claude-opus-4-6"
 	const entries = (opts?.assistantMessages ?? []).map((u) => ({
 		type: "message" as const,
-		message: { role: "assistant", usage: { input: u.input, output: u.output } },
+		message: { role: "assistant", usage: { input: u.input, output: u.output, cost: { total: 0 } } },
 	}))
 	return {
 		model: { id: modelId, name: modelId },
