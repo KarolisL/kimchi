@@ -1761,6 +1761,16 @@ export class KimchiAcpAgent implements Agent {
 						cwd: entry.cwd,
 						windowStart: stashed.startedAt,
 					})
+					// Tool-declared artifacts are deliverables the user may need
+					// MID-turn (a submitted plan chips before its review
+					// questionnaire opens) — emit immediately. emitNow marks them
+					// emitted, so turn-end flush can't double-chip; the buffer
+					// keys come from this one collect (no re-parse).
+					const paths = turn.artifactBuffer.getDeclaredPaths()
+					if (paths.length > 0) {
+						for (const update of turn.artifactBuffer.emitNow(paths, entry.emittedModelMeta))
+							this.send({ sessionId, update })
+					}
 				}
 				const preWrite = turn.preWriteContents.get(event.toolCallId)
 				turn.preWriteContents.delete(event.toolCallId)
