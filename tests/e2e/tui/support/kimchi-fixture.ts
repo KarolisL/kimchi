@@ -152,6 +152,14 @@ export interface CreateKimchiFixtureOptions {
 	 * project-trust-gate scenarios answer the live prompt instead).
 	 */
 	trustWorkDir?: boolean
+	/**
+	 * Override the seeded `tuiMode` (default: "regular"; the binary default
+	 * is fullscreen). Tests targeting fullscreen behavior pin "fullscreen"
+	 * (or write settings themselves) and assert via the fullscreen APIs —
+	 * pi 1.3's alt-screen renderer keeps the transcript out of the terminal
+	 * scrollback the hermetic assertions read.
+	 */
+	sessionTuiMode?: "regular" | "fullscreen"
 }
 
 export type RunKimchiSessionOptions = CreateKimchiFixtureOptions & {
@@ -207,7 +215,25 @@ export async function createKimchiFixture(options: CreateKimchiFixtureOptions): 
 		// (context, agents, phase, usage) and change the terminal layout for every test.
 		writeFileSync(
 			join(agentDir, "settings.json"),
-			JSON.stringify({ statusLine: { pinned: [] }, hideThinkingBlock: true }, null, "\t"),
+			JSON.stringify(
+				{
+					statusLine: { pinned: [] },
+					hideThinkingBlock: true,
+					// Default the hermetic suite to regular mode: pi 1.3's fullscreen
+					// alt-screen keeps the transcript/overlays out of the terminal
+					// scrollback, which most tests read for assertions. Fullscreen
+					// coverage opts in via sessionTuiMode or its own settings write.
+					tuiMode: options.sessionTuiMode ?? "regular",
+					// On the first boot of a fresh HOME the adapter has not yet written
+					// its own `-builtin:mcp` disable, so pi's built-in MCP extension
+					// would load alongside the adapter for that boot (double tool
+					// registration, /mcp routing taken by the built-in). Seed the flag
+					// up front so every E2E launch has the adapter as sole MCP owner.
+					extensions: ["-builtin:mcp"],
+				},
+				null,
+				"\t",
+			),
 			"utf-8",
 		)
 
